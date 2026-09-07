@@ -1,0 +1,68 @@
+[project]
+name = "llm-hub"
+version = "1.1.0"
+description = "Unified entrypoint for Ollama / LM Studio instances"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "PIE",  # flake8-pie
+    "PT",   # flake8-pytest-style
+    "RUF",  # ruff-specific
+    "S",    # flake8-bandit (security)
+    "T20",  # flake8-print
+    "RET",  # flake8-return
+    "PTH",  # flake8-use-pathlib
+    "TCH",  # flake8-type-checking
+    "FA",   # flake8-future-annotations
+]
+ignore = [
+    "T201",   # allow print() in scripts (demo.py, smoke_test.py)
+    "S101",   # allow assert in tests
+    "E501",   # line length handled by formatter
+    "UP007",  # allow X | Y union syntax (keep Optional for compatibility)
+    "S104",   # allow binding to 0.0.0.0 (intentional for container)
+    "S105",   # allow "password" false positives (yes_token/no_token are not secrets)
+    "B008",   # allow Depends() in function signatures (FastAPI pattern)
+    "S110",   # allow try-except-pass (used for intentional no-op)
+    "SIM105", # allow try-except-pass over contextlib.suppress (readability)
+    "TCH",    # skip type-checking block moves (optional optimization)
+    "PTH",    # skip pathlib migration (os.path works fine, lower priority)
+    "TC003",  # skip type-checking block moves
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "T20", "S110"]
+"app/main.py" = ["T20", "B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py", "smoke_test.py"]

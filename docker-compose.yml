@@ -1,0 +1,26 @@
+services:
+  llm-hub:
+    build: .
+    image: llm-hub:latest
+    container_name: llm-hub
+    restart: unless-stopped
+    ports:
+      # External port 8888 -> container port 8000
+      - "8888:8000"
+    volumes:
+      # Runtime configuration directory (holds config.json)
+      - ./data:/data
+      # Source code: every *.py sits directly in /app, so local edits are picked
+      # up after a container restart without rebuilding the image.
+      - ./app:/app
+    environment:
+      # Path of the config file inside the container
+      CONFIG_PATH: /data/config.json
+      # API keys are injected here; config.json intentionally holds none.
+      # The value comes from the .env file next to this compose file.
+      GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?missing GATEWAY_API_KEYS - put it in .env or export it}
+      TZ: Asia/Shanghai
+    extra_hosts:
+      # Lets the container reach the host machine (Docker Desktop provides this
+      # hostname already; harmless and required on plain Linux Docker).
+      - "host.docker.internal:host-gateway"

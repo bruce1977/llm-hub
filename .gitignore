@@ -1,0 +1,23 @@
+# Secrets: contains GATEWAY_API_KEYS, must never be committed
+.env
+*.secret
+
+# Local config (machine-specific, not committed): keep example.* tracked instead
+data/config.json
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Logs
+*.log
