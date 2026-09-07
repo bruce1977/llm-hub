@@ -119,6 +119,113 @@ curl http://localhost:8888/v1/chat/completions \
 
 ---
 
+## Docker Hub 部署（推荐）
+
+无需克隆仓库，直接从 Docker Hub 拉取镜像部署。
+
+### 步骤 1: 拉取镜像
+
+```bash
+docker pull bruce1977/llm-hub:latest
+```
+
+### 步骤 2: 准备配置文件
+
+```bash
+# 创建配置目录
+mkdir -p llm-hub/data
+
+# 创建配置文件
+cat > llm-hub/data/config.json << 'EOF'
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "log_level": "info"
+  },
+  "auth": {
+    "enabled": true,
+    "api_keys": [],
+    "allow_anonymous_health": true
+  },
+  "upstreams": [
+    {
+      "name": "local-main",
+      "type": "ollama",
+      "base_url": "http://host.docker.internal:11434",
+      "models": ["qwen3:8b", "qwen3.5:4b", "bge-m3:latest"],
+      "timeout": 600,
+      "description": "本地 Ollama 实例"
+    }
+  ],
+  "default_upstream": "local-main",
+  "aliases": {
+    "qwen3.5:4b-nothink": {
+      "model": "qwen3.5:4b",
+      "params": {"think": false},
+      "description": "禁用思考模式的 4B 模型"
+    }
+  },
+  "rerank": {
+    "enabled": true,
+    "mode": "logprobs",
+    "models": ["qwen3-reranker:4b"],
+    "normalize": true,
+    "max_concurrency": 8
+  }
+}
+EOF
+
+# 创建环境变量文件
+cat > llm-hub/.env << 'EOF'
+GATEWAY_API_KEYS=sk-gateway-$(openssl rand -hex 16)
+TZ=Asia/Shanghai
+EOF
+```
+
+### 步骤 3: 启动服务
+
+```bash
+# 使用 docker run
+docker run -d --name llm-hub \
+  -p 8888:8000 \
+  -v $(pwd)/llm-hub/data:/data \
+  --env-file llm-hub/.env \
+  --restart unless-stopped \
+  bruce1977/llm-hub:latest
+
+# 或使用 docker compose
+cd llm-hub
+docker compose up -d
+```
+
+### 步骤 4: 验证部署
+
+```bash
+curl http://localhost:8888/health
+curl http://localhost:8888/v1/models -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### 更新镜像
+
+```bash
+# 拉取最新版本
+docker pull bruce1977/llm-hub:latest
+
+# 停止并删除旧容器
+docker stop llm-hub && docker rm llm-hub
+
+# 重新启动
+docker run -d --name llm-hub \
+  -p 8888:8000 \
+  -v $(pwd)/llm-hub/data:/data \
+  --env-file llm-hub/.env \
+  --restart unless-stopped \
+  bruce1977/llm-hub:latest
+```
+
+---
+
 ## 生产环境部署
 
 ### 使用 systemd 管理 (Linux)

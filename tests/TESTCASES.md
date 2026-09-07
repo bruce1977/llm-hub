@@ -898,25 +898,36 @@ curl http://localhost:8888/health
 curl http://localhost:8888/v1/models -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-### 测试 28: Docker 手动部署
+### 测试 28: Docker 部署
 
 **步骤:**
 
 ```bash
-# 1. 构建镜像
+# 方式一: 从 Docker Hub 拉取 (推荐)
+docker pull bruce1977/llm-hub:latest
+
+# 运行容器
+docker run -d --name llm-hub \
+  -p 8888:8000 \
+  -v ./data:/data \
+  --env-file .env \
+  --restart unless-stopped \
+  bruce1977/llm-hub:latest
+
+# 方式二: 从源码构建
 docker build -t llm-hub:latest .
 
-# 2. 运行容器
+# 运行容器
 docker run -d --name llm-hub \
   -p 8888:8000 \
   -v ./data:/data \
   --env-file .env \
   llm-hub:latest
 
-# 3. 查看日志
+# 查看日志
 docker logs -f llm-hub
 
-# 4. 验证
+# 验证
 curl http://localhost:8888/health
 ```
 

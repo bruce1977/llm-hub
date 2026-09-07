@@ -105,15 +105,22 @@ CONFIG_PATH=./data/config.json python -m uvicorn app.main:app --reload --port 80
 
 ### Docker Development
 ```bash
-# Build and run
-docker compose up --build
+# Pull from Docker Hub (recommended)
+docker pull bruce1977/llm-hub:latest
 
-# Or manually
+# Run with Docker Hub image
+docker run -d --name llm-hub \
+  -p 8888:8000 \
+  -v ./data:/data \
+  --env-file .env \
+  --restart unless-stopped \
+  bruce1977/llm-hub:latest
+
+# Or build from source
 docker build -t llm-hub:latest .
 docker run -d --name llm-hub \
   -p 8888:8000 \
   -v ./data:/data \
-  -v ./app:/app \
   --env-file .env \
   llm-hub:latest
 ```

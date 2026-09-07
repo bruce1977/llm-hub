@@ -184,22 +184,36 @@ python -m ruff format app/ tests/
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  1. 构建镜像  │────▶│  2. 配置环境  │────▶│  3. 启动容器  │────▶│  4. 验证服务  │
+│  1. 拉取镜像  │────▶│  2. 配置环境  │────▶│  3. 启动容器  │────▶│  4. 验证服务  │
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-  docker build        配置 config.json    docker run          curl /health
-  -t llm-hub:latest   配置 .env           docker compose      curl /v1/models
-                                        up -d
+  docker pull         配置 config.json    docker run          curl /health
+  bruce1977/llm-hub   配置 .env           docker compose      curl /v1/models
+                      latest              up -d
 ```
 
 **部署命令：**
 
 ```bash
-# 方式一: Docker Compose (推荐)
-docker compose up -d
+# 方式一: 从 Docker Hub 拉取 (推荐)
+docker pull bruce1977/llm-hub:latest
 
-# 方式二: 手动 Docker
+# 准备配置
+mkdir -p data
+cp data/example.config.json data/config.json
+cp .example.env .env
+# 编辑 data/config.json 和 .env
+
+# 启动
+docker run -d --name llm-hub \
+  -p 8888:8000 \
+  -v $(pwd)/data:/data \
+  --env-file .env \
+  --restart unless-stopped \
+  bruce1977/llm-hub:latest
+
+# 方式二: 从源码构建
 docker build -t llm-hub:latest .
 docker run -d --name llm-hub \
   -p 8888:8000 \

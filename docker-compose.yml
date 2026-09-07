@@ -1,7 +1,6 @@
 services:
   llm-hub:
-    build: .
-    image: llm-hub:latest
+    image: bruce1977/llm-hub:latest
     container_name: llm-hub
     restart: unless-stopped
     ports:
@@ -10,9 +9,6 @@ services:
     volumes:
       # Runtime configuration directory (holds config.json)
       - ./data:/data
-      # Source code: every *.py sits directly in /app, so local edits are picked
-      # up after a container restart without rebuilding the image.
-      - ./app:/app
     environment:
       # Path of the config file inside the container
       CONFIG_PATH: /data/config.json

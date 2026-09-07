@@ -36,6 +36,29 @@ llm-hub/
 
 ## 快速开始
 
+### 方式一：从 Docker Hub 拉取（推荐）
+
+```bash
+# 1. 拉取最新镜像
+docker pull bruce1977/llm-hub:latest
+
+# 2. 准备配置与密钥
+mkdir -p llm-hub/data
+cp data/example.config.json llm-hub/data/config.json
+cp .example.env llm-hub/.env
+# 编辑 llm-hub/data/config.json 和 llm-hub/.env，填入你的配置
+
+# 3. 启动
+docker run -d --name llm-hub \
+  -p 8888:8000 \
+  -v $(pwd)/llm-hub/data:/data \
+  --env-file llm-hub/.env \
+  --restart unless-stopped \
+  bruce1977/llm-hub:latest
+```
+
+### 方式二：从源码构建
+
 本项目采用 **`docker build` + `docker run`** 的方式部署（不依赖 compose）。配置目录通过卷挂载，
 密钥通过 `--env-file` 注入，二者都不写进镜像。
 

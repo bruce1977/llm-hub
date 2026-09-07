@@ -38,6 +38,29 @@ llm-hub/
 
 ## Quick start
 
+### Option 1: Pull from Docker Hub (Recommended)
+
+```bash
+# 1. Pull the latest image
+docker pull bruce1977/llm-hub:latest
+
+# 2. Prepare config & secrets
+mkdir -p llm-hub/data
+cp data/example.config.json llm-hub/data/config.json
+cp .example.env llm-hub/.env
+# Edit llm-hub/data/config.json and llm-hub/.env with your settings
+
+# 3. Run
+docker run -d --name llm-hub \
+  -p 8888:8000 \
+  -v $(pwd)/llm-hub/data:/data \
+  --env-file llm-hub/.env \
+  --restart unless-stopped \
+  bruce1977/llm-hub:latest
+```
+
+### Option 2: Build from source
+
 Deploy with `docker build` + `docker run` (no compose required). The config directory is
 volume-mounted and secrets are injected via `--env-file`; neither is baked into the image.
 
