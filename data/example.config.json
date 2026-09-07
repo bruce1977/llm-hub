@@ -1,0 +1,97 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "log_level": "info",
+    "request_timeout": 600.0,
+    "max_concurrency": 64,
+    "upstream_keepalive_expiry": 30.0
+  },
+  "auth": {
+    "enabled": true,
+    "api_keys": [],
+    "allow_anonymous_health": true
+  },
+  "routing": {
+    "strict": false
+  },
+  "upstreams": [
+    {
+      "name": "ollama",
+      "type": "ollama",
+      "base_url": "http://host.docker.internal:11434",
+      "models": [
+        "qwen3:4b",
+        "qwen3:8b",
+        "qwen3.6:35b-pruned"
+      ],
+      "timeout": 600,
+      "priority": 0,
+      "description": "Primary Ollama instance (GPU)"
+    },
+    {
+      "name": "ollama-ipex-llm",
+      "type": "ollama",
+      "base_url": "http://host.docker.internal:11435",
+      "models": [
+        "qwen3:4b",
+        "qwen3-reranker:4b"
+      ],
+      "timeout": 1800,
+      "priority": 10,
+      "description": "Second Ollama instance (iGPU) - lower priority, used as fallback for overlapping models"
+    },
+    {
+      "name": "lmstudio",
+      "type": "lmstudio",
+      "base_url": "http://host.docker.internal:1234",
+      "models": [],
+      "model_aliases": {
+        "qwen3.5:9b": "qwen/qwen3.5-9b"
+      },
+      "timeout": 600,
+      "priority": 20,
+      "description": "LM Studio (OpenAI-compatible API); verbose model ids exposed under short names via model_aliases"
+    }
+  ],
+  "default_upstream": "ollama",
+  "aliases": {
+    "qwen3:4b-nothink": {
+      "model": "qwen3:4b",
+      "params": { "think": false },
+      "description": "4B model with thinking disabled for faster responses"
+    },
+    "qwen3.6:35b-nothink": {
+      "model": "qwen3.6:35b-pruned",
+      "upstream": "ollama",
+      "params": { "think": false },
+      "description": "35B pruned model with thinking disabled"
+    }
+  },
+  "rerank": {
+    "enabled": true,
+    "endpoint": "/v1/rerank",
+    "mode": "logprobs",
+    "models": ["qwen3-reranker:4b"],
+    "instruction": "Given a web search query, retrieve relevant passages that answer the query",
+    "yes_token": "yes",
+    "no_token": "no",
+    "temperature": 0.0,
+    "top_logprobs": 20,
+    "max_tokens": 1,
+    "normalize": true,
+    "max_concurrency": 8,
+    "return_documents": false
+  },
+  "security": {
+    "admin_endpoints": "deny",
+    "blocked_paths": [],
+    "allow_docs": false,
+    "cors_origins": [],
+    "max_body_bytes": 33554432,
+    "allow_query_api_key": false,
+    "expose_health_details": false,
+    "fail_on_weak_keys": true,
+    "allowed_client_ips": []
+  }
+}

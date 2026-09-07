@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.git/
+.gitignore
+.env
+.idea/
+.vscode/
+*.log
+data/*.local.json
