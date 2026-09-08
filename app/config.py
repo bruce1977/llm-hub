@@ -29,6 +29,9 @@ CONFIG_PATH = os.getenv("CONFIG_PATH", "/data/config.json")
 ENV_API_KEYS = "GATEWAY_API_KEYS"
 ENV_API_KEYS_FILE = "GATEWAY_API_KEYS_FILE"
 
+#: Environment variable to disable authentication entirely (e.g. GATEWAY_AUTH_DISABLED=true)
+ENV_AUTH_DISABLED = "GATEWAY_AUTH_DISABLED"
+
 
 def collect_env_api_keys() -> list[str]:
     """Collect API keys from the environment.
@@ -482,6 +485,11 @@ class ConfigManager:
 
         # Merge keys from the environment so secrets do not have to live in config.json
         cfg.auth.api_keys = merge_env_api_keys(cfg.auth.api_keys)
+
+        # Allow disabling auth via environment variable (takes precedence over config file)
+        if os.getenv(ENV_AUTH_DISABLED, "").lower() in ("true", "1", "yes"):
+            cfg.auth.enabled = False
+            logger.info("Authentication disabled via %s=true", ENV_AUTH_DISABLED)
 
         logger.info(
             "Config loaded: %s | upstreams=%d | aliases=%d | api_keys=%d",
