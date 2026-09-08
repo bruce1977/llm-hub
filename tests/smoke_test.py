@@ -255,6 +255,20 @@ def main() -> int:
         r = client.get("/v1/models", headers={"X-API-Key": "sk-test-2"})
         check("The second key and the X-API-Key header work", r.status_code == 200, f"got {r.status_code}")
 
+        # ----------------------------------------- GATEWAY_AUTH_DISABLED env var ---
+        print("[2b] GATEWAY_AUTH_DISABLED")
+        os.environ["GATEWAY_AUTH_DISABLED"] = "true"
+        try:
+            manager = getattr(client.app.state, "manager", None)
+            if manager:
+                manager.reload()
+            r = client.get("/v1/models")
+            check("GATEWAY_AUTH_DISABLED=true skips auth", r.status_code == 200, f"got {r.status_code}")
+        finally:
+            os.environ.pop("GATEWAY_AUTH_DISABLED", None)
+            if manager:
+                manager.reload()
+
         # ------------------------------------------------ /v1/models aggregation ---
         print("[3] Unified /v1/models")
         r = client.get("/v1/models", headers=good)
