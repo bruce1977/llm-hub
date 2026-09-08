@@ -260,43 +260,86 @@ curl http://localhost:8888/v1/rerank \
 |------|------|------|------|
 | `model` | string | ✅ | 重排序模型名称 |
 | `query` | string | ✅ | 查询文本 |
-| `documents` | array | ✅ | 待排序文档列表 |
+| `documents` | array | ✅ | 待排序文档列表（`string` 或 `{"text": "..."}`） |
 | `top_n` | integer | ❌ | 返回前 N 个结果 |
-| `return_documents` | boolean | ❌ | 是否返回文档内容 |
+| `return_documents` | boolean | ❌ | 是否返回文档内容（默认取配置 `rerank.return_documents`） |
 | `instruction` | string | ❌ | 覆盖默认指令 |
+
+兼容别名（便于对接不同客户端 / 网关）：
+
+| 别名 | 对应字段 | 说明 |
+|------|----------|------|
+| `model_name` / `model_id` | `model` | 优先级：`model` > `model_name` > `model_id` |
+| `input` | `query` | 支持字符串或单元素数组 |
+| `texts` / `passages` | `documents` | 文档列表的另一种写法 |
+
+> 未传 `model` 时，会回退到配置 `rerank.models` 中的第一个模型。
 
 **响应 (200 OK)：**
 
 ```json
 {
   "id": "rerank-abc123def456",
-  "model": "qwen3-reranker:4b",
   "object": "list",
+  "model": "qwen3-reranker:4b",
   "results": [
     {
       "index": 0,
-      "relevance_score": 0.91234567,
       "rank": 0,
+      "relevance_score": 0.91234567,
       "document": {
         "text": "手冲咖啡需要90°C左右的水温"
       }
     },
     {
       "index": 2,
-      "relevance_score": 0.63456789,
       "rank": 1,
+      "relevance_score": 0.63456789,
       "document": {
         "text": "研磨度影响萃取速度"
       }
     }
   ],
   "usage": {
-    "total_tokens": 0,
-    "prompt_tokens": 0,
-    "rerank_count": 3
+    "rerank_count": 3,
+    "returned_count": 2,
+    "failed_count": 0
+  },
+  "meta": {
+    "mode": "logprobs",
+    "upstream": "ollama",
+    "model": "qwen3-reranker:4b",
+    "total_documents": 3,
+    "returned_documents": 2,
+    "failed_documents": 0,
+    "normalized": false,
+    "took_ms": 412.35
   }
 }
 ```
+
+**打分模式：**
+
+| 模式 | 适用模型 | 原理 |
+|------|----------|------|
+| `logprobs`（默认） | Qwen3-Reranker 等生成式重排模型 | 用 yes/no 提示词取**首个回答 token** 的 logprobs，做二分类 softmax 得到概率 |
+| `embedding` | bge-m3 等向量模型 | 一次性批量向量化 query + 文档，用余弦相似度打分 |
+
+`relevance_score` 默认是**绝对概率**（0~1，跨请求可比）。若希望把本批次分数拉伸到 `[0,1]`，可设置 `rerank.normalize: true`。
+
+**关键配置项（`rerank` 段）：**
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `mode` / `model_modes` | `logprobs` | 全局模式 / 按模型覆盖，如 `{"bge-m3:latest": "embedding"}` |
+| `upstream_api` | `auto` | Ollama 走 `/api/generate`（`raw_prompt=true`，避免注入 `<think>`），OpenAI 兼容走 `/v1/chat/completions`；可强制 `chat` |
+| `top_logprobs` | `20` | 向上游请求的候选 token 数，用于计算 yes/no 概率 |
+| `max_tokens` | `2` | 只生成少量 token 判定 yes/no |
+| `normalize` | `false` | 是否做 min-max 归一化 |
+| `return_documents` | `true` | 响应是否回带文档原文 |
+| `on_error` | `score_zero` | 单篇打分失败时：记 0 分或返回 502（全部失败一律 502） |
+| `max_documents` / `max_document_chars` | `0` | 文档数量 / 单篇长度上限，0 表示不限制 |
+| `embedding_query_prefix` / `embedding_clamp` | `""` / `true` | embedding 模式的 query 前缀、余弦值裁剪到 `[0,1]` |
 
 ---
 

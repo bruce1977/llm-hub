@@ -71,8 +71,10 @@ cp .example.env .env
     "enabled": true,
     "mode": "logprobs",
     "models": ["qwen3-reranker:4b"],
-    "normalize": true,
-    "max_concurrency": 8
+    "normalize": false,
+    "max_concurrency": 8,
+    "return_documents": true,
+    "model_modes": { "bge-m3:latest": "embedding" }
   }
 }
 ```
@@ -170,8 +172,10 @@ cat > llm-hub/data/config.json << 'EOF'
     "enabled": true,
     "mode": "logprobs",
     "models": ["qwen3-reranker:4b"],
-    "normalize": true,
-    "max_concurrency": 8
+    "normalize": false,
+    "max_concurrency": 8,
+    "return_documents": true,
+    "model_modes": { "bge-m3:latest": "embedding" }
   }
 }
 EOF

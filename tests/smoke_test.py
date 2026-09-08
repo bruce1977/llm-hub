@@ -134,7 +134,36 @@ def make_handler(store: list[dict[str, Any]]):
 
             # --- chat ---
             elif self.path.endswith("/api/chat"):
-                if body.get("stream"):
+                # Check if this is a rerank request (has logprobs enabled)
+                if body.get("logprobs"):
+                    messages = body.get("messages", [])
+                    prompt = messages[0].get("content", "") if messages else ""
+                    # return different yes/no probabilities per document so ordering can be verified
+                    if "highly relevant" in prompt:
+                        yes_lp, no_lp = -0.1, -3.0
+                    elif "partially relevant" in prompt:
+                        yes_lp, no_lp = -1.0, -1.0
+                    else:
+                        yes_lp, no_lp = -3.0, -0.2
+                    self._send(
+                        {
+                            "model": model,
+                            "message": {"role": "assistant", "content": "yes" if yes_lp > no_lp else "no"},
+                            "done": True,
+                            "logprobs": [
+                                {
+                                    "token": "yes",
+                                    "logprob": yes_lp,
+                                    "bytes": [],
+                                    "top_logprobs": [
+                                        {"token": "yes", "logprob": yes_lp, "bytes": []},
+                                        {"token": " no", "logprob": no_lp, "bytes": []},
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                elif body.get("stream"):
                     self._send(
                         [
                             {"model": model, "message": {"role": "assistant", "content": "Hel"}, "done": False},
@@ -400,6 +429,154 @@ def main() -> int:
             "document" in (results[0] if results else {}),
             str(results[0] if results else None),
         )
+        # The upstream call must really ask for logprobs - without it Ollama returns none
+        # and every score silently degrades to the 0.9/0.1/0.5 text fallback.
+        scored_calls = [
+            c
+            for c in store_a
+            if c["path"].endswith(("/api/generate", "/api/chat")) and c["body"].get("logprobs") is True
+        ]
+        check("rerank requests logprobs from the upstream", len(scored_calls) >= 3, str(len(scored_calls)))
+        if scored_calls:
+            first_call = scored_calls[-1]["body"]
+            check(
+                "upstream request carries top_logprobs",
+                first_call.get("top_logprobs", 0) >= 1,
+                str(first_call.get("top_logprobs")),
+            )
+            check(
+                "upstream request targets the resolved model id",
+                first_call.get("model") == "qwen3-reranker:4b",
+                str(first_call.get("model")),
+            )
+        distinct = {round(x["relevance_score"], 6) for x in results}
+        check(
+            "Scores carry real signal (not the flat fallback)",
+            len(distinct) == len(results),
+            str([x["relevance_score"] for x in results]),
+        )
+
+        # ------------------------------------------- Rerank: logprobs parsing ---
+        print("[7b] Rerank - logprobs parsing")
+        from rerank import extract_positions, text_fallback_score, yes_no_probability
+
+        ollama_resp = {
+            "logprobs": [
+                {
+                    "token": " yes",
+                    "logprob": -0.02,
+                    "top_logprobs": [
+                        {"token": " yes", "logprob": -0.02},
+                        {"token": " no", "logprob": -5.0},
+                    ],
+                }
+            ]
+        }
+        score = yes_no_probability(extract_positions(ollama_resp), "yes", "no")
+        check("ollama logprobs -> high yes probability", score is not None and score > 0.99, str(score))
+
+        openai_resp = {
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {
+                                "token": "no",
+                                "logprob": -0.1,
+                                "top_logprobs": [
+                                    {"token": "yes", "logprob": -2.5},
+                                    {"token": "no", "logprob": -0.1},
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        score = yes_no_probability(extract_positions(openai_resp), "yes", "no")
+        check("openai logprobs -> low yes probability", score is not None and score < 0.1, str(score))
+
+        thinking_resp = {
+            "message": {"content": "<think>\n\n</think>\n\nyes"},
+            "logprobs": [
+                {"token": "<think>", "logprob": -0.0, "top_logprobs": [{"token": "<think>", "logprob": -0.0}]},
+                {
+                    "token": "yes",
+                    "logprob": -0.5,
+                    "top_logprobs": [
+                        {"token": "yes", "logprob": -0.5},
+                        {"token": "no", "logprob": -2.0},
+                    ],
+                },
+            ],
+        }
+        score = yes_no_probability(extract_positions(thinking_resp), "yes", "no")
+        check("a leading <think> token is skipped", score is not None and score > 0.8, str(score))
+        check(
+            "text fallback maps yes/no to 0.9/0.1",
+            text_fallback_score("yes", "yes", "no") == 0.9 and text_fallback_score("No.", "yes", "no") == 0.1,
+            f"{text_fallback_score('yes', 'yes', 'no')} / {text_fallback_score('No.', 'yes', 'no')}",
+        )
+
+        # ------------------------------------- Rerank: absolute score semantics ---
+        print("[7c] Rerank - normalize=false keeps absolute probabilities")
+        config["rerank"]["normalize"] = False
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(config, fh)
+        manager = getattr(client.app.state, "manager", None)
+        if manager:
+            manager.reload()
+        r = client.post(
+            "/v1/rerank",
+            headers=good,
+            json={
+                "model": "qwen3-reranker:4b",
+                "query": "what is the capital of France",
+                "documents": ["highly relevant document about Paris"],
+            },
+        )
+        single_scores = [x["relevance_score"] for x in r.json().get("results", [])]
+        check(
+            "a single document keeps its absolute probability (not 0.5)",
+            len(single_scores) == 1 and single_scores[0] > 0.9,
+            str(single_scores),
+        )
+
+        # ---------------------------------- Rerank: generic provider payload ---
+        print("[7d] Rerank - generic provider payload (model_name + input)")
+        r = client.post(
+            "/v1/rerank",
+            headers=good,
+            json={
+                "documents": [
+                    "CPU 飙升通常由死循环代码或高并发请求引起，建议使用 top 命令定位进程。",
+                    "服务器内存不足时，系统会频繁使用 Swap 分区。",
+                    "如何更换服务器机房空调滤网：首先切断电源。",
+                ],
+                "input": "服务器 CPU 占用率突然飙升到 100%，导致系统响应极慢，怎么排查？",
+                "model_id": "4d5207dd-7784-40b1-8be8-a5927a188c2c",
+                "model_name": "qwen3-reranker:4b",
+                "model_type": "Rerank",
+                "options": {},
+                "provider": "generic",
+                "source": "remote",
+            },
+        )
+        check("generic provider payload returns 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+        body = r.json()
+        check("response echoes the requested model", body.get("model") == "qwen3-reranker:4b", str(body.get("model")))
+        check(
+            "results expose index / relevance_score / document.text",
+            all({"index", "relevance_score", "document"} <= set(x) for x in body.get("results", [])),
+            json.dumps(body.get("results", [])[:1], ensure_ascii=False),
+        )
+        check("meta reports the scoring mode", body.get("meta", {}).get("mode") == "logprobs", str(body.get("meta")))
+
+        config["rerank"]["normalize"] = True
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(config, fh)
+        if manager:
+            manager.reload()
 
         # ------------------------------------------------ Rerank: embedding ---
         print("[8] Rerank - embedding mode")
@@ -430,6 +607,18 @@ def main() -> int:
         check("Empty documents returns 400", r.status_code == 400, f"got {r.status_code}")
         r = client.get("/v1/rerank", headers=good)
         check("rerank rejects GET with 405", r.status_code == 405, f"got {r.status_code}")
+
+        # --- field alias compatibility: input/model_name ---
+        r = client.post(
+            "/v1/rerank",
+            headers=good,
+            json={
+                "model_name": "qwen3-reranker:4b",
+                "input": "test query",
+                "documents": ["doc1", "doc2"],
+            },
+        )
+        check("model_name+input aliases work", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
 
         # ------------------------------------------- Security: admin endpoint block ---
         print("[10] Security - admin endpoint blocking")

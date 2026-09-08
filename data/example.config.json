@@ -78,10 +78,21 @@
     "no_token": "no",
     "temperature": 0.0,
     "top_logprobs": 20,
-    "max_tokens": 1,
-    "normalize": true,
+    "max_tokens": 2,
+    "normalize": false,
     "max_concurrency": 8,
-    "return_documents": false
+    "return_documents": true,
+    "model_modes": {
+      "bge-m3:latest": "embedding"
+    },
+    "upstream_api": "auto",
+    "raw_prompt": true,
+    "disable_thinking": true,
+    "max_documents": 0,
+    "max_document_chars": 0,
+    "on_error": "score_zero",
+    "embedding_query_prefix": "",
+    "embedding_clamp": true
   },
   "security": {
     "admin_endpoints": "deny",

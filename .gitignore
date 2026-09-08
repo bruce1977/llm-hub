@@ -13,6 +13,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.workbuddy/
 
 # Editors / OS
 .idea/

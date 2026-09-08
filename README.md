@@ -327,8 +327,10 @@ clients like Dify / RAGFlow / WorkBuddy see a tidy list of short names.
   "enabled": true,
   "mode": "logprobs",
   "models": ["qwen3-reranker:4b"],
-  "normalize": true,
-  "max_concurrency": 8
+  "normalize": false,
+  "max_concurrency": 8,
+  "return_documents": true,
+  "model_modes": { "bge-m3:latest": "embedding" }
 }
 ```
 

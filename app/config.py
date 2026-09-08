@@ -176,15 +176,64 @@ class RerankConfig(BaseModel):
     no_token: str = "no"
     temperature: float = 0.0
     top_logprobs: int = 20
-    max_tokens: int = 1
-    normalize: bool = True
+    max_tokens: int = 2
+    # Off by default: logprobs already produce probabilities in [0, 1] and min-max
+    # normalization would force the best hit to 1.0 / the worst to 0.0, which makes
+    # scores incomparable across requests (and meaningless for a single document).
+    normalize: bool = False
     max_concurrency: int = 8
-    return_documents: bool = False
+    return_documents: bool = True
     # Per-model mode override, e.g. {"bge-m3:latest": "embedding"}
     model_modes: dict[str, str] = Field(default_factory=dict)
+    # Which upstream call to use for generative scoring:
+    #   "auto"     -> Ollama: /api/generate (raw prompt), OpenAI-compatible: /v1/chat/completions
+    #   "generate" -> always Ollama /api/generate
+    #   "chat"     -> always the chat endpoint (/api/chat or /v1/chat/completions)
+    upstream_api: str = "auto"
+    # Send the rendered template verbatim, without applying the model's chat template.
+    # Required for the Qwen3-Reranker prompt, which already is a full chat prompt.
+    raw_prompt: bool = True
+    # Thinking models would waste the tiny token budget on <think>...</think>.
+    disable_thinking: bool = True
+    # Guard rails (0 = unlimited)
+    max_documents: int = 0
+    max_document_chars: int = 0
+    # What to do when a single document cannot be scored:
+    #   "score_zero" -> score it 0.0 and keep going
+    #   "fail"       -> return 502
+    # (if EVERY document fails, 502 is returned in both cases)
+    on_error: str = "score_zero"
+    # Embedding mode: optional prefix for the query (bge/gte style retrieval instructions)
+    embedding_query_prefix: str = ""
+    # Embedding mode: clamp cosine similarity from [-1, 1] to [0, 1]
+    embedding_clamp: bool = True
 
-    def mode_for(self, model: str) -> str:
-        return self.model_modes.get(model, self.mode)
+    #: Accepted spellings for the two scoring modes.
+    MODE_ALIASES: ClassVar[dict[str, str]] = {
+        "logprob": "logprobs",
+        "logprobs": "logprobs",
+        "generation": "logprobs",
+        "generate": "logprobs",
+        "generative": "logprobs",
+        "cross-encoder": "logprobs",
+        "cross_encoder": "logprobs",
+        "crossencoder": "logprobs",
+        "yes_no": "logprobs",
+        "embedding": "embedding",
+        "embeddings": "embedding",
+        "vector": "embedding",
+        "cosine": "embedding",
+    }
+
+    def mode_for(self, model: str, target: str | None = None) -> str:
+        """Resolve the scoring mode for a model (per-model override wins)."""
+        raw = self.model_modes.get(model)
+        if not raw and target:
+            raw = self.model_modes.get(target)
+        if not raw:
+            raw = self.mode
+        normalized = str(raw).strip().lower()
+        return self.MODE_ALIASES.get(normalized, normalized)
 
 
 class SecurityConfig(BaseModel):
@@ -430,11 +479,19 @@ def build_default_config() -> dict[str, Any]:
             "no_token": "no",
             "temperature": 0.0,
             "top_logprobs": 20,
-            "max_tokens": 1,
-            "normalize": True,
+            "max_tokens": 2,
+            "normalize": False,
             "max_concurrency": 8,
-            "return_documents": False,
+            "return_documents": True,
             "model_modes": {"bge-m3:latest": "embedding"},
+            "upstream_api": "auto",
+            "raw_prompt": True,
+            "disable_thinking": True,
+            "max_documents": 0,
+            "max_document_chars": 0,
+            "on_error": "score_zero",
+            "embedding_query_prefix": "",
+            "embedding_clamp": True,
         },
     }
 

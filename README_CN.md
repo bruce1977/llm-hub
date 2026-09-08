@@ -305,8 +305,10 @@ Dify / RAGFlow / WorkBuddy 等客户端看到的模型列表是整齐的短名�
   "enabled": true,
   "mode": "logprobs",
   "models": ["qwen3-reranker:4b"],
-  "normalize": true,
-  "max_concurrency": 8
+  "normalize": false,
+  "max_concurrency": 8,
+  "return_documents": true,
+  "model_modes": { "bge-m3:latest": "embedding" }
 }
 ```
 
