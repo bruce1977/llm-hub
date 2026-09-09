@@ -49,7 +49,17 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 # --------------------------------------------------------------------------- #
 # Mock Ollama upstream
 # --------------------------------------------------------------------------- #
-def make_handler(store: list[dict[str, Any]]):
+def make_handler(store: list[dict[str, Any]], generate_mode: str = "ok"):
+    """Mock Ollama upstream.
+
+    generate_mode:
+      "ok"           - /api/generate returns proper yes/no logprobs
+      "no_logprobs"  - emulates an Ollama that silently ignores the top-level
+                       ``logprobs`` field (-> flat 0.9/0.1 text scores)
+      "garbage"      - emulates a model that is not in an answering state and emits
+                       multilingual junk ('ਐ', '경') instead of yes/no
+    """
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # silence the access log
             pass
@@ -100,37 +110,39 @@ def make_handler(store: list[dict[str, Any]]):
                     yes_lp, no_lp = -1.0, -1.0
                 else:
                     yes_lp, no_lp = -3.0, -0.2
-                self._send(
-                    {
-                        "model": model,
-                        "response": "yes" if yes_lp > no_lp else "no",
-                        "done": True,
-                        "logprobs": [
-                            {
-                                "token": "yes",
-                                "logprob": yes_lp,
-                                "bytes": [],
-                                "top_logprobs": [
-                                    {"token": "yes", "logprob": yes_lp, "bytes": []},
-                                    {"token": " no", "logprob": no_lp, "bytes": []},
-                                ],
-                            }
-                        ],
-                    }
-                )
-
-            # --- rerank: embedding mode ---
-            elif self.path.endswith("/api/embed"):
-                inputs = body.get("input", [])
-                vectors = []
-                for i, text in enumerate(inputs):
-                    if i == 0 or "highly" in text:  # query
-                        vectors.append([1.0, 0.0, 0.0])
-                    elif "partially" in text:
-                        vectors.append([0.7071, 0.7071, 0.0])
-                    else:
-                        vectors.append([0.0, 1.0, 0.0])
-                self._send({"model": model, "embeddings": vectors})
+                answer = {
+                    "model": model,
+                    "response": "yes" if yes_lp > no_lp else "no",
+                    "done": True,
+                }
+                if generate_mode == "garbage":
+                    # Real-world symptom: the model is not in an answering state and
+                    # "continues the document" with multilingual junk.
+                    answer["response"] = "ਐ"
+                    answer["logprobs"] = [
+                        {
+                            "token": "ਐ",
+                            "logprob": -0.05,
+                            "bytes": [],
+                            "top_logprobs": [
+                                {"token": "ਐ", "logprob": -0.05, "bytes": []},
+                                {"token": " 경", "logprob": -2.1, "bytes": []},
+                            ],
+                        }
+                    ]
+                elif generate_mode == "ok":
+                    answer["logprobs"] = [
+                        {
+                            "token": "yes",
+                            "logprob": yes_lp,
+                            "bytes": [],
+                            "top_logprobs": [
+                                {"token": "yes", "logprob": yes_lp, "bytes": []},
+                                {"token": " no", "logprob": no_lp, "bytes": []},
+                            ],
+                        }
+                    ]
+                self._send(answer)
 
             # --- chat ---
             elif self.path.endswith("/api/chat"):
@@ -188,17 +200,28 @@ def make_handler(store: list[dict[str, Any]]):
 
 
 def start_mock() -> tuple:
-    """Start two mock upstreams to simulate a multi-instance deployment."""
+    """Start four mock upstreams.
+
+    * mock-a / mock-b simulate a normal multi-instance deployment
+    * mock-c simulates an Ollama that returns no logprobs on /api/generate
+    * mock-d simulates a reranker that emits junk tokens instead of yes/no
+    """
     store_a: list[dict[str, Any]] = []
     store_b: list[dict[str, Any]] = []
+    store_c: list[dict[str, Any]] = []
+    store_d: list[dict[str, Any]] = []
 
     server_a = HTTPServer(("127.0.0.1", 0), make_handler(store_a))
     server_b = HTTPServer(("127.0.0.1", 0), make_handler(store_b))
-    threading.Thread(target=server_a.serve_forever, daemon=True).start()
-    threading.Thread(target=server_b.serve_forever, daemon=True).start()
+    server_c = HTTPServer(("127.0.0.1", 0), make_handler(store_c, generate_mode="no_logprobs"))
+    server_d = HTTPServer(("127.0.0.1", 0), make_handler(store_d, generate_mode="garbage"))
+    for server in (server_a, server_b, server_c, server_d):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
     return (
         (server_a, store_a, f"http://127.0.0.1:{server_a.server_address[1]}"),
         (server_b, store_b, f"http://127.0.0.1:{server_b.server_address[1]}"),
+        (server_c, store_c, f"http://127.0.0.1:{server_c.server_address[1]}"),
+        (server_d, store_d, f"http://127.0.0.1:{server_d.server_address[1]}"),
     )
 
 
@@ -206,7 +229,7 @@ def start_mock() -> tuple:
 # Main test flow
 # --------------------------------------------------------------------------- #
 def main() -> int:
-    (srv_a, store_a, url_a), (srv_b, store_b, url_b) = start_mock()
+    (srv_a, store_a, url_a), (srv_b, store_b, url_b), (srv_c, store_c, url_c), (srv_d, store_d, url_d) = start_mock()
 
     config = {
         "server": {"host": "127.0.0.1", "port": 8000, "log_level": "warning"},
@@ -228,6 +251,20 @@ def main() -> int:
                 "models": ["big-model:72b", "bge-m3:latest"],
                 "timeout": 30,
             },
+            {
+                # "Old Ollama": /api/generate silently drops the logprobs field.
+                "name": "mock-c",
+                "base_url": url_c,
+                "models": ["reranker-old:4b"],
+                "timeout": 30,
+            },
+            {
+                # Reranker that answers with junk instead of yes/no.
+                "name": "mock-d",
+                "base_url": url_d,
+                "models": ["reranker-broken:4b"],
+                "timeout": 30,
+            },
         ],
         "default_upstream": "mock-a",
         "aliases": {
@@ -244,8 +281,7 @@ def main() -> int:
         "rerank": {
             "enabled": True,
             "mode": "logprobs",
-            "models": ["qwen3-reranker:4b", "bge-m3:latest"],
-            "model_modes": {"bge-m3:latest": "embedding"},
+            "models": ["qwen3-reranker:4b"],
             "normalize": True,
             "max_concurrency": 4,
             "return_documents": True,
@@ -455,6 +491,14 @@ def main() -> int:
             len(distinct) == len(results),
             str([x["relevance_score"] for x in results]),
         )
+        meta = result.get("meta", {})
+        check("meta reports that real logprobs were used", meta.get("logprobs_ok") is True, json.dumps(meta))
+        check("meta reports the endpoint style", meta.get("endpoint") == "generate", str(meta.get("endpoint")))
+        check(
+            "no document had to use the text fallback",
+            meta.get("text_fallbacks") == 0,
+            str(meta.get("text_fallbacks")),
+        )
 
         # ------------------------------------------- Rerank: logprobs parsing ---
         print("[7b] Rerank - logprobs parsing")
@@ -517,6 +561,25 @@ def main() -> int:
             text_fallback_score("yes", "yes", "no") == 0.9 and text_fallback_score("No.", "yes", "no") == 0.1,
             f"{text_fallback_score('yes', 'yes', 'no')} / {text_fallback_score('No.', 'yes', 'no')}",
         )
+        check(
+            "unparsable text scores 0.0 instead of a misleading 0.5",
+            text_fallback_score("ਐ", "yes", "no") == 0.0,
+            str(text_fallback_score("ਐ", "yes", "no")),
+        )
+        zh_resp = {
+            "logprobs": [
+                {
+                    "token": " 是",
+                    "logprob": -0.1,
+                    "top_logprobs": [
+                        {"token": " 是", "logprob": -0.1},
+                        {"token": " 否", "logprob": -4.0},
+                    ],
+                }
+            ]
+        }
+        score = yes_no_probability(extract_positions(zh_resp), "yes", "no", ["是"], ["否"])
+        check("configured yes/no aliases are honoured", score is not None and score > 0.9, str(score))
 
         # ------------------------------------- Rerank: absolute score semantics ---
         print("[7c] Rerank - normalize=false keeps absolute probabilities")
@@ -572,6 +635,71 @@ def main() -> int:
         )
         check("meta reports the scoring mode", body.get("meta", {}).get("mode") == "logprobs", str(body.get("meta")))
 
+        # ------------------------------------- Rerank: logprobs fallback chain ---
+        print("[7e] Rerank - upstream without logprobs on /api/generate")
+        store_c.clear()
+        r = client.post(
+            "/v1/rerank",
+            headers=good,
+            json={
+                "model": "reranker-old:4b",
+                "query": "what is the capital of France",
+                "documents": [
+                    "highly relevant document about Paris",
+                    "totally unrelated content",
+                ],
+            },
+        )
+        check(
+            "rerank survives an upstream that drops logprobs",
+            r.status_code == 200,
+            f"got {r.status_code}: {r.text[:200]}",
+        )
+        meta = r.json().get("meta", {}) if r.status_code == 200 else {}
+        paths = [c["path"] for c in store_c]
+        check(
+            "falls back to /api/chat when /api/generate returns no logprobs",
+            any(p.endswith("/api/chat") for p in paths),
+            str(paths),
+        )
+        check("meta reports the endpoint that finally worked", meta.get("endpoint") == "chat", json.dumps(meta))
+        check("scores come from real logprobs after the fallback", meta.get("logprobs_ok") is True, json.dumps(meta))
+        check(
+            "ordering is preserved after the fallback",
+            [x["index"] for x in r.json().get("results", [])] == [0, 1],
+            str([(x["index"], x["relevance_score"]) for x in r.json().get("results", [])]),
+        )
+
+        # ------------------------------- Rerank: junk tokens instead of yes/no ---
+        print("[7f] Rerank - model answers with garbage tokens")
+        store_d.clear()
+        r = client.post(
+            "/v1/rerank",
+            headers=good,
+            json={
+                "model": "reranker-broken:4b",
+                "query": "what is the capital of France",
+                "documents": [
+                    "highly relevant document about Paris",
+                    "totally unrelated content",
+                ],
+            },
+        )
+        check("rerank returns 200 for a rambling model", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+        meta = r.json().get("meta", {}) if r.status_code == 200 else {}
+        check(
+            "junk logprobs trigger the next endpoint style",
+            any(c["path"].endswith("/api/chat") for c in store_d),
+            str([c["path"] for c in store_d]),
+        )
+        check("the healthy endpoint is reported", meta.get("endpoint") == "chat", json.dumps(meta))
+        check("scores still come from real logprobs", meta.get("logprobs_ok") is True, json.dumps(meta))
+        check(
+            "no document was scored by the text fallback",
+            meta.get("text_fallbacks") == 0,
+            json.dumps(meta),
+        )
+
         config["rerank"]["normalize"] = True
         with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
             json.dump(config, fh)
@@ -579,27 +707,32 @@ def main() -> int:
             manager.reload()
 
         # ------------------------------------------------ Rerank: embedding ---
-        print("[8] Rerank - embedding mode")
+        print("[8] Rerank - embedding mode has been removed")
+        config["rerank"]["model_modes"] = {"qwen3-reranker:4b": "embedding"}
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(config, fh)
+        if manager:
+            manager.reload()
         r = client.post(
             "/v1/rerank",
             headers=good,
             json={
-                "model": "bge-m3:latest",
+                "model": "qwen3-reranker:4b",
                 "query": "test query",
-                "documents": [
-                    "highly relevant",
-                    "partially relevant",
-                    "unrelated",
-                ],
+                "documents": ["highly relevant", "unrelated"],
             },
         )
-        check("embedding-mode rerank returns 200", r.status_code == 200, r.text[:200])
-        results = r.json().get("results", [])
+        check("embedding mode is rejected with 400", r.status_code == 400, f"got {r.status_code}: {r.text[:200]}")
         check(
-            "embedding ordering is 0 > 1 > 2",
-            [x["index"] for x in results] == [0, 1, 2],
-            str([(x["index"], x["relevance_score"]) for x in results]),
+            "the error explains why embedding mode was removed",
+            "removed" in str(r.json().get("detail", "")).lower(),
+            str(r.json().get("detail"))[:160],
         )
+        config["rerank"]["model_modes"] = {}
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(config, fh)
+        if manager:
+            manager.reload()
 
         # -------------------------------------------------------- validation ---
         print("[9] Errors and edge cases")
@@ -791,6 +924,8 @@ def main() -> int:
 
     srv_a.shutdown()
     srv_b.shutdown()
+    srv_c.shutdown()
+    srv_d.shutdown()
 
     print(f"\n=== Result: {PASSED} passed, {FAILED} failed ===\n")
     return 1 if FAILED else 0

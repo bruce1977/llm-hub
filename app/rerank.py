@@ -2,12 +2,23 @@
 Reranker API implementation.
 Exposes the standard /v1/rerank endpoint (Cohere / Infinity style).
 
-Supports two scoring modes:
-1. logprobs: For generative rerankers (e.g. Qwen3-Reranker).
-   Builds a yes/no prompt, reads the logprobs of the answering token and turns the
-   yes/no distribution into a relevance probability.
-2. embedding: For embedding models (e.g. bge-m3).
-   Embeds the query together with the documents and uses cosine similarity as score.
+Scoring mode: logprobs (generative rerankers such as Qwen3-Reranker).
+A yes/no prompt is sent to the model, the logprobs of the answering token are read back
+and the yes/no distribution is turned into a relevance probability.
+
+Note: a former "embedding" mode (cosine similarity over bge-m3 vectors) was removed -
+re-ranking with the very model that produced the retrieval embeddings adds no signal.
+
+Logprobs robustness
+-------------------
+Ollama only returns token log probabilities when the caller explicitly asks for them
+(``"logprobs": true`` plus ``"top_logprobs": n`` at the TOP level of the request body -
+they are *not* Ollama ``options``). Older Ollama releases simply ignore the fields, and
+some OpenAI-compatible backends only implement them on the chat endpoint. When the
+response carries no logprobs at all, the scorer therefore walks a fallback chain of
+endpoint styles (``/api/generate`` -> ``/api/chat`` -> ``/v1/chat/completions``) and only
+then degrades to parsing the generated text. Which path was taken is reported back in
+``meta`` so a broken deployment is visible instead of silently producing flat scores.
 """
 
 from __future__ import annotations
@@ -28,10 +39,43 @@ logger = logging.getLogger("llm_hub")
 #: Score used when no logprobs are available and the model plainly answered "yes"/"no".
 FALLBACK_YES = 0.9
 FALLBACK_NO = 0.1
-FALLBACK_UNKNOWN = 0.5
+#: Score used when neither logprobs nor a yes/no text answer are available.
+#:
+#: 0.0 (instead of a neutral 0.5) is deliberate: an unparsable answer means "we could not
+#: establish relevance", and treating it as "half relevant" pushes unrelated documents
+#: through downstream score thresholds.
+FALLBACK_UNKNOWN = 0.0
 
 #: How many generated token positions are inspected when looking for the yes/no answer.
 MAX_TOKEN_SCAN = 4
+
+#: Ollama and OpenAI both cap the number of returned alternatives at 20.
+MAX_TOP_LOGPROBS = 20
+
+#: Endpoint styles used for generative (logprobs) scoring.
+STYLE_GENERATE = "generate"  # Ollama /api/generate (raw prompt, no chat template)
+STYLE_CHAT = "chat"  # Ollama /api/chat
+STYLE_OPENAI = "openai"  # /v1/chat/completions (LM Studio, vLLM, ...)
+
+#: Endpoints already reported as "no logprobs" (kept small; used to log the hint once).
+_no_logprobs_warned: set[str] = set()
+
+
+def _warn_no_logprobs(key: str, detail: str) -> None:
+    """Log the 'upstream returned no logprobs' hint once per endpoint/model."""
+    if key in _no_logprobs_warned:
+        logger.debug("Upstream %s still returns no logprobs: %s", key, detail)
+        return
+    _no_logprobs_warned.add(key)
+    logger.warning(
+        "Rerank: upstream %s did not return any logprobs (%s). "
+        "Scores fall back to parsing the generated text, which yields coarse "
+        "0.9/0.1 values. Check that (a) the request reaches an Ollama build that "
+        "implements 'logprobs' (older releases ignore the field), and (b) the model "
+        "is a generative reranker such as qwen3-reranker.",
+        key,
+        detail,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -196,6 +240,26 @@ def extract_positions(data: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def has_logprobs(data: dict[str, Any]) -> bool:
+    """True when the upstream actually returned token log probabilities."""
+    return bool(extract_positions(data))
+
+
+def top_tokens(data: dict[str, Any], limit: int = 5) -> list[str]:
+    """Top-1 token of the first generated positions.
+
+    Purely diagnostic: when a reranker answers with 'ਐ' / '경' / '_binding' instead of
+    yes/no, the model is not in an answering state (wrong prompt, truncated context,
+    quantisation trouble) - printing what it really emitted makes that obvious.
+    """
+    tokens: list[str] = []
+    for pos in extract_positions(data)[:limit]:
+        candidates = _position_candidates(pos)
+        if candidates:
+            tokens.append(candidates[0][0])
+    return tokens
+
+
 def _position_candidates(pos: dict[str, Any]) -> list[tuple[str, float]]:
     """All (token, logprob) candidates of one position: the token itself + top_logprobs."""
     candidates: list[tuple[str, float]] = []
@@ -214,19 +278,28 @@ def _position_candidates(pos: dict[str, Any]) -> list[tuple[str, float]]:
     return candidates
 
 
-def _token_matches(token: str, target: str) -> bool:
+def _token_matches(token: str, targets: tuple[str, ...]) -> bool:
     """Case/whitespace/punctuation tolerant comparison (e.g. ' Yes' vs 'yes')."""
-    if not target:
+    if not targets:
         return False
-    normalized = token.strip().strip("\"'`.,!?:;").lower()
-    expected = target.strip().lower()
-    return normalized == expected
+    normalized = token.strip().strip("\"'`.,!?:;()[]").lower()
+    if not normalized:
+        return False
+    return normalized in targets
+
+
+def _targets(primary: str, aliases: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    """Build the normalized set of accepted spellings for the yes (or no) answer."""
+    values = [primary, *(aliases or [])]
+    return tuple(v.strip().lower() for v in values if isinstance(v, str) and v.strip())
 
 
 def yes_no_probability(
     positions: list[dict[str, Any]],
     yes_token: str,
     no_token: str,
+    yes_aliases: list[str] | None = None,
+    no_aliases: list[str] | None = None,
     max_scan: int = MAX_TOKEN_SCAN,
 ) -> float | None:
     """Binary softmax over the yes/no candidates of the answering token position.
@@ -234,6 +307,9 @@ def yes_no_probability(
     Returns ``None`` when no position carries a yes/no candidate (e.g. the model
     started with ``<think>``), so the caller can fall back to text parsing.
     """
+    yes_targets = _targets(yes_token, yes_aliases)
+    no_targets = _targets(no_token, no_aliases)
+
     for pos in positions[:max_scan]:
         candidates = _position_candidates(pos)
         if not candidates:
@@ -242,9 +318,9 @@ def yes_no_probability(
         p_yes = 0.0
         p_no = 0.0
         for token, logprob in candidates:
-            if _token_matches(token, yes_token):
+            if _token_matches(token, yes_targets):
                 p_yes += math.exp(logprob)
-            elif _token_matches(token, no_token):
+            elif _token_matches(token, no_targets):
                 p_no += math.exp(logprob)
 
         total = p_yes + p_no
@@ -275,25 +351,39 @@ def response_text(data: dict[str, Any]) -> str:
     return ""
 
 
-def text_fallback_score(text: str, yes_token: str, no_token: str) -> float:
-    """Last-resort scoring when the upstream returns no logprobs at all."""
+def text_fallback_score(
+    text: str,
+    yes_token: str,
+    no_token: str,
+    yes_score: float = FALLBACK_YES,
+    no_score: float = FALLBACK_NO,
+    unknown_score: float = FALLBACK_UNKNOWN,
+    yes_aliases: list[str] | None = None,
+    no_aliases: list[str] | None = None,
+) -> float:
+    """Last-resort scoring when the upstream returns no usable logprobs at all."""
     lowered = (text or "").strip().lower()
     if not lowered:
-        return FALLBACK_UNKNOWN
+        return unknown_score
 
     head = lowered[:32]
-    yes = yes_token.strip().lower()
-    no = no_token.strip().lower()
+    yes_targets = _targets(yes_token, yes_aliases)
+    no_targets = _targets(no_token, no_aliases)
 
-    if lowered.startswith(yes):
-        return FALLBACK_YES
-    if lowered.startswith(no):
-        return FALLBACK_NO
-    if yes in head and no not in head:
-        return 0.75
-    if no in head and yes not in head:
-        return 0.25
-    return FALLBACK_UNKNOWN
+    for target in yes_targets:
+        if lowered.startswith(target):
+            return yes_score
+    for target in no_targets:
+        if lowered.startswith(target):
+            return no_score
+
+    has_yes = any(t in head for t in yes_targets)
+    has_no = any(t in head for t in no_targets)
+    if has_yes and not has_no:
+        return (yes_score + unknown_score) / 2
+    if has_no and not has_yes:
+        return (no_score + unknown_score) / 2
+    return unknown_score
 
 
 def softmax_pair(yes_logprob: float, no_logprob: float) -> float:
@@ -314,17 +404,6 @@ def normalize_scores(scores: list[float]) -> list[float]:
         # If all scores are identical, return 0.5 (neutral) unless they are 0
         return [0.5 if not math.isclose(lo, 0.0) else 0.0 for _ in scores]
     return [(s - lo) / (hi - lo) for s in scores]
-
-
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 # --------------------------------------------------------------------------- #
@@ -398,20 +477,25 @@ class RerankService:
                 text = text[: rcfg.max_document_chars]
             documents.append(text)
 
-        instruction = req.instruction or rcfg.instruction
+        instruction = (req.instruction or "").strip() or rcfg.instruction
 
-        if mode == "embedding":
-            scores, failures, last_error = await self._score_by_embedding(
-                resolved, req.query, documents, req.options
-            )
-        elif mode == "logprobs":
-            scores, failures, last_error = await self._score_by_logprobs(
+        if mode in ("logprobs", "logprob", "generative", "yes_no"):
+            scores, failures, last_error, stats = await self._score_by_logprobs(
                 resolved, req.query, documents, instruction, req.options
+            )
+        elif mode == "embedding":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Rerank 'embedding' mode has been removed: re-scoring with the same model that "
+                    "produced the retrieval embeddings adds no signal. Use a generative reranker "
+                    "(e.g. qwen3-reranker:4b) with mode 'logprobs', or drop the rerank step."
+                ),
             )
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported rerank mode '{mode}' for model '{model}'. Choose 'logprobs' or 'embedding'.",
+                detail=f"Unsupported rerank mode '{mode}' for model '{model}'. Only 'logprobs' is supported.",
             )
 
         # Nothing could be scored at all -> surface it instead of returning silent zeros.
@@ -471,10 +555,110 @@ class RerankService:
                 "failed_documents": failures,
                 "normalized": bool(rcfg.normalize),
                 "took_ms": round((time.perf_counter() - started) * 1000, 2),
+                # --- scoring quality telemetry -------------------------------
+                # logprobs_ok=false means the model was NOT scored from real token
+                # probabilities, i.e. the ranking is only as good as the 0.9/0.1 text
+                # fallback. Watch this field when tuning a deployment.
+                "logprobs_ok": bool(stats.get("logprobs_ok")),
+                "logprobs_scored": int(stats.get("logprobs_scored", 0)),
+                "text_fallbacks": int(stats.get("text_fallbacks", 0)),
+                "endpoint": str(stats.get("endpoint") or ""),
             },
         }
 
     # ------------------------------------------------- logprobs scoring mode ---
+    def _endpoint_plan(self, upstream, style: str) -> list[str]:
+        """Ordered list of endpoint styles to try for generative scoring.
+
+        ``auto`` starts with the raw ``/api/generate`` call on Ollama (the Qwen3-Reranker
+        template already is a complete chat prompt, and raw mode keeps the engine from
+        injecting ``<think>`` tokens). When the response carries no logprobs the caller
+        moves on to the next style, which is what makes old Ollama builds (that silently
+        ignore the ``logprobs`` field) degrade gracefully instead of returning flat scores.
+        """
+        style = (style or "auto").strip().lower()
+        is_ollama = upstream.type == "ollama"
+
+        if style in ("generate", "gen", "raw"):
+            return [STYLE_GENERATE] if is_ollama else [STYLE_OPENAI]
+        if style in ("chat", "chat_completions"):
+            return [STYLE_CHAT] if is_ollama else [STYLE_OPENAI]
+        if style in ("openai", "v1"):
+            return [STYLE_OPENAI]
+        if is_ollama:
+            plan = [STYLE_GENERATE]
+            if self.manager.config.rerank.logprobs_fallback:
+                plan += [STYLE_CHAT, STYLE_OPENAI]
+            return plan
+        return [STYLE_OPENAI]
+
+    def _build_payload(
+        self,
+        kind: str,
+        upstream,
+        model_name: str,
+        content: str,
+        rcfg,
+        top_logprobs: int,
+        extra_options: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Returns (url, request body) for one endpoint style."""
+        base = upstream.base_url_stripped()
+        options: dict[str, Any] = {
+            "temperature": rcfg.temperature,
+            "num_predict": max(1, rcfg.max_tokens),
+        }
+        if rcfg.options:
+            options.update(rcfg.options)
+        if rcfg.stop:
+            options["stop"] = list(rcfg.stop)
+        if extra_options:
+            options.update(extra_options)
+
+        if kind == STYLE_GENERATE:
+            # NOTE: 'logprobs' / 'top_logprobs' are TOP-LEVEL fields for Ollama.
+            # Putting them into 'options' makes Ollama drop them silently.
+            return f"{base}/api/generate", {
+                "model": model_name,
+                "prompt": content,
+                "stream": False,
+                "raw": bool(rcfg.raw_prompt),
+                "logprobs": True,
+                "top_logprobs": top_logprobs,
+                "options": options,
+            }
+
+        if kind == STYLE_CHAT:
+            payload: dict[str, Any] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": content}],
+                "stream": False,
+                "logprobs": True,
+                "top_logprobs": top_logprobs,
+                "options": options,
+            }
+            if rcfg.disable_thinking:
+                # Thinking models would otherwise spend the (very small) token budget
+                # on <think>... instead of answering yes/no.
+                payload["think"] = False
+            return f"{base}/api/chat", payload
+
+        # OpenAI-compatible (LM Studio, vLLM, ...)
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": content}],
+            "stream": False,
+            "logprobs": True,
+            "top_logprobs": min(top_logprobs, MAX_TOP_LOGPROBS),  # OpenAI caps at 20
+            "max_tokens": max(1, rcfg.max_tokens),
+            "temperature": rcfg.temperature,
+        }
+        if rcfg.stop:
+            payload["stop"] = list(rcfg.stop)
+        if extra_options:
+            payload.update(extra_options)
+        return f"{base}/v1/chat/completions", payload
+
     async def _score_by_logprobs(
         self,
         resolved,
@@ -482,109 +666,137 @@ class RerankService:
         documents: list[str],
         instruction: str,
         extra_options: dict[str, Any] | None,
-    ) -> tuple[list[float], int, str]:
-        """Returns (scores, failed_count, last_error)."""
+    ) -> tuple[list[float], int, str, dict[str, Any]]:
+        """Returns (scores, failed_count, last_error, stats)."""
         cfg = self.manager.config
         rcfg = cfg.rerank
         upstream = resolved.upstream
         model_name = resolved.target or resolved.requested
         timeout = upstream.timeout or cfg.server.request_timeout
-        is_ollama = upstream.type == "ollama"
-        base = upstream.base_url_stripped()
 
-        # "auto" -> Ollama gets a raw /api/generate call (the default template already is a
-        # full chat prompt, and raw mode keeps the engine from injecting <think> tokens);
-        # OpenAI-compatible backends only have a chat endpoint.
-        style = (rcfg.upstream_api or "auto").strip().lower()
-        use_generate = is_ollama and style != "chat"
-
-        if use_generate:
-            url = f"{base}/api/generate"
-        elif is_ollama:
-            url = f"{base}/api/chat"
-        else:
-            url = f"{base}/v1/chat/completions"
-
-        top_logprobs = max(1, int(rcfg.top_logprobs or 1))
+        plan = self._endpoint_plan(upstream, rcfg.upstream_api)
+        top_logprobs = max(1, min(int(rcfg.top_logprobs or 1), MAX_TOP_LOGPROBS))
+        max_scan = max(1, int(rcfg.token_scan_depth or MAX_TOKEN_SCAN))
         semaphore = asyncio.Semaphore(max(1, min(rcfg.max_concurrency, len(documents) or 1)))
+
         failures = 0
         last_error = ""
+        # Mutable state shared by the per-document tasks. asyncio runs them on one thread,
+        # so plain reads/writes are safe here (no await between read and write).
+        state: dict[str, Any] = {
+            "kind": plan[0],
+            "logprobs_scored": 0,
+            "text_fallbacks": 0,
+        }
 
-        async def score_one(doc: str) -> float | None:
-            nonlocal failures, last_error
-            content = rcfg.template.format(instruction=instruction, query=query, document=doc)
+        def ordered_plan() -> list[str]:
+            active = state["kind"]
+            if active in plan:
+                return [active, *(k for k in plan if k != active)]
+            return list(plan)
 
-            options: dict[str, Any] = {
-                "temperature": rcfg.temperature,
-                "num_predict": max(1, rcfg.max_tokens),
-                "stop": ["\n"],
-            }
-            if extra_options:
-                options.update(extra_options)
-
-            if use_generate:
-                payload: dict[str, Any] = {
-                    "model": model_name,
-                    "prompt": content,
-                    "stream": False,
-                    "raw": bool(rcfg.raw_prompt),
-                    # Ollama only returns logprobs when they are requested top-level.
-                    "logprobs": True,
-                    "top_logprobs": top_logprobs,
-                    "options": options,
-                }
-            elif is_ollama:
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": content}],
-                    "stream": False,
-                    "logprobs": True,
-                    "top_logprobs": top_logprobs,
-                    "options": options,
-                }
-                if rcfg.disable_thinking:
-                    # Thinking models would otherwise spend the (very small) token budget
-                    # on <think>... instead of answering yes/no.
-                    payload["think"] = False
-            else:  # OpenAI-compatible (LM Studio, vLLM, ...)
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": content}],
-                    "stream": False,
-                    "logprobs": True,
-                    "top_logprobs": min(top_logprobs, 20),  # OpenAI caps at 20
-                    "max_tokens": max(1, rcfg.max_tokens),
-                    "temperature": rcfg.temperature,
-                }
-                if extra_options:
-                    payload.update(extra_options)
-
+        async def call(kind: str, content: str) -> dict[str, Any] | None:
+            nonlocal last_error
+            url, payload = self._build_payload(kind, upstream, model_name, content, rcfg, top_logprobs, extra_options)
             try:
                 async with semaphore:
                     resp = await self.client.post(url, json=payload, timeout=timeout)
                     resp.raise_for_status()
                     data = resp.json()
             except Exception as exc:  # noqa: BLE001 - one bad document must not kill the batch
-                failures += 1
                 last_error = str(exc) or exc.__class__.__name__
-                logger.error("Rerank call to %s failed: %s", url, last_error)
+                logger.error("Rerank call to %s (%s) failed: %s", url, kind, last_error)
                 return None
-
             if not isinstance(data, dict):
-                failures += 1
                 last_error = f"Unexpected upstream response type: {type(data).__name__}"
                 return None
+            return data
 
-            score = yes_no_probability(extract_positions(data), rcfg.yes_token, rcfg.no_token)
-            if score is not None:
-                return min(1.0, max(0.0, score))
+        async def score_one(doc: str) -> float | None:
+            nonlocal failures
+            content = rcfg.template.format(instruction=instruction, query=query, document=doc)
+            fallback_data: dict[str, Any] | None = None
+            unusable_data: dict[str, Any] | None = None
 
-            # Fallback: no usable logprobs -> parse the generated text
-            text = response_text(data)
-            parsed = text_fallback_score(text, rcfg.yes_token, rcfg.no_token)
+            for kind in ordered_plan():
+                data = await call(kind, content)
+                if data is None:
+                    continue  # transport error -> try the next endpoint style
+                fallback_data = fallback_data or data
+
+                if not has_logprobs(data):
+                    # The upstream understood us but gave no probabilities. Remember the
+                    # response (it may still contain a usable yes/no text) and try the
+                    # next endpoint style before giving up.
+                    logger.debug(
+                        "Rerank: no logprobs from %s/%s (model=%s), trying next endpoint style",
+                        upstream.name,
+                        kind,
+                        model_name,
+                    )
+                    continue
+
+                score = yes_no_probability(
+                    extract_positions(data),
+                    rcfg.yes_token,
+                    rcfg.no_token,
+                    rcfg.yes_aliases,
+                    rcfg.no_aliases,
+                    max_scan,
+                )
+                if score is not None:
+                    state["kind"] = kind
+                    state["logprobs_scored"] += 1
+                    return min(1.0, max(0.0, score))
+
+                # Logprobs ARE there, but the model emitted something else entirely
+                # ('ਐ', '경', '_binding', ...). That means the prompt did not put the model
+                # into an answering state - a different endpoint style (which lets the
+                # backend apply the model's own chat template) often fixes it, so retry
+                # before trusting the text.
+                logger.warning(
+                 "Rerank: no yes/no candidate from %s/%s (model=%s); top tokens=%s. "
+                 "This usually means the prompt is malformed for this model (raw prompt "
+                 "vs. chat template), the context was truncated (set rerank.options.num_ctx) "
+                 "or the model is not a generative reranker. Trying the next endpoint style.",
+                    upstream.name,
+                    kind,
+                    model_name,
+                    top_tokens(data),
+                )
+                unusable_data = unusable_data or data
+                continue
+
+            # No endpoint returned usable logprobs -> last resort: parse the text.
+            last_data = unusable_data or fallback_data
+            if last_data is None:
+                failures += 1
+                last_error = last_error or "all rerank endpoint styles failed"
+                return None
+
+            state["text_fallbacks"] += 1
+            text = response_text(last_data)
+            parsed = text_fallback_score(
+                text,
+                rcfg.yes_token,
+                rcfg.no_token,
+                rcfg.fallback_yes,
+                rcfg.fallback_no,
+                rcfg.fallback_unknown,
+                rcfg.yes_aliases,
+                rcfg.no_aliases,
+            )
+            if unusable_data is None:
+                _warn_no_logprobs(
+                    f"{upstream.name}:{model_name}",
+                    f"styles tried: {', '.join(ordered_plan())}; text={text[:40]!r}",
+                )
             logger.warning(
-                "No yes/no logprobs in upstream response (model=%s); fell back to text %r -> %.2f",
+                "No yes/no logprobs in upstream response (model=%s, upstream=%s, kinds=%s); "
+                "fell back to text %r -> %.2f",
                 model_name,
+                upstream.name,
+                ", ".join(ordered_plan()),
                 text[:40],
                 parsed,
             )
@@ -592,113 +804,12 @@ class RerankService:
 
         raw_scores = await asyncio.gather(*[score_one(doc) for doc in documents])
         scores = [0.0 if s is None else float(s) for s in raw_scores]
-        return scores, failures, last_error
 
-    # ----------------------------------------------- embedding scoring mode ---
-    async def _score_by_embedding(
-        self,
-        resolved,
-        query: str,
-        documents: list[str],
-        extra_options: dict[str, Any] | None,
-    ) -> tuple[list[float], int, str]:
-        """Returns (scores, failed_count, last_error)."""
-        cfg = self.manager.config
-        rcfg = cfg.rerank
-        upstream = resolved.upstream
-        model_name = resolved.target or resolved.requested
-        timeout = upstream.timeout or cfg.server.request_timeout
-        base = upstream.base_url_stripped()
+        stats = {
+            "logprobs_ok": state["logprobs_scored"] > 0,
+            "logprobs_scored": state["logprobs_scored"],
+            "text_fallbacks": state["text_fallbacks"],
+            "endpoint": state["kind"],
+        }
+        return scores, failures, last_error, stats
 
-        prefix = rcfg.embedding_query_prefix or ""
-        query_text = f"{prefix}{query}" if prefix else query
-        texts = [query_text, *documents]
-
-        vectors = await self._embed(upstream, model_name, texts, timeout, extra_options)
-
-        if len(vectors) != len(texts) or not vectors:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Embedding upstream '{upstream.name}' returned {len(vectors)} vectors for {len(texts)} inputs.",
-            )
-
-        query_vec = vectors[0]
-        if not query_vec:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Embedding upstream '{upstream.name}' returned an empty query vector.",
-            )
-
-        scores = [cosine_similarity(query_vec, vec) for vec in vectors[1:]]
-        if rcfg.embedding_clamp:
-            # Cosine similarity lives in [-1, 1]; most rerank clients expect [0, 1].
-            scores = [min(1.0, max(0.0, s)) for s in scores]
-        return scores, 0, ""
-
-    async def _embed(
-        self,
-        upstream,
-        model_name: str,
-        texts: list[str],
-        timeout: float,
-        extra_options: dict[str, Any] | None,
-    ) -> list[list[float]]:
-        """Embed a batch of texts; Ollama uses /api/embed, OpenAI-compatible /v1/embeddings."""
-        cfg = self.manager.config
-        rcfg = cfg.rerank
-        base = upstream.base_url_stripped()
-        headers = dict(upstream.headers or {})
-
-        if upstream.type == "ollama":
-            url = f"{base}/api/embed"
-            payload: dict[str, Any] = {"model": model_name, "input": texts}
-            if extra_options:
-                payload.update(extra_options)
-            resp = await self.client.post(url, json=payload, timeout=timeout, headers=headers)
-
-            if resp.status_code == 404:
-                # Older Ollama only has the single-text endpoint.
-                logger.debug("/api/embed not available on %s, falling back to /api/embeddings", upstream.name)
-                return await self._embed_ollama_legacy(upstream, model_name, texts, timeout, headers)
-
-            resp.raise_for_status()
-            data = resp.json()
-            vectors = data.get("embeddings")
-            if isinstance(vectors, list) and vectors:
-                return [v for v in vectors if isinstance(v, list)]
-            single = data.get("embedding")
-            return [single] if isinstance(single, list) else []
-
-        url = f"{base}/v1/embeddings"
-        payload = {"model": model_name, "input": texts}
-        if extra_options:
-            payload.update(extra_options)
-        resp = await self.client.post(url, json=payload, timeout=timeout, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("data")
-        if isinstance(items, list):
-            return [it.get("embedding") for it in items if isinstance(it, dict) and isinstance(it.get("embedding"), list)]
-        return []
-
-    async def _embed_ollama_legacy(
-        self,
-        upstream,
-        model_name: str,
-        texts: list[str],
-        timeout: float,
-        headers: dict[str, str],
-    ) -> list[list[float]]:
-        url = f"{upstream.base_url_stripped()}/api/embeddings"
-        semaphore = asyncio.Semaphore(max(1, min(self.manager.config.rerank.max_concurrency, len(texts) or 1)))
-
-        async def one(text: str) -> list[float]:
-            async with semaphore:
-                resp = await self.client.post(
-                    url, json={"model": model_name, "prompt": text}, timeout=timeout, headers=headers
-                )
-                resp.raise_for_status()
-                vec = resp.json().get("embedding")
-                return vec if isinstance(vec, list) else []
-
-        return list(await asyncio.gather(*[one(t) for t in texts]))

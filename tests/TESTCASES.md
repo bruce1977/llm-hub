@@ -891,7 +891,7 @@ cp .example.env .env
 # 编辑 .env 设置真实的 API 密钥
 
 # 3. 启动服务
-docker compose up -d
+docker run -d --name llm-hub -p 8888:8000 -v ./data:/data --env-file .env bruce1977/llm-hub:latest
 
 # 4. 验证
 curl http://localhost:8888/health

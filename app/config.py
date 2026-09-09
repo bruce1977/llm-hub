@@ -88,6 +88,16 @@ DEFAULT_RERANK_TEMPLATE = (
     "<think>\n\n</think>\n\n"
 )
 
+# The instruction is the main lever against "topic matching": without an explicit
+# constraint, a generative reranker happily answers "yes" for anything that shares the
+# query's broad theme (e.g. "how much water per day" -> "bananas contain potassium").
+DEFAULT_RERANK_INSTRUCTION = (
+    "Given a web search query, retrieve relevant passages that answer the query. "
+    "A passage is relevant only if it directly answers the specific question asked. "
+    "Passages that merely share the same broad topic, mention related keywords, or "
+    "talk about the same field or entity without answering the question are NOT relevant."
+)
+
 
 # --------------------------------------------------------------------------- #
 # Configuration models
@@ -168,22 +178,44 @@ class AliasConfig(BaseModel):
 class RerankConfig(BaseModel):
     enabled: bool = True
     endpoint: str = "/v1/rerank"
-    mode: str = "logprobs"  # logprobs (generative scoring) | embedding (vector cosine)
+    mode: str = "logprobs"  # generative yes/no scoring (the only supported mode)
     models: list[str] = Field(default_factory=list)
-    instruction: str = "Given a web search query, retrieve relevant passages that answer the query"
+    instruction: str = DEFAULT_RERANK_INSTRUCTION
     template: str = DEFAULT_RERANK_TEMPLATE
     yes_token: str = "yes"
     no_token: str = "no"
+    # Extra accepted spellings (matched case-insensitively, punctuation stripped),
+    # e.g. yes_aliases ["是"] / no_aliases ["否"] for a Chinese-tuned reranker.
+    yes_aliases: list[str] = Field(default_factory=list)
+    no_aliases: list[str] = Field(default_factory=list)
     temperature: float = 0.0
     top_logprobs: int = 20
-    max_tokens: int = 2
+    # Small budget: the answer is a single token. >1 keeps a leading "\n"/"<think>"
+    # token from swallowing the whole budget (see token_scan_depth).
+    max_tokens: int = 4
+    # How many generated token positions are searched for the yes/no candidate.
+    token_scan_depth: int = 4
+    # Stop sequences handed to the upstream (empty = rely on max_tokens only).
+    stop: list[str] = Field(default_factory=list)
+    # Extra upstream options merged into every scoring call, e.g. {"num_ctx": 32768}.
+    # Matters: Ollama defaults to num_ctx=4096, and a truncated prompt is a classic
+    # reason for a reranker to emit garbage instead of yes/no on long documents.
+    options: dict[str, Any] = Field(default_factory=dict)
+    # When an endpoint style returns no (usable) logprobs, try the next one
+    # (/api/generate -> /api/chat -> /v1/chat/completions) before degrading to text.
+    logprobs_fallback: bool = True
+    # Scores used when the upstream returns no usable logprobs. "unknown" is 0.0 on
+    # purpose: an unparsable answer must not look like "half relevant".
+    fallback_yes: float = 0.9
+    fallback_no: float = 0.1
+    fallback_unknown: float = 0.0
     # Off by default: logprobs already produce probabilities in [0, 1] and min-max
     # normalization would force the best hit to 1.0 / the worst to 0.0, which makes
     # scores incomparable across requests (and meaningless for a single document).
     normalize: bool = False
     max_concurrency: int = 8
     return_documents: bool = True
-    # Per-model mode override, e.g. {"bge-m3:latest": "embedding"}
+    # Per-model mode override, e.g. {"qwen3-reranker:4b": "logprobs"}
     model_modes: dict[str, str] = Field(default_factory=dict)
     # Which upstream call to use for generative scoring:
     #   "auto"     -> Ollama: /api/generate (raw prompt), OpenAI-compatible: /v1/chat/completions
@@ -203,12 +235,9 @@ class RerankConfig(BaseModel):
     #   "fail"       -> return 502
     # (if EVERY document fails, 502 is returned in both cases)
     on_error: str = "score_zero"
-    # Embedding mode: optional prefix for the query (bge/gte style retrieval instructions)
-    embedding_query_prefix: str = ""
-    # Embedding mode: clamp cosine similarity from [-1, 1] to [0, 1]
-    embedding_clamp: bool = True
 
-    #: Accepted spellings for the two scoring modes.
+    #: Accepted spellings for the logprobs scoring mode. The former embedding/cosine
+    #: mode was removed: re-ranking with the retrieval embedding model adds no signal.
     MODE_ALIASES: ClassVar[dict[str, str]] = {
         "logprob": "logprobs",
         "logprobs": "logprobs",
@@ -219,10 +248,10 @@ class RerankConfig(BaseModel):
         "cross_encoder": "logprobs",
         "crossencoder": "logprobs",
         "yes_no": "logprobs",
+        "yes-no": "logprobs",
+        # Kept so an old config still fails with a helpful message instead of a
+        # confusing "unsupported mode" error.
         "embedding": "embedding",
-        "embeddings": "embedding",
-        "vector": "embedding",
-        "cosine": "embedding",
     }
 
     def mode_for(self, model: str, target: str | None = None) -> str:
@@ -474,24 +503,31 @@ def build_default_config() -> dict[str, Any]:
             "endpoint": "/v1/rerank",
             "mode": "logprobs",
             "models": ["qwen3-reranker:4b"],
-            "instruction": ("Given a web search query, retrieve relevant passages that answer the query"),
+            "instruction": DEFAULT_RERANK_INSTRUCTION,
             "yes_token": "yes",
             "no_token": "no",
+            "yes_aliases": [],
+            "no_aliases": [],
             "temperature": 0.0,
             "top_logprobs": 20,
-            "max_tokens": 2,
+            "max_tokens": 4,
+            "token_scan_depth": 4,
+            "stop": [],
+            "options": {},
+            "logprobs_fallback": True,
+            "fallback_yes": 0.9,
+            "fallback_no": 0.1,
+            "fallback_unknown": 0.0,
             "normalize": False,
             "max_concurrency": 8,
             "return_documents": True,
-            "model_modes": {"bge-m3:latest": "embedding"},
+            "model_modes": {},
             "upstream_api": "auto",
             "raw_prompt": True,
             "disable_thinking": True,
             "max_documents": 0,
             "max_document_chars": 0,
             "on_error": "score_zero",
-            "embedding_query_prefix": "",
-            "embedding_clamp": True,
         },
     }
 

@@ -24,7 +24,6 @@ thinking mode).
 ```
 llm-hub/
 ├── Dockerfile
-├── docker-compose.yml
 ├── requirements.txt
 ├── app/
 │   ├── main.py       # FastAPI entrypoint & special endpoints
@@ -119,8 +118,7 @@ cp .example.env .env
 
 ## Building the image (docker build)
 
-The repo root has a `Dockerfile` (based on `python:3.12-slim`). Besides `docker compose up` (which
-builds then runs), you can build explicitly with `docker build` — handy for custom tags, specific
+The repo root has a `Dockerfile` (based on `python:3.12-slim`). You can build explicitly with `docker build` — handy for custom tags, specific
 platforms, or pushing to a registry.
 
 ```bash

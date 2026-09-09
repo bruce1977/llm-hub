@@ -30,7 +30,6 @@ llm-hub/
 │   ├── extensions.json # Recommended extensions
 │   └── launch.json   # Debug configurations
 ├── Dockerfile        # Container build (python:3.12-slim)
-├── docker-compose.yml # Docker Compose configuration
 ├── pyproject.toml    # Python tooling config (ruff, mypy, pytest)
 ├── API.md            # API documentation with all endpoints
 ├── workflow.md       # Development workflow with diagrams

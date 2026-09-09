@@ -22,7 +22,6 @@
 ```
 llm-hub/
 ├── Dockerfile
-├── docker-compose.yml
 ├── requirements.txt
 ├── app/
 │   ├── main.py       # FastAPI 入口与特殊端点
@@ -114,8 +113,7 @@ cp .example.env .env
 
 ## 构建镜像（docker build）
 
-仓库根目录已提供 `Dockerfile`（基于 `python:3.12-slim`）。除了 `docker compose up`（内部也是先 build 再 up），
-也可以直接用 `docker build` 显式构建镜像——更适合自定义标签、指定平台或推送到镜像仓库的场景。
+仓库根目录已提供 `Dockerfile`（基于 `python:3.12-slim`）。可以用 `docker build` 显式构建镜像——更适合自定义标签、指定平台或推送到镜像仓库的场景。
 
 ```bash
 cd llm-hub

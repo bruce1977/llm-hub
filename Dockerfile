@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CONFIG_PATH=/data/config.json
 
 # /app holds every *.py module at the top level, so the local source directory
-# can be mounted straight onto it (see docker-compose.yml) for instant patches.
+# can be mounted straight onto it for instant patches.
 WORKDIR /app
 
 # curl is only needed by the container health check

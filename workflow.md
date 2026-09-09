@@ -189,8 +189,8 @@ python -m ruff format app/ tests/
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
   docker pull         配置 config.json    docker run          curl /health
-  bruce1977/llm-hub   配置 .env           docker compose      curl /v1/models
-                      latest              up -d
+  bruce1977/llm-hub   配置 .env           docker run           curl /v1/models
+                       latest              -d --name llm-hub
 ```
 
 **部署命令：**
@@ -300,7 +300,7 @@ curl http://localhost:8888/v1/models
 | 代码检查 | `python -m ruff check app/ tests/` |
 | 代码格式化 | `python -m ruff format app/ tests/` |
 | Docker 构建 | `docker build -t llm-hub:latest .` |
-| Docker 运行 | `docker compose up -d` |
+| Docker 运行 | `docker run -d --name llm-hub -p 8888:8000 ...` |
 | 查看日志 | `docker logs -f llm-hub` |
 | 重启容器 | `docker restart llm-hub` |
-| 停止容器 | `docker compose down` |
+| 停止容器 | `docker stop llm-hub && docker rm llm-hub` |
