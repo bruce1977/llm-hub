@@ -615,10 +615,16 @@ class RerankService:
         if extra_options:
             options.update(extra_options)
 
+        # Ollama only: unload the reranker from VRAM after this many seconds of
+        # inactivity. Omitted entirely when negative so the server default applies.
+        keep_alive = getattr(rcfg, "keep_alive", None)
+        if keep_alive is not None and isinstance(keep_alive, (int, float)) and keep_alive < 0:
+            keep_alive = None
+
         if kind == STYLE_GENERATE:
             # NOTE: 'logprobs' / 'top_logprobs' are TOP-LEVEL fields for Ollama.
             # Putting them into 'options' makes Ollama drop them silently.
-            return f"{base}/api/generate", {
+            payload: dict[str, Any] = {
                 "model": model_name,
                 "prompt": content,
                 "stream": False,
@@ -627,9 +633,12 @@ class RerankService:
                 "top_logprobs": top_logprobs,
                 "options": options,
             }
+            if keep_alive is not None:
+                payload["keep_alive"] = keep_alive
+            return f"{base}/api/generate", payload
 
         if kind == STYLE_CHAT:
-            payload: dict[str, Any] = {
+            payload = {
                 "model": model_name,
                 "messages": [{"role": "user", "content": content}],
                 "stream": False,
@@ -641,6 +650,8 @@ class RerankService:
                 # Thinking models would otherwise spend the (very small) token budget
                 # on <think>... instead of answering yes/no.
                 payload["think"] = False
+            if keep_alive is not None:
+                payload["keep_alive"] = keep_alive
             return f"{base}/api/chat", payload
 
         # OpenAI-compatible (LM Studio, vLLM, ...)
@@ -703,7 +714,7 @@ class RerankService:
                     resp = await self.client.post(url, json=payload, timeout=timeout)
                     resp.raise_for_status()
                     data = resp.json()
-            except Exception as exc:  # noqa: BLE001 - one bad document must not kill the batch
+            except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
                 logger.error("Rerank call to %s (%s) failed: %s", url, kind, last_error)
                 return None
@@ -771,7 +782,6 @@ class RerankService:
             last_data = unusable_data or fallback_data
             if last_data is None:
                 failures += 1
-                last_error = last_error or "all rerank endpoint styles failed"
                 return None
 
             state["text_fallbacks"] += 1

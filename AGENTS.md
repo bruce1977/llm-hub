@@ -72,18 +72,31 @@ llm-hub/
 # Mock tests only (no external dependencies)
 python tests/smoke_test.py
 
-# With real Ollama (requires local instance on port 11434)
-E2E=1 python tests/smoke_test.py
+# Security verification tests (no external dependencies)
+python tests/verify_security.py
+
+# E2E API tests (requires running server + real Ollama on port 11434)
+# 1. Start the server using the current directory's data/config.json:
+PYTHONPATH=app CONFIG_PATH=./data/config.json \
+  GATEWAY_API_KEYS=sk-test-1234567890abcdef \
+  python -m uvicorn main:app --host 127.0.0.1 --port 8000
+
+# 2. In another terminal, run the E2E tests:
+python tests/test_api.py --base-url http://127.0.0.1:8000 --api-key sk-test-1234567890abcdef
 
 # Demo script (requires real Ollama)
 python tests/demo.py
 ```
 
+**Important:** E2E tests always use `data/config.json` from the project root (set via `CONFIG_PATH=./data/config.json`). This config points to the local Ollama instance at `127.0.0.1:11434`. Never hardcode paths in test commands.
+
 ### Test Structure
-- Tests use `fastapi.testclient.TestClient`
-- Mock upstreams simulate Ollama instances
-- Tests cover: auth, routing, aliases, streaming, rerank, security
-- No pytest framework - uses custom test runner
+- `smoke_test.py` — 87 mock tests (auth, routing, aliases, streaming, rerank, security), no external deps
+- `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
+- `test_api.py` — 20 E2E tests against a real running server + Ollama
+- `demo.py` — interactive demo (requires real Ollama)
+- Tests use `fastapi.testclient.TestClient` (mock) or `httpx.Client` (E2E)
+- No pytest framework - uses custom test runner with `check()` assertions
 
 ### Writing Tests
 - Add new test cases to `smoke_test.py`
@@ -147,9 +160,13 @@ docker run -d --name llm-hub \
 ### Security
 - Admin endpoints blocked by default (`api/delete`, `api/pull`, etc.)
 - Client IP allowlist support
-- CORS configuration
+- CORS configuration (no `*` by default)
 - Request body size limits
-- Weak key detection at startup
+- Weak key detection at startup (refuses to boot with placeholder keys)
+- HTTP method allowlist (`security.allowed_http_methods`, default GET/POST -> 405 for the rest)
+- Regex path allowlist (`security.path_allowlist`, 403 for non-matching paths)
+- In-memory token-bucket rate limiter (`security.rate_limit`, 429 when over budget)
+- Defensive response headers on every response (nosniff, X-Frame-Options, CSP, etc.)
 
 ### Rerank Modes
 - **logprobs**: Generative scoring using token probabilities

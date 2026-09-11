@@ -23,23 +23,23 @@
       "models": [
         "qwen3:4b",
         "qwen3:8b",
-        "qwen3.6:35b-pruned"
+        "qwen3.6:35b-pruned",
+        "qwen3-reranker:4b-rk"
       ],
       "timeout": 600,
       "priority": 0,
-      "description": "Primary Ollama instance (GPU)"
+      "description": "Primary Ollama instance (GPU): keep the reranker here. qwen3-reranker:4b-rk is a num_ctx=8192 variant of qwen3-reranker:4b (see Modelfile.reranker) - same scores, ~4 GB VRAM instead of ~9.3 GB."
     },
     {
       "name": "ollama-ipex-llm",
       "type": "ollama",
       "base_url": "http://host.docker.internal:11435",
       "models": [
-        "qwen3:4b",
-        "qwen3-reranker:4b"
+        "qwen3:4b"
       ],
       "timeout": 1800,
       "priority": 10,
-      "description": "Second Ollama instance (iGPU) - lower priority, used as fallback for overlapping models"
+      "description": "Second Ollama instance (iGPU) - lower priority, used as fallback for overlapping models. Do NOT route the reranker here if this is the archived IPEX-LLM build (Ollama 0.9.3): it silently ignores 'logprobs'."
     },
     {
       "name": "lmstudio",
@@ -72,7 +72,7 @@
     "enabled": true,
     "endpoint": "/v1/rerank",
     "mode": "logprobs",
-    "models": ["qwen3-reranker:4b"],
+    "models": ["qwen3-reranker:4b-rk", "qwen3-reranker:4b"],
     "instruction": "Given a web search query, retrieve relevant passages that answer the query. A passage is relevant only if it directly answers the specific question asked. Passages that merely share the same broad topic, mention related keywords, or talk about the same field or entity without answering the question are NOT relevant.",
     "yes_token": "yes",
     "no_token": "no",
@@ -83,7 +83,8 @@
     "max_tokens": 4,
     "token_scan_depth": 4,
     "stop": [],
-    "options": {},
+    "options": { "num_ctx": 8192 },
+    "keep_alive": "3m",
     "logprobs_fallback": true,
     "fallback_yes": 0.9,
     "fallback_no": 0.1,
@@ -108,6 +109,14 @@
     "allow_query_api_key": false,
     "expose_health_details": false,
     "fail_on_weak_keys": true,
-    "allowed_client_ips": []
+    "allowed_client_ips": [],
+    "allowed_http_methods": ["GET", "POST"],
+    "path_allowlist": [],
+    "rate_limit": {
+      "enabled": false,
+      "per_minute": 60,
+      "burst": 20,
+      "by": "ip"
+    }
   }
 }

@@ -13,6 +13,7 @@ All other requests (/api/*, /v1/*) are routed to the matching Ollama instance by
 from __future__ import annotations
 
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -23,12 +24,13 @@ import uvicorn
 from auth import (
     DOCS_PATHS,
     client_ip,
+    extract_api_key,
     find_weak_keys,
     ip_allowed,
     require_api_key,
 )
 from config import CONFIG_PATH, ConfigManager
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from proxy import ProxyService
 from rerank import RerankService
@@ -121,50 +123,154 @@ app = FastAPI(
 )
 
 
+# --------------------------------------------------------------------------- #
+# Security response hardening
+# --------------------------------------------------------------------------- #
+# Defensive headers attached to every response (see OWASP Secure Headers Project).
+SECURITY_HEADERS: dict[str, str] = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+}
+
+# Compiled path-allowlist regexes, cached by the pattern tuple.
+_PATH_ALLOWLIST_CACHE: dict[tuple, list[re.Pattern]] = {}
+
+
+def _allowlist_patterns(patterns: list[str]) -> list[re.Pattern]:
+    key = tuple(patterns)
+    cached = _PATH_ALLOWLIST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    compiled: list[re.Pattern] = []
+    for pat in patterns:
+        try:
+            compiled.append(re.compile(pat))
+        except re.error as exc:  # a bad pattern must not open the gateway
+            logger.error("Invalid path_allowlist regex %r: %s (entry ignored)", pat, exc)
+    _PATH_ALLOWLIST_CACHE[key] = compiled
+    return compiled
+
+
+def _path_allowed(path: str, patterns: list[str]) -> bool:
+    return any(rx.search(path) for rx in _allowlist_patterns(patterns))
+
+
+def _harden_response(resp: Response) -> Response:
+    """Attach defensive security headers without clobbering existing ones."""
+    for name, value in SECURITY_HEADERS.items():
+        resp.headers.setdefault(name, value)
+    return resp
+
+
+def _deny(status_code: int, detail: str) -> JSONResponse:
+    return _harden_response(JSONResponse({"detail": detail}, status_code=status_code))
+
+
+# --------------------------------------------------------------------------- #
+# In-memory token-bucket rate limiter (single process)
+# --------------------------------------------------------------------------- #
+_RATE_BUCKETS: dict[str, tuple[float, float]] = {}  # key -> (tokens, last_ts)
+
+
+def _rate_limit_key(rl, request: Request, sec) -> str:
+    if rl.by == "key":
+        k = extract_api_key(request, allow_query=sec.allow_query_api_key)
+        if k:
+            return "key:" + k
+    return "ip:" + (client_ip(request) or "unknown")
+
+
+def _rate_limited(rl, request: Request, sec) -> bool:
+    """Return True when the request should be throttled (HTTP 429)."""
+    key = _rate_limit_key(rl, request, sec)
+    now = time.time()
+    capacity = max(int(rl.burst), 1)
+    rate = max(float(rl.per_minute), 1) / 60.0  # tokens per second
+    tokens, ts = _RATE_BUCKETS.get(key, (float(capacity), now))
+    tokens = min(float(capacity), tokens + (now - ts) * rate)
+    if tokens < 1.0:
+        _RATE_BUCKETS[key] = (tokens, now)
+        return True
+    _RATE_BUCKETS[key] = (tokens - 1.0, now)
+    # Occasionally prune stale buckets to bound memory.
+    if len(_RATE_BUCKETS) > 5000:
+        old = now - 120.0
+        for k in [k for k, (_, t) in _RATE_BUCKETS.items() if t < old]:
+            _RATE_BUCKETS.pop(k, None)
+    return False
+
+
 @app.middleware("http")
 async def gateway_security_middleware(request: Request, call_next):
-    """Per-request hardening of the public surface.
+    """Per-request hardening of the public surface, evaluated in this order:
 
-    - hides /docs, /redoc, /openapi.json unless security.allow_docs is true
-    - enforces an optional client IP allowlist (security.allowed_client_ips)
-    - applies CORS only for origins explicitly listed in security.cors_origins
+    1. HTTP method allowlist (security.allowed_http_methods)  -> 405
+    2. path regex allowlist   (security.path_allowlist)       -> 403
+    3. hide /docs /redoc /openapi.json unless allowed         -> 404
+    4. client IP allowlist     (security.allowed_client_ips)  -> 403
+    5. rate limit              (security.rate_limit)           -> 429
+    6. CORS only for explicitly listed origins                -> 204 / header
     """
     manager = getattr(request.app.state, "manager", None)
-    if manager is not None:
-        sec = manager.config.security
-        path = request.url.path.rstrip("/") or "/"
+    sec = manager.config.security if manager is not None else None
 
-        # hide API docs on a public gateway
-        if path in DOCS_PATHS and not sec.allow_docs:
-            return JSONResponse({"detail": "Not found"}, status_code=404)
+    # 1. HTTP method allowlist -------------------------------------------------
+    allowed_methods = set(getattr(sec, "allowed_http_methods", None) or ["GET", "POST"])
+    method = request.method.upper()
+    # CORS preflight needs OPTIONS; permit it only when CORS is actually configured.
+    if method == "OPTIONS" and sec is not None and sec.cors_origins:
+        allowed_methods = allowed_methods | {"OPTIONS"}
+    if method not in allowed_methods:
+        return _deny(status.HTTP_405_METHOD_NOT_ALLOWED, "Method not allowed.")
 
-        # optional client IP allowlist
+    if sec is not None:
+        path = request.url.path
+
+        # 2. path regex allowlist (perimeter control) --------------------------
+        if sec.path_allowlist and not _path_allowed(path, sec.path_allowlist):
+            logger.warning("Path not in allowlist: %s %s", method, path)
+            return _deny(status.HTTP_403_FORBIDDEN, "Path not allowed.")
+
+        # 3. hide API docs on a public gateway ---------------------------------
+        if path.rstrip("/") in DOCS_PATHS and not sec.allow_docs:
+            return _deny(status.HTTP_404_NOT_FOUND, "Not found.")
+
+        # 4. client IP allowlist -----------------------------------------------
         if not ip_allowed(client_ip(request), sec.allowed_client_ips):
-            return JSONResponse(
-                {"detail": "Client address is not permitted to access this gateway."},
-                status_code=403,
-            )
+            return _deny(status.HTTP_403_FORBIDDEN, "Client address is not permitted to access this gateway.")
 
-        # CORS (only for explicitly allowed origins)
+        # 5. rate limit -------------------------------------------------------
+        if sec.rate_limit.enabled and _rate_limited(sec.rate_limit, request, sec):
+            logger.warning("Rate limit exceeded: %s %s", method, path)
+            return _deny(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests.")
+
+        # 6. CORS (only for explicitly allowed origins) -----------------------
         origin = request.headers.get("origin")
         if origin and sec.cors_origins:
             allowed = "*" in sec.cors_origins or origin in sec.cors_origins
-            if request.method == "OPTIONS" and allowed:
-                return JSONResponse(
-                    {},
-                    status_code=204,
-                    headers={
-                        "Access-Control-Allow-Origin": origin,
-                        "Access-Control-Allow-Methods": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
+            if method == "OPTIONS" and allowed:
+                return _harden_response(
+                    JSONResponse(
+                        {},
+                        status_code=204,
+                        headers={
+                            "Access-Control-Allow-Origin": origin,
+                            "Access-Control-Allow-Methods": "*",
+                            "Access-Control-Allow-Headers": "*",
+                        },
+                    )
                 )
             if allowed:
                 resp = await call_next(request)
                 resp.headers["Access-Control-Allow-Origin"] = origin
-                return resp
+                return _harden_response(resp)
 
-    return await call_next(request)
+    resp = await call_next(request)
+    return _harden_response(resp)
 
 
 # --------------------------------------------------------------------------- #

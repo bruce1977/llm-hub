@@ -550,6 +550,17 @@ Ollama 的 gin 解析器会严格拒绝此类请求并报 400。网关在转发�
 | `expose_health_details` | `false` | `/health` 是否回显 `config_path` 与上游 `base_url`（默认脱敏） |
 | `fail_on_weak_keys` | `true` | 启动时检测到弱密钥/占位密钥直接拒绝启动 |
 | `allowed_client_ips` | `[]` | 客户端 IP 白名单（支持 CIDR，如 `10.0.0.0/8`），留空不限制 |
+| `allowed_http_methods` | `["GET","POST"]` | 只放行这些 HTTP 动词，其余（PUT / PATCH / DELETE / HEAD / OPTIONS）一律返回 **405**。LLM 网关只需 GET（模型/健康/标签）与 POST（对话/重排），这是安全默认值 |
+| `path_allowlist` | `[]` | 正则 perimeter 控制：非空时，请求路径必须匹配其中至少一个正则，否则返回 **403**；留空则不过滤。非法正则会被记录并忽略（坏正则绝不会放开网关），例如 `["^/health$", "^/v1/(models\|chat/completions\|rerank)$", "^/api/tags$"]` |
+| `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | 内存令牌桶限流（单进程）：`by` 选择桶的维度（`ip` 或 `key`），`burst` 为桶容量（瞬时上限），`per_minute` 为持续补充速率；超量返回 **429**。可在反向代理后开启，或作为公网第一道廉价防线 |
+
+所有响应默认还会带上加固响应头：`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、
+`Referrer-Policy: no-referrer`、`Cross-Origin-Opener-Policy: same-origin`、
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`，以及严格的 `Permissions-Policy`。
+这些头无法关闭（只加固响应，不会泄露数据）。
+
+> **容器健康检查：** Docker 的 `HEALTHCHECK` 现在改为每小时探测一次 `/health`（`--interval=1h`），
+> 而非每 30 秒一次。网关本身不做周期性轮询，只在收到 `/health` 时应答，因此该间隔只是 Docker 侧的存活探测节奏。
 
 ### 把密钥移出磁盘（推荐）
 

@@ -197,10 +197,16 @@ class RerankConfig(BaseModel):
     token_scan_depth: int = 4
     # Stop sequences handed to the upstream (empty = rely on max_tokens only).
     stop: list[str] = Field(default_factory=list)
-    # Extra upstream options merged into every scoring call, e.g. {"num_ctx": 32768}.
-    # Matters: Ollama defaults to num_ctx=4096, and a truncated prompt is a classic
-    # reason for a reranker to emit garbage instead of yes/no on long documents.
+    # Extra upstream options merged into every scoring call.
+    # KEEP num_ctx TIGHT: Ollama pre-allocates the whole KV cache up front, so
+    # num_ctx dominates VRAM. qwen3-reranker:4b at its default 40960 context costs
+    # ~9.3 GB; the same model at 8192 costs ~4.0 GB - same scores, half the memory.
     options: dict[str, Any] = Field(default_factory=dict)
+    # Ollama only. Unload the reranker from VRAM after this many seconds idle.
+    # Reranking is bursty (one scoring burst per query), so keeping a 4B model
+    # resident steals VRAM from the chat models. 0 = unload right after the burst,
+    # "5m" = keep it warm for 5 minutes, -1 (default) = leave the server default.
+    keep_alive: Any = -1
     # When an endpoint style returns no (usable) logprobs, try the next one
     # (/api/generate -> /api/chat -> /v1/chat/completions) before degrading to text.
     logprobs_fallback: bool = True
@@ -265,6 +271,22 @@ class RerankConfig(BaseModel):
         return self.MODE_ALIASES.get(normalized, normalized)
 
 
+class RateLimitConfig(BaseModel):
+    """In-memory token-bucket rate limiter (single-process only).
+
+    `by` selects the bucket key: "ip" (default) or "key" (per API key).
+    `burst` is the bucket capacity (max immediate requests); `per_minute` is the
+    sustained refill rate. Requests beyond the budget get HTTP 429. Disabled by
+    default - enable it either behind a reverse proxy that already rate-limits, or
+    as a cheap first line of defence on a public gateway.
+    """
+
+    enabled: bool = False
+    per_minute: int = 60
+    burst: int = 20
+    by: Literal["ip", "key"] = "ip"
+
+
 class SecurityConfig(BaseModel):
     """Public-facing hardening. All Ollama model-management endpoints are blocked by default.
 
@@ -272,6 +294,17 @@ class SecurityConfig(BaseModel):
       "deny"     (default) - block pull/push/create/delete/copy and blob up/downloads
       "readonly" - block delete/copy/push/create and blobs (still allow `pull` to fetch models)
       "allow"    - forward everything (only for trusted internal networks)
+
+    allowed_http_methods:
+      only these verbs are served; anything else (PUT/PATCH/DELETE/HEAD/TRACE/OPTIONS)
+      is rejected with 405. Defaults to GET/POST - that is all an LLM gateway needs.
+
+    path_allowlist:
+      regex perimeter control - when non-empty, a request path must match at least one
+      pattern or it is rejected with 403. Empty = allow every path (disabled).
+
+    rate_limit:
+      optional in-memory token-bucket limiter to blunt brute-force / DoS.
     """
 
     admin_endpoints: Literal["deny", "readonly", "allow"] = "deny"
@@ -283,6 +316,12 @@ class SecurityConfig(BaseModel):
     expose_health_details: bool = False
     fail_on_weak_keys: bool = True
     allowed_client_ips: list[str] = Field(default_factory=list)
+    # Only these HTTP methods are accepted; everything else returns 405.
+    allowed_http_methods: list[str] = Field(default_factory=lambda: ["GET", "POST"])
+    # Regex path allowlist (perimeter control). Empty = allow all paths (disabled).
+    path_allowlist: list[str] = Field(default_factory=list)
+    # In-memory token-bucket rate limiter (DoS / brute-force mitigation).
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
 
     # Ollama management endpoints that are unsafe to expose on a public gateway.
     ADMIN_DESTRUCTIVE: ClassVar[set] = {"api/delete", "api/copy", "api/create", "api/push"}
@@ -513,7 +552,8 @@ def build_default_config() -> dict[str, Any]:
             "max_tokens": 4,
             "token_scan_depth": 4,
             "stop": [],
-            "options": {},
+            "options": {"num_ctx": 8192},
+            "keep_alive": "3m",
             "logprobs_fallback": True,
             "fallback_yes": 0.9,
             "fallback_no": 0.1,

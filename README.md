@@ -576,6 +576,18 @@ the hardening options:
 | `expose_health_details` | `false` | Whether `/health` echoes `config_path` and upstream `base_url` (redacted by default) |
 | `fail_on_weak_keys` | `true` | Refuse to start when weak / placeholder keys are detected |
 | `allowed_client_ips` | `[]` | Client IP allowlist (CIDR supported, e.g. `10.0.0.0/8`); empty = unrestricted |
+| `allowed_http_methods` | `["GET","POST"]` | Only these HTTP verbs are served; anything else (PUT / PATCH / DELETE / HEAD / OPTIONS) is rejected with **405**. An LLM gateway only needs GET (models / health / tags) and POST (chat / rerank), so this is the safe default |
+| `path_allowlist` | `[]` | Regex perimeter control: when non-empty, a request path must match at least one pattern or it is rejected with **403**. Empty = allow all paths. Invalid regexes are logged and ignored (a bad pattern never opens the gateway), e.g. `["^/health$", "^/v1/(models\|chat/completions\|rerank)$", "^/api/tags$"]` |
+| `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | In-memory token-bucket limiter (single process): `by` selects the bucket key (`ip` or `key`), `burst` = bucket capacity (max immediate requests), `per_minute` = sustained refill rate; over-budget requests get **429**. Enable behind a reverse proxy or as a cheap first line of defence |
+
+Every response also gets defensive headers by default: `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`,
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, and a restrictive
+`Permissions-Policy`. These cannot be turned off (they only harden the response, never leak data).
+
+> **Container health check:** the Docker `HEALTHCHECK` now probes `/health` once per hour
+> (`--interval=1h`) instead of every 30s. The gateway itself performs no periodic polling; it only
+> answers `/health` on demand, so the interval is purely a Docker-side liveness cadence.
 
 ### Keep secrets off disk (recommended)
 
