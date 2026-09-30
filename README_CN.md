@@ -329,8 +329,8 @@ Dify / RAGFlow / WorkBuddy 等客户端看到的模型列表是整齐的短名�
 两种方式任选其一：
 
 ```bash
--H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
--H "X-API-Key: sk-gateway-9f2c8a1b4d5e6f70"
+-H "Authorization: Bearer sk-gateway-example-key"
+-H "X-API-Key: sk-gateway-example-key"
 ```
 
 ### 错误响应
@@ -384,19 +384,19 @@ curl http://localhost:8000/api/delete \
 ```bash
 # 原生 API —— 自动路由到配置了该模型的实例
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.6:35b-pruned","messages":[{"role":"user","content":"你好"}],"stream":false}'
 
 # OpenAI 兼容接口
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"你好"}]}'
 
 # 向量
 curl http://localhost:8000/api/embed \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"bge-m3:latest","input":["你好世界"]}'
 ```
@@ -417,7 +417,7 @@ curl .../api/chat -d '{"model":"qwen3.5:4b-nothink","messages":[...]}'
 
 ```bash
 curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 ```json
@@ -439,7 +439,7 @@ curl http://localhost:8000/v1/models \
 
 ```bash
 curl http://localhost:8000/v1/rerank \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-reranker:4b",
@@ -543,7 +543,7 @@ Ollama 的 gin 解析器会严格拒绝此类请求并报 400。网关在转发�
 |------|------|------|
 | `admin_endpoints` | `deny` | `deny` 拦截 pull/push/create/delete/copy/blobs；`readonly` 额外放行 `pull`；`allow` 全部转发（仅内网） |
 | `blocked_paths` | `[]` | 额外封禁的路径前缀，如 `["api/show"]` 或 `["api/*"]` |
-| `allow_docs` | `false` | 是否公开 `/docs`、`/redoc`、`/openapi.json`（公网建议关） |
+| `allow_docs` | `false` | 是否公开 `/docs` 与 `/openapi.json`（公网建议关；开启后文档本身免 API Key 鉴权，每个端点的 **Parameters** 区都有 `X-API-Key` 输入框随本次请求发送，顶部 **Authorize** 也可填 `Authorization: Bearer` / `X-API-Key`） |
 | `cors_origins` | `[]` | 显式允许的跨域来源；留空则完全不返回 CORS 头（不再有 `*`） |
 | `max_body_bytes` | `33554432` | 请求体上限（32MB），超过返回 413，防大 body 打挂 |
 | `allow_query_api_key` | `false` | 是否接受 `?api_key=` 查询参数（默认关，避免密钥进日志/浏览器历史） |
@@ -558,6 +558,8 @@ Ollama 的 gin 解析器会严格拒绝此类请求并报 400。网关在转发�
 `Referrer-Policy: no-referrer`、`Cross-Origin-Opener-Policy: same-origin`、
 `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`，以及严格的 `Permissions-Policy`。
 这些头无法关闭（只加固响应，不会泄露数据）。
+唯一例外是 `/docs` 与 `/openapi.json`：它们使用收窄后的 CSP（`script-src`/`style-src 'self' 'unsafe-inline'`），
+以便内置的 Swagger UI 能正常加载——否则页面会渲染成一片空白；其余响应仍保持 `default-src 'none'`。
 
 > **容器健康检查：** Docker 的 `HEALTHCHECK` 现在改为每小时探测一次 `/health`（`--interval=1h`），
 > 而非每 30 秒一次。网关本身不做周期性轮询，只在收到 `/health` 时应答，因此该间隔只是 Docker 侧的存活探测节奏。
@@ -568,10 +570,38 @@ Ollama 的 gin 解析器会严格拒绝此类请求并报 400。网关在转发�
 
 ```bash
 # 容器 / 进程环境变量，逗号或换行分隔多个 Key
-export GATEWAY_API_KEYS="sk-gateway-9f2c8a1b4d5e6f70,sk-gateway-2b3c4d5e6f7a8b9c"
+export GATEWAY_API_KEYS="sk-gateway-example-key,sk-gateway-example-two"
 ```
 
 网关启动时会把环境变量里的 Key 合并进 `auth.api_keys`，`config.json` 里即可只写 `[]` 或不写。
+
+### System One（laya-server 代理）
+
+网关可把 `1panel/laya-server` 的 `POST /v1/systemone`（System One 结构化决策 API，兼容 Jev 线协议）统一收敛进来：
+
+- **调用方鉴权**用网关自己的 Key（`.env` / `GATEWAY_API_KEYS`，即 `.keys` 配置）；
+- 网关再以 `config.json` 里 `systemone.api_key_env`（默认 `LAYA_SERVER_API_KEY`）环境变量中的密钥对 laya-server 后端签名；
+- 请求体 / 响应体**原样透传**，网关不做改写。
+
+`config.json` 的 `systemone` 段：
+
+```json
+{
+  "systemone": {
+    "enabled": true,
+    "backend": "http://127.0.0.1:8080",
+    "model": "local",
+    "api_key_env": "LAYA_SERVER_API_KEY",
+    "path": "v1/systemone",
+    "timeout": 60.0
+  }
+}
+```
+
+- `model` 为 `"local"` 是**哨兵值**：不向下游注入 `model`（laya-server 默认 `auto`）；改成 `auto` / `multilingual` 才会强制覆盖。注意 laya-server 只接受这两个值，其它值返回 **422**。
+- 后端密钥只能从环境变量读取，绝不写入 `config.json`。
+
+详情见 [API 文档](API.md#system-one-决策-apilaya-server-代理)。
 
 ### 公网部署 checklist
 
@@ -594,12 +624,13 @@ pip install -r requirements.txt
 cp data/example.config.json data/config.json
 # 编辑 data/config.json，填入真实的上游地址
 
-# 3. 设置 API 密钥（必须，或写在 config.json 的 auth.api_keys 中）
-export GATEWAY_API_KEYS="${your_secret_api_key}"
+# 3. 准备密钥文件（.env）—— 下文的 --env-file 会自动加载
+cp .example.env .env
+# 编辑 .env：设置 GATEWAY_API_KEYS、LAYA_SERVER_API_KEY 等
 
-# 4. 启动服务
+# 4. 启动服务（自动加载 ../.env）
 cd app
-python -m uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 ```
 
 ### Windows PowerShell 启动
@@ -608,42 +639,47 @@ python -m uvicorn main:app --reload --port 8000
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 设置环境变量（必须）
+# 2. 准备密钥文件（.env）
+Copy-Item .example.env .env
+# 编辑 .env：设置 GATEWAY_API_KEYS、LAYA_SERVER_API_KEY 等
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.json"
-$env:GATEWAY_API_KEYS="${your_secret_api_key}"
 
-# 3. 启动服务
+# 3. 启动服务（自动加载 ../.env）
 cd app
-python -m uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 ```
 
 ### 指定配置文件运行
 
 ```bash
-CONFIG_PATH=./data/config.json GATEWAY_API_KEYS="${your_secret_api_key}" python -m uvicorn main:app --host 0.0.0.0 --port 8000
+cd app
+CONFIG_PATH=../data/config.json python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
 ```
 
 ```powershell
 # Windows PowerShell
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.json"
-$env:GATEWAY_API_KEYS="${your_secret_api_key}"
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+cd app
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
 ```
 
 ### 后台运行（Linux/macOS）
 
 ```bash
-nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 > llm-hub.log 2>&1 &
+cd app
+nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env > ../llm-hub.log 2>&1 &
 ```
 
 ### 注册为 Windows 服务（使用 NSSM）
 
 ```powershell
 # 安装 NSSM: choco install nssm
-nssm install LLMHub "C:\path\to\python.exe" "-m" "uvicorn" "main:app" "--host" "0.0.0.0" "--port" "8000"
+nssm install LLMHub "C:\path\to\python.exe" "-m" "uvicorn" "main:app" "--host" "0.0.0.0" "--port" "8000" "--env-file" "../.env"
 nssm set LLMHub AppDirectory "D:\workspace\github\llm-hub\app"
 nssm set LLMHub AppEnvironmentExtra "CONFIG_PATH=D:\workspace\github\llm-hub\data\config.json"
 nssm start LLMHub
 ```
 
-交互式文档：<http://localhost:8000/docs>（需设置 `security.allow_docs: true`）
+> **说明：**`uvicorn --env-file` 会在启动时一次性读取 `.env` 并把其中的变量注入为环境变量（如 `GATEWAY_API_KEYS`、`LAYA_SERVER_API_KEY` 等），**不会热重载**——改了 `.env` 后需重启 uvicorn。而 `config.json` 的改动仍无需重启即可热加载。
+
+交互式文档：<http://localhost:8000/docs>（需设置 `security.allow_docs: true`；开启后访问 `/docs`、`/openapi.json` 均无需 API Key；每个端点的 **Parameters** 区都有 `X-API-Key` 输入框——**Try it out** 后填写，**Execute** 时随该次请求发送；顶部 **Authorize** 则可一次性填入 `Authorization: Bearer` 或 `X-API-Key` 供所有请求使用）

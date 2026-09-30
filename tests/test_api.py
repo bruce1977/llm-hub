@@ -16,10 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-import time
-from typing import Any
 
 import httpx
 
@@ -46,7 +43,7 @@ def main() -> int:
     base_url = args.base_url.rstrip("/")
     headers = {"Authorization": f"Bearer {args.api_key}"}
 
-    print(f"\n=== LLM Hub API Test Cases ===")
+    print("\n=== LLM Hub API Test Cases ===")
     print(f"Target: {base_url}\n")
 
     with httpx.Client(base_url=base_url, timeout=30.0) as client:

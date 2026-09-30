@@ -18,6 +18,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY app/*.py /app/
+COPY app/static /app/static
 
 RUN mkdir -p /data
 

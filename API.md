@@ -6,14 +6,21 @@
 - [认证方式](#认证方式)
 - [端点列表](#端点列表)
   - [健康检查](#健康检查)
+  - [系统信息](#系统信息)
   - [实例探测](#实例探测)
   - [模型列表](#模型列表)
+  - [Ollama 原生模型列表](#ollama-原生模型列表)
+  - [实例运行状态 (Process Status)](#实例运行状态-process-status)
+  - [System One 决策 API（laya-server 代理）](#system-one-决策-apilaya-server-代理)
   - [重排序](#重排序)
   - [聊天补全](#聊天补全)
   - [文本补全](#文本补全)
   - [嵌入向量](#嵌入向量)
   - [模型管理](#模型管理)
+- [流式响应](#流式响应)
 - [错误响应](#错误响应)
+- [别名参数注入](#别名参数注入)
+- [工具调用](#工具调用)
 
 ---
 
@@ -34,13 +41,18 @@
 
 ```bash
 # 方式一：Authorization 头
--H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+-H "Authorization: Bearer sk-gateway-example-key"
 
 # 方式二：X-API-Key 头
--H "X-API-Key: sk-gateway-9f2c8a1b4d5e6f70"
+-H "X-API-Key: sk-gateway-example-key"
 ```
 
-**例外：** `/health` 端点默认无需认证。
+**例外：** `/`、`/health` 端点默认无需认证（由 `auth.allow_anonymous_health` 控制）。
+
+**Swagger UI：** 打开 `/docs`，**每个端点的 Parameters 区都有一个 `X-API-Key` 输入框**——点
+**Try it out** 后填入 Key，点 **Execute** 时随本次请求发送（只影响该端点的这一次请求）。
+也可以用右上角 **Authorize** 一次性填入 `Authorization: Bearer` 或 `X-API-Key`，此后所有请求自动携带
+（`persistAuthorization` 刷新页面后依然保留）。
 
 ---
 
@@ -50,8 +62,8 @@
 
 | 项目 | 值 |
 |------|-----|
-| 路径 | `/health`, `/healthz`, `/` |
-| 方法 | `GET`, `POST`, `PUT`, `DELETE`, ... |
+| 路径 | `/health` |
+| 方法 | `GET` |
 | 认证 | ❌ 不需要 |
 | 说明 | 轻量级健康检查，不消耗任何资源 |
 
@@ -71,20 +83,46 @@ curl http://localhost:8888/health
 
 ---
 
+### 系统信息
+
+| 项目 | 值 |
+|------|-----|
+| 路径 | `/` |
+| 方法 | `GET` |
+| 认证 | ❌ 不需要 |
+| 说明 | 返回系统名称与网关版本，供客户端发现/握手 |
+
+**请求示例：**
+
+```bash
+curl http://localhost:8888/
+```
+
+**响应 (200 OK)：**
+
+```json
+{
+  "name": "LLM Hub",
+  "version": "1.1.0"
+}
+```
+
+---
+
 ### 实例探测
 
 | 项目 | 值 |
 |------|-----|
 | 路径 | `/probe` |
-| 方法 | `GET`, `POST`, ... |
+| 方法 | `GET` |
 | 认证 | ✅ 需要 |
-| 说明 | 探测所有上游实例的连接状态和模型可用性 |
+| 说明 | 探测所有上游实例的连接状态和模型可用性。本端点只处理 `GET`；其它方法会落到统一转发 catch-all，被当作上游路径代理（通常得到 502/404） |
 
 **请求示例：**
 
 ```bash
 curl http://localhost:8888/probe \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (200 OK)：**
@@ -140,13 +178,13 @@ curl http://localhost:8888/probe \
 | 路径 | `/v1/models`, `/models` |
 | 方法 | `GET` |
 | 认证 | ✅ 需要 |
-| 说明 | 返回所有可用模型（包括别名） |
+| 说明 | 聚合所有已配置上游的模型（含声明模型、实时拉取的模型、别名） |
 
 **请求示例：**
 
 ```bash
 curl http://localhost:8888/v1/models \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (200 OK)：**
@@ -192,7 +230,7 @@ curl http://localhost:8888/v1/models \
 
 ```bash
 curl http://localhost:8888/api/tags \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (200 OK)：**
@@ -226,6 +264,127 @@ curl http://localhost:8888/api/tags \
 
 ---
 
+### 实例运行状态 (Process Status)
+
+| 项目 | 值 |
+|------|-----|
+| 路径 | `/api/ps` |
+| 方法 | `GET` |
+| 认证 | ✅ 需要 |
+| 说明 | 聚合所有 Ollama 上游的 `/api/ps`（已加载/运行中的模型）。LM Studio 等 OpenAI 兼容上游无此端点，会被自动跳过。每个条目都会标注来源 `upstream`。 |
+
+**请求示例：**
+
+```bash
+curl http://localhost:8888/api/ps \
+  -H "Authorization: Bearer sk-gateway-example-key"
+```
+
+**响应 (200 OK)：**
+
+```json
+{
+  "models": [
+    {
+      "name": "qwen3:8b",
+      "model": "qwen3:8b",
+      "size": 5368709120,
+      "digest": "sha256:abc...",
+      "details": { "parameter_size": "8.0B" },
+      "expires_at": "2026-09-07T06:00:00Z",
+      "size_vram": 5368709120,
+      "upstream": "local-main"
+    }
+  ],
+  "errors": [
+    { "upstream": "ollama-ipex", "error": "connect timeout" }
+  ]
+}
+```
+
+> 单个上游不可达时不会中断整体响应，错误会汇总到 `errors` 字段。
+
+---
+
+### System One 决策 API（laya-server 代理）
+
+| 项目 | 值 |
+|------|-----|
+| 路径 | `/v1/systemone` |
+| 方法 | `POST` |
+| 认证 | ✅ 需要（网关自身的 API Key，来自 `.env` / `GATEWAY_API_KEYS`） |
+| 说明 | 将请求原样转发到配置的 laya-server 后端。网关用 `systemone.api_key_env`（默认 `LAYA_SERVER_API_KEY`）环境变量中的密钥对后端签名，请求体与响应体均原样透传。 |
+
+**配置（`config.json` 的 `systemone` 段）：**
+
+```json
+{
+  "systemone": {
+    "enabled": true,
+    "backend": "http://127.0.0.1:8080",
+    "model": "local",
+    "api_key_env": "LAYA_SERVER_API_KEY",
+    "path": "v1/systemone",
+    "timeout": 60.0
+  }
+}
+```
+
+- `model` 为 `"local"` 时表示**哨兵值**：不向下游注入 `model`，由调用方自行指定（laya-server 默认 `auto`）；将其改为 `auto` / `multilingual` 才会强制覆盖。
+- laya-server 的 `model` 为字面量枚举，**仅接受 `auto` / `english` / `multilingual` / `typed-decisions`**，其它值返回 **HTTP 422** `literal_error`。
+- 后端密钥从环境变量读取，绝不写入 `config.json`。
+
+**请求体结构（实测自 laya-server：`state` / `questions` 必填，且**未知顶层字段被拒绝**）：**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `state` | object | ✅ | 自由结构，承载上下文，如 `{"message": "..."}` |
+| `questions` | object | ✅ | 问题 id → 问题定义，至少 1 项 |
+| `model` | string | ❌ | 路由提示，取值见上文枚举 |
+
+`questions.<id>` 是**按 `type` 判别的联合类型**（tag 为 `type`），共三种变体：
+
+| `type` | 额外必填字段 | 语义 | 响应关键字段 |
+|--------|--------------|------|--------------|
+| `noul` | `instructions: string` | 二值判定 | `noul`（概率）、`confidence` |
+| `choice` | `instructions: string`、`criteria: string[] \| object` | 多选一 | `choice`、`probabilities`、`confidence` |
+| `score` | `instructions: string`、`criteria: string[]`（**至少 2 项**） | 打分/择优 | `score`、`legend`、`probabilities`、`confidence` |
+
+**请求示例：**
+
+```bash
+curl -X POST http://localhost:8888/v1/systemone \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "state": {"message": "I was charged twice and need a refund today."},
+    "questions": {
+      "refund":  {"type": "noul",   "instructions": "Does the customer ask for a refund?"},
+      "intent":  {"type": "choice", "instructions": "Primary intent?", "criteria": ["refund", "cancel", "other"]},
+      "urgency": {"type": "score",  "instructions": "How urgent?",      "criteria": ["urgent", "normal"]}
+    },
+    "model": "auto"
+  }'
+```
+
+**响应示例：**
+
+```json
+{
+  "model": "laya-rl-agent",
+  "answers": {
+    "refund": {"type": "noul", "noul": 0.9937, "confidence": 0.9937, "action": {"act_probability": 1.0}},
+    "intent": {"type": "choice", "choice": "refund", "probabilities": {"refund": 0.9999, "cancel": 0.0, "other": 0.0001}, "confidence": 0.9992}
+  },
+  "usage": {"input_tokens": 83, "output_tokens": 0},
+  "routing": {"model": "multilingual", "repo": "/opt/models/multilingual", "reason": "explicit model='multilingual'"}
+}
+```
+
+> 响应（`answers`、`model`、`usage`、`routing`）由 laya-server 原样返回，网关不做任何改写。
+
+---
+
 ### 重排序
 
 | 项目 | 值 |
@@ -239,7 +398,7 @@ curl http://localhost:8888/api/tags \
 
 ```bash
 curl http://localhost:8888/v1/rerank \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-reranker:4b",
@@ -358,7 +517,7 @@ curl http://localhost:8888/v1/rerank \
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -422,7 +581,7 @@ curl http://localhost:8888/v1/chat/completions \
 
 ```bash
 curl http://localhost:8888/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -472,7 +631,7 @@ curl http://localhost:8888/api/chat \
 
 ```bash
 curl http://localhost:8888/api/generate \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -508,7 +667,7 @@ curl http://localhost:8888/api/generate \
 
 ```bash
 curl http://localhost:8888/api/embed \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "bge-m3:latest",
@@ -555,7 +714,7 @@ curl http://localhost:8888/api/embed \
 
 ```bash
 curl http://localhost:8888/api/pull \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"name": "llama3"}'
 ```
@@ -570,7 +729,7 @@ curl http://localhost:8888/api/pull \
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -597,7 +756,7 @@ data: [DONE]
 
 ```bash
 curl http://localhost:8888/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -742,7 +901,7 @@ curl http://localhost:8888/api/delete \
 ```bash
 # 使用别名（自动映射到 qwen3.5:4b 并注入 think=false）
 curl http://localhost:8888/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -d '{
     "model": "qwen3.5:4b-nothink",
     "messages": [{"role": "user", "content": "1+1=?"}],
@@ -760,7 +919,7 @@ curl http://localhost:8888/api/chat \
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",

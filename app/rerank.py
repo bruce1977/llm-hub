@@ -386,15 +386,6 @@ def text_fallback_score(
     return unknown_score
 
 
-def softmax_pair(yes_logprob: float, no_logprob: float) -> float:
-    """Binary softmax over yes/no logprobs; returns probability of 'yes'."""
-    max_lp = max(yes_logprob, no_logprob)
-    yes_p = math.exp(yes_logprob - max_lp)
-    no_p = math.exp(no_logprob - max_lp)
-    total = yes_p + no_p
-    return yes_p / total if total > 0 else 0.5
-
-
 def normalize_scores(scores: list[float]) -> list[float]:
     """Min-max normalize scores to [0, 1]."""
     if not scores:

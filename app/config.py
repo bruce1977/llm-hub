@@ -271,6 +271,34 @@ class RerankConfig(BaseModel):
         return self.MODE_ALIASES.get(normalized, normalized)
 
 
+class SystemOneConfig(BaseModel):
+    """Proxy configuration for the laya-server `POST /v1/systemone` (System One) endpoint.
+
+    llm-hub authenticates the *caller* with its own API key (cfg.auth.api_keys, sourced
+    from `.env` / GATEWAY_API_KEYS - the `.keys` config). The request is then forwarded
+    to the configured laya-server backend, which needs *its own* API key. That key is read
+    from the environment variable named by `api_key_env` (default LAYA_SERVER_API_KEY) so
+    it never has to live in config.json.
+
+    `model` is the default model name sent to laya-server. The value "local" is a sentinel:
+    it is NOT forwarded - the caller may set `model` in the request body, otherwise
+    laya-server falls back to its own default ("auto"). Set `model` to a concrete value
+    such as "auto" or "multilingual" to force it. (laya-server only accepts those two -
+    any other value returns HTTP 422.)
+    """
+
+    enabled: bool = False
+    # laya-server base URL, e.g. http://127.0.0.1:8080 (set to your VM's address)
+    backend: str = "http://127.0.0.1:8080"
+    # Default model to send; "local" = do-not-override sentinel (see class docstring).
+    model: str = "auto"
+    # Name of the environment variable holding the laya-server API key.
+    api_key_env: str = "LAYA_SERVER_API_KEY"
+    # Endpoint path on the laya-server backend.
+    path: str = "v1/systemone"
+    timeout: float = 60.0
+
+
 class RateLimitConfig(BaseModel):
     """In-memory token-bucket rate limiter (single-process only).
 
@@ -354,6 +382,7 @@ class Config(BaseModel):
     default_upstream: str | None = None
     aliases: dict[str, AliasConfig] = Field(default_factory=dict)
     rerank: RerankConfig = Field(default_factory=RerankConfig)
+    systemone: SystemOneConfig = Field(default_factory=SystemOneConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     @model_validator(mode="after")
@@ -569,6 +598,17 @@ def build_default_config() -> dict[str, Any]:
             "max_document_chars": 0,
             "on_error": "score_zero",
         },
+        "systemone": {
+            # Proxy for the laya-server System One decision API.
+            # The caller authenticates with the gateway's own API key (GATEWAY_API_KEYS);
+            # the gateway then forwards to `backend` using the key from `api_key_env`.
+            "enabled": False,
+            "backend": "http://127.0.0.1:8080",
+            "model": "local",
+            "api_key_env": "LAYA_SERVER_API_KEY",
+            "path": "v1/systemone",
+            "timeout": 60.0,
+        },
     }
 
 
@@ -661,8 +701,3 @@ class ConfigManager:
             except OSError:
                 self._mtime = 0.0
             return self._config
-
-    def snapshot(self) -> tuple[Config, float]:
-        """Returns (config, current mtime) so a request sees a consistent view."""
-        cfg = self.config
-        return cfg, self._mtime

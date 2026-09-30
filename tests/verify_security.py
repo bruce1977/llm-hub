@@ -22,7 +22,6 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "app"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-import config as _config  # noqa: E402  (CONFIG_PATH already bound to _TMP)
 from main import app  # noqa: E402
 
 EXAMPLE = Path("data/example.config.json").read_text(encoding="utf-8")

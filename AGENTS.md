@@ -18,19 +18,26 @@ llm-hub/
 │   ├── config.py     # Config models, loading, hot reload, alias resolution
 │   ├── auth.py       # API key authentication, security helpers
 │   ├── proxy.py      # Reverse proxy, streaming pass-through
-│   └── rerank.py     # Rerank API implementation (logprobs/embedding modes)
+│   ├── rerank.py     # Rerank API implementation (logprobs/embedding modes)
+│   ├── systemone.py  # System One decision API (proxied to laya-server)
+│   └── static/swagger/  # Vendored Swagger UI assets (offline /docs)
 ├── data/
-│   └── config.json   # Runtime configuration (mounted into container)
+│   ├── config.json          # Runtime configuration (mounted into container)
+│   └── example.config.json  # Config template copied to config.json
 ├── tests/
-│   ├── smoke_test.py # Comprehensive mock tests
-│   ├── demo.py       # Demo script (requires real Ollama)
-│   └── TESTCASES.md  # Test cases documentation with examples
+│   ├── smoke_test.py        # Comprehensive mock tests (91)
+│   ├── test_gateway_new.py  # Aggregation / systemone / /docs schema tests (33)
+│   ├── verify_security.py   # Security control tests (15)
+│   ├── test_api.py          # E2E tests against a live server (20)
+│   ├── demo.py              # Demo script (requires real Ollama)
+│   └── TESTCASES.md         # Test cases documentation with examples
 ├── .vscode/
 │   ├── settings.json # VSCode editor settings
 │   ├── extensions.json # Recommended extensions
 │   └── launch.json   # Debug configurations
 ├── Dockerfile        # Container build (python:3.12-slim)
 ├── pyproject.toml    # Python tooling config (ruff, mypy, pytest)
+├── requirements.txt  # Runtime dependencies
 ├── API.md            # API documentation with all endpoints
 ├── workflow.md       # Development workflow with diagrams
 ├── DEPLOY.md         # Docker deployment guide
@@ -44,7 +51,7 @@ llm-hub/
 - Use type hints consistently
 - Follow PEP 8 style guidelines
 - Use `from __future__ import annotations` for forward references
-- Prefer `Optional[T]` over `T | None` for compatibility
+- Use PEP 604 unions (`str | None`) — `from __future__ import annotations` keeps them lazy
 - Use Pydantic models for configuration and validation
 - Use `logging` module with `llm_hub` logger name
 
@@ -72,17 +79,20 @@ llm-hub/
 # Mock tests only (no external dependencies)
 python tests/smoke_test.py
 
+# Gateway features: aggregation, systemone forwarding, /docs schema (no external deps)
+python tests/test_gateway_new.py
+
 # Security verification tests (no external dependencies)
 python tests/verify_security.py
 
 # E2E API tests (requires running server + real Ollama on port 11434)
 # 1. Start the server using the current directory's data/config.json:
 PYTHONPATH=app CONFIG_PATH=./data/config.json \
-  GATEWAY_API_KEYS=sk-test-1234567890abcdef \
+  GATEWAY_API_KEYS=sk-test-example-key \
   python -m uvicorn main:app --host 127.0.0.1 --port 8000
 
 # 2. In another terminal, run the E2E tests:
-python tests/test_api.py --base-url http://127.0.0.1:8000 --api-key sk-test-1234567890abcdef
+python tests/test_api.py --base-url http://127.0.0.1:8000 --api-key sk-test-example-key
 
 # Demo script (requires real Ollama)
 python tests/demo.py
@@ -91,7 +101,8 @@ python tests/demo.py
 **Important:** E2E tests always use `data/config.json` from the project root (set via `CONFIG_PATH=./data/config.json`). This config points to the local Ollama instance at `127.0.0.1:11434`. Never hardcode paths in test commands.
 
 ### Test Structure
-- `smoke_test.py` — 87 mock tests (auth, routing, aliases, streaming, rerank, security), no external deps
+- `smoke_test.py` — 91 mock tests (auth, routing, aliases, streaming, rerank, security, `/` system info), no external deps
+- `test_gateway_new.py` — 33 tests for aggregation, systemone forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input)
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
 - `test_api.py` — 20 E2E tests against a real running server + Ollama
 - `demo.py` — interactive demo (requires real Ollama)

@@ -15,9 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add defensive response headers on every response (nosniff, X-Frame-Options, CSP, etc.)
 - Document new hardening options in README and README_CN
 
+### Added (Docs)
+
+- Swagger `/docs`: every operation gets an `X-API-Key` **header parameter**, so an API-key input box sits in each endpoint's request section (`Parameters` → `Try it out` → `Execute` sends it with that call); the classic **Authorize** dialog (`BearerAuth` / `ApiKeyAuth`, persisted via `persistAuthorization`) still covers "one key for all requests"
+- Vendored local `favicon.svg` for `/docs` (replaces the external FastAPI CDN favicon, which CSP/air-gapped deployments reject)
+
 ### Changed
 
+- `GET /` now returns system information (`{"name": "LLM Hub", "version": "1.1.0"}`) instead of the `{"ok": true}` health payload; health probing stays on `/health`
 - Dockerfile HEALTHCHECK interval changed from 30s to 1h (passive gateway needs less probing)
+
+### Fixed
+
+- `/docs` rendered a blank white page: the blanket `default-src 'none'` CSP blocked the Swagger UI stylesheet, bundle and inline bootstrapper. Docs routes now serve a scoped CSP (`script-src`/`style-src 'self' 'unsafe-inline'`); every other response keeps `default-src 'none'`
+- Docs ↔ code sync pass: API.md documents `/probe` as **GET only** (other verbs fall through to the catch-all proxy) and its TOC now lists every section; documented JSON shapes (`/`, `/health`, `/v1/models`, `/api/tags`, `/api/ps`, `/probe`, error payloads) were re-verified against the live handlers
+
+### Removed
+
+- `/healthz` health alias (use `/health`)
+- Dead helpers with no callers: `ConfigManager.snapshot()` and `rerank.softmax_pair()` (Pydantic validators like `Config._expand_upstream_aliases` / `RerankRequest._coerce_aliases` are invoked by Pydantic and stay)
 
 ### Added (Rerank)
 
@@ -31,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - AGENTS.md: document new security features
+- AGENTS.md: project tree now lists `systemone.py`, vendored `static/swagger/`, all four test suites and `requirements.txt`; the type-hint convention line was corrected to PEP 604 unions (`X | None`), which is what `app/` actually uses
+- `.example.env` / README / README_CN / API.md / TESTCASES.md: example API keys replaced with obviously-fake placeholders (the previous realistic-looking `sk-gateway-…` + hex values tripped secret scanning)
 - README.md / README_CN.md: add security hardening tables and container health check notes
 
 ---

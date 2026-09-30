@@ -310,6 +310,22 @@ def main() -> int:
             data.get("ok") is True,
             json.dumps(data, ensure_ascii=False),
         )
+        r = client.get("/")
+        check("GET / returns 200 without a key", r.status_code == 200, f"got {r.status_code}: {r.text[:120]}")
+        if r.status_code == 200:
+            system = r.json()
+            check(
+                "/ returns the system name",
+                bool(system.get("name")),
+                json.dumps(system, ensure_ascii=False),
+            )
+            check(
+                "/ returns the gateway version",
+                bool(system.get("version")),
+                json.dumps(system, ensure_ascii=False),
+            )
+        r = client.get("/healthz")
+        check("GET /healthz no longer maps to the health route (401)", r.status_code == 401, f"got {r.status_code}")
 
         # -------------------------------------------------------- Authentication ---
         print("[2] API key authentication")

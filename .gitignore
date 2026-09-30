@@ -1,5 +1,6 @@
 # Secrets: contains GATEWAY_API_KEYS, must never be committed
 .env
+.keys
 *.secret
 
 # Local config (machine-specific, not committed): keep example.* tracked instead

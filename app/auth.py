@@ -21,9 +21,10 @@ from fastapi import HTTPException, Request, status
 logger = logging.getLogger("llm_hub")
 
 # Routes always anonymous when auth.allow_anonymous_health is true.
-HEALTH_PATHS = {"/", "/health", "/healthz"}
+PUBLIC_PATHS = {"/", "/health"}
 # OpenAPI docs routes (hidden on a public gateway unless security.allow_docs).
-DOCS_PATHS = {"/docs", "/redoc", "/openapi.json"}
+# Served locally (vendored assets) so they work without any public CDN.
+DOCS_PATHS = {"/docs", "/openapi.json"}
 
 WWW_AUTHENTICATE = "Bearer"
 
@@ -147,7 +148,7 @@ async def _authorize(request: Request, cfg) -> str | None:
             detail="Client address is not permitted to access this gateway.",
         )
 
-    if cfg.auth.allow_anonymous_health and path in HEALTH_PATHS:
+    if cfg.auth.allow_anonymous_health and path in PUBLIC_PATHS:
         return None
 
     key = extract_api_key(request, allow_query=cfg.security.allow_query_api_key)

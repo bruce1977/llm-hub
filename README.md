@@ -352,8 +352,8 @@ The examples below assume the gateway runs at `http://localhost:8000`.
 Either header works:
 
 ```bash
--H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
--H "X-API-Key: sk-gateway-9f2c8a1b4d5e6f70"
+-H "Authorization: Bearer sk-gateway-example-key"
+-H "X-API-Key: sk-gateway-example-key"
 ```
 
 ### Error responses
@@ -407,19 +407,19 @@ curl http://localhost:8000/api/delete \
 ```bash
 # Native API — auto-routes to the instance that has this model
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.6:35b-pruned","messages":[{"role":"user","content":"hello"}],"stream":false}'
 
 # OpenAI-compatible endpoint
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"hello"}]}'
 
 # Embeddings
 curl http://localhost:8000/api/embed \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"bge-m3:latest","input":["hello world"]}'
 ```
@@ -440,7 +440,7 @@ Both requests hit the same model, but the latter won't emit the `<think>` reason
 
 ```bash
 curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 ```json
@@ -462,7 +462,7 @@ clients / Open WebUI can treat the gateway as a single instance.
 
 ```bash
 curl http://localhost:8000/v1/rerank \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-reranker:4b",
@@ -569,7 +569,7 @@ the hardening options:
 |------|------|------|
 | `admin_endpoints` | `deny` | `deny` blocks pull/push/create/delete/copy/blobs; `readonly` also allows `pull`; `allow` forwards everything (internal only) |
 | `blocked_paths` | `[]` | Extra path prefixes to block, e.g. `["api/show"]` or `["api/*"]` |
-| `allow_docs` | `false` | Whether to expose `/docs`, `/redoc`, `/openapi.json` (keep off publicly) |
+| `allow_docs` | `false` | Whether to expose `/docs` and `/openapi.json` (keep off publicly; when on, the docs are API-key-free, every endpoint's **Parameters** section carries an `X-API-Key` input sent with that call, and the classic **Authorize** dialog covers `Authorization: Bearer` / `X-API-Key`) |
 | `cors_origins` | `[]` | Explicitly allowed cross-origin sources; empty means no CORS headers at all (no more `*`) |
 | `max_body_bytes` | `33554432` | Request-body cap (32MB); returns 413 above it, preventing oversized bodies |
 | `allow_query_api_key` | `false` | Whether to accept `?api_key=` query param (off by default, avoids keys in logs / browser history) |
@@ -584,6 +584,9 @@ Every response also gets defensive headers by default: `X-Content-Type-Options: 
 `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`,
 `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, and a restrictive
 `Permissions-Policy`. These cannot be turned off (they only harden the response, never leak data).
+The one relaxation is `/docs` / `/openapi.json`: they carry a scoped CSP
+(`script-src`/`style-src 'self' 'unsafe-inline'`) so the vendored Swagger UI can boot — without it
+the page would render as a blank white screen; every other response keeps `default-src 'none'`.
 
 > **Container health check:** the Docker `HEALTHCHECK` now probes `/health` once per hour
 > (`--interval=1h`) instead of every 30s. The gateway itself performs no periodic polling; it only
@@ -596,7 +599,7 @@ them at runtime:
 
 ```bash
 # Container / process environment; comma or newline separated
-export GATEWAY_API_KEYS="sk-gateway-9f2c8a1b4d5e6f70,sk-gateway-2b3c4d5e6f7a8b9c"
+export GATEWAY_API_KEYS="sk-gateway-example-key,sk-gateway-example-two"
 ```
 
 The gateway merges environment keys into `auth.api_keys` at startup, so `config.json` can stay `[]`
@@ -623,12 +626,13 @@ pip install -r requirements.txt
 cp data/example.config.json data/config.json
 # Edit data/config.json with your upstream URLs
 
-# 3. Set API keys (required, or add to auth.api_keys in config.json)
-export GATEWAY_API_KEYS="${your_secret_api_key}"
+# 3. Prepare secrets (.env) — uvicorn loads these via --env-file below
+cp .example.env .env
+# Edit .env: set GATEWAY_API_KEYS, LAYA_SERVER_API_KEY, etc.
 
-# 4. Run the server
+# 4. Run the server (loads ../.env automatically)
 cd app
-python -m uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 ```
 
 ### Windows PowerShell
@@ -637,42 +641,47 @@ python -m uvicorn main:app --reload --port 8000
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Set environment variables (required)
+# 2. Prepare secrets (.env)
+Copy-Item .example.env .env
+# Edit .env: set GATEWAY_API_KEYS, LAYA_SERVER_API_KEY, etc.
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.json"
-$env:GATEWAY_API_KEYS="${your_secret_api_key}"
 
-# 3. Run the server
+# 3. Run the server (loads ../.env automatically)
 cd app
-python -m uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 ```
 
 ### Run with specific config
 
 ```bash
-CONFIG_PATH=./data/config.json GATEWAY_API_KEYS="${your_secret_api_key}" python -m uvicorn main:app --host 0.0.0.0 --port 8000
+cd app
+CONFIG_PATH=../data/config.json python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
 ```
 
 ```powershell
 # Windows PowerShell
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.json"
-$env:GATEWAY_API_KEYS="${your_secret_api_key}"
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+cd app
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
 ```
 
 ### Run in background (Linux/macOS)
 
 ```bash
-nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 > llm-hub.log 2>&1 &
+cd app
+nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env > ../llm-hub.log 2>&1 &
 ```
 
 ### Run as Windows service (using NSSM)
 
 ```powershell
 # Install NSSM: choco install nssm
-nssm install LLMHub "C:\path\to\python.exe" "-m" "uvicorn" "main:app" "--host" "0.0.0.0" "--port" "8000"
+nssm install LLMHub "C:\path\to\python.exe" "-m" "uvicorn" "main:app" "--host" "0.0.0.0" "--port" "8000" "--env-file" "../.env"
 nssm set LLMHub AppDirectory "D:\workspace\github\llm-hub\app"
 nssm set LLMHub AppEnvironmentExtra "CONFIG_PATH=D:\workspace\github\llm-hub\data\config.json"
 nssm start LLMHub
 ```
 
-Interactive docs: <http://localhost:8000/docs> (requires `security.allow_docs: true`)
+> **Note:** `uvicorn --env-file` reads `.env` once at startup and injects its variables as environment variables (e.g. `GATEWAY_API_KEYS`, `LAYA_SERVER_API_KEY`). It does **not** hot-reload — after editing `.env`, restart uvicorn. `config.json` changes still hot-reload without restart.
+
+Interactive docs: <http://localhost:8000/docs> (requires `security.allow_docs: true`; when enabled, `/docs` and `/openapi.json` are API-key-free; each endpoint has an `X-API-Key` input box in its own **Parameters** section — "Try it out" → "Execute" sends it with that request — and the header **Authorize** dialog accepts `Authorization: Bearer` or `X-API-Key` for all requests)

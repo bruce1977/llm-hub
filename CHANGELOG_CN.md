@@ -15,14 +15,47 @@
 - 所有响应默认携带安全加固响应头（nosniff、X-Frame-Options、CSP 等）
 - README 和 README_CN 补充加固配置说明
 
+### 新增（文档 / Swagger）
+
+- Swagger `/docs`：每个端点都注入 `X-API-Key` **请求头参数**，因此**每个 API 的请求区（Parameters）里都有 API Key 输入框**——点 **Try it out** 填写、**Execute** 时随该次请求发送；顶部 **Authorize**（`BearerAuth` / `ApiKeyAuth`，`persistAuthorization` 持久化）仍可用于一次填写、全部请求共用
+- `/docs` 改用本地内置的 `favicon.svg`（替代外部 CDN 图标，离线/内网部署同样可用）
+
 ### 变更
 
+- `GET /` 改为直接返回系统信息（`{"name": "LLM Hub", "version": "1.1.0"}`），健康探测统一使用 `/health`（返回 `{"ok": true}`）
 - Dockerfile 健康检查间隔从 30 秒改为 1 小时（被动网关无需频繁探测）
+
+### 修复
+
+- `/docs` 打开是一片空白：统一的 `default-src 'none'` CSP 拦截了 Swagger UI 的样式表、bundle 与内联启动脚本。现在 `/docs`、`/openapi.json` 使用收窄后的 CSP（`script-src`/`style-src 'self' 'unsafe-inline'`），其余响应仍保持 `default-src 'none'`
+- 文档与代码同步：API.md 中 `/probe` 更正为 **仅 GET**（其它方法会落到统一转发 catch-all 被代理到上游），目录补全缺失的 6 个小节；`/`、`/health`、`/v1/models`、`/api/tags`、`/api/ps`、`/probe` 及各错误文案的响应结构已对真实处理器逐项复核
+
+### 移除
+
+- 移除 `/healthz` 健康检查别名（请使用 `/health`）
+- 移除无任何调用的死代码：`ConfigManager.snapshot()`、`rerank.softmax_pair()`（`Config._expand_upstream_aliases`、`RerankRequest._coerce_aliases` 等 Pydantic 校验器由框架调用，保留）
 
 ### 新增（Rerank）
 
 - 新增 `keep_alive` 配置，管理 Ollama 重排器的 VRAM 占用（0 = 打完即卸，"5m" = 保持 5 分钟，-1 = 服务端默认）
 - 新增 `RateLimitConfig` 模型，含 `enabled`、`per_minute`、`burst`、`by`（ip/key）
+
+### 新增（System One / laya-server 代理）
+
+- 新增 `POST /v1/systemone` 端点：将请求原样转发到 `config.json` 的 `systemone.backend`（laya-server），网关用自身 API Key 校验调用方，再以 `systemone.api_key_env`（默认 `LAYA_SERVER_API_KEY`）环境变量密钥对后端签名，请求/响应体透传
+- 新增 `SystemOneConfig`：`enabled`、`backend`、`model`（默认 `local` 哨兵值，不注入；改为 `auto`/`multilingual` 才强制覆盖）、`api_key_env`、`path`、`timeout`
+- `model` 为 `local` 时不向下游注入模型（laya-server 默认 `auto`），避免非法模型值触发 422
+
+### 新增（模型/进程聚合）
+
+- `GET /v1/models` 与 `GET /api/tags` 现在实时拉取每个上游的真实模型列表并与声明模型、别名合并
+- 新增 `GET /api/ps`：聚合所有 Ollama 上游的 `/api/ps`（运行中模型），逐条标注来源 `upstream`，单上游失败不影响整体（错误汇总到 `errors`）
+
+### 文档
+
+- API.md：新增 System One、`/api/ps` 端点说明；`/v1/models` 标注实时聚合
+- README_CN.md：新增 System One 集成说明
+- 新增 `tests/test_gateway_new.py`（33 项，覆盖聚合、systemone 鉴权/转发/哨兵、/docs 开关）
 - 默认 rerank `options.num_ctx` 设为 8192，`keep_alive` 设为 "3m"
 - 新增 `Modelfile.reranker` 低显存重排器变体（8192 ctx ≈ 4 GB，原 40960 ctx ≈ 9.3 GB）
 - 新增 `Ranker.md` 重排器配置完整指南
@@ -31,6 +64,8 @@
 ### 文档
 
 - AGENTS.md：补充新安全功能描述
+- AGENTS.md：项目结构树补齐 `systemone.py`、内置 `static/swagger/`、四套测试与 `requirements.txt`；类型注解约定更正为 PEP 604 联合类型（`app/` 中 `Optional[...]` 实际 0 处使用）
+- `.example.env` / README / README_CN / API.md / TESTCASES.md：示例 API Key 统一替换为明显可辨的占位值（原 `sk-gateway-…` + 十六进制的形式会命中密钥扫描）
 - README.md / README_CN.md：新增安全加固配置表和容器健康检查说明
 
 ---

@@ -48,7 +48,7 @@ curl http://localhost:8888/health
 
 ```bash
 curl http://localhost:8888/probe \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (200 OK):**
@@ -141,7 +141,7 @@ curl http://localhost:8000/v1/models
 
 ```bash
 curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (200 OK):**
@@ -159,7 +159,7 @@ curl http://localhost:8000/v1/models \
 
 ```bash
 curl http://localhost:8000/v1/models \
-  -H "X-API-Key: sk-gateway-9f2c8a1b4d5e6f70"
+  -H "X-API-Key: sk-gateway-example-key"
 ```
 
 **响应 (200 OK):**
@@ -198,7 +198,7 @@ curl http://localhost:8000/v1/models \
 
 ```bash
 curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (200 OK):**
@@ -235,7 +235,7 @@ curl http://localhost:8000/v1/models \
 
 ```bash
 curl http://localhost:8000/api/tags \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (200 OK):**
@@ -277,7 +277,7 @@ curl http://localhost:8000/api/tags \
 
 ```bash
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -309,7 +309,7 @@ curl http://localhost:8000/api/chat \
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -354,7 +354,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -419,7 +419,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```bash
 curl http://localhost:8000/api/generate \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -450,7 +450,7 @@ curl http://localhost:8000/api/generate \
 
 ```bash
 curl http://localhost:8000/api/embed \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "bge-m3:latest",
@@ -480,7 +480,7 @@ curl http://localhost:8000/api/embed \
 
 ```bash
 curl http://localhost:8000/v1/rerank \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-reranker:4b",
@@ -542,7 +542,7 @@ curl http://localhost:8000/v1/rerank \
 
 ```bash
 curl http://localhost:8000/v1/rerank \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "bge-m3:latest",
@@ -597,7 +597,7 @@ curl http://localhost:8000/v1/rerank \
 
 ```bash
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -624,7 +624,7 @@ curl http://localhost:8000/api/chat \
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
@@ -659,7 +659,7 @@ data: [DONE]
 
 ```bash
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5:4b-nothink",
@@ -691,7 +691,7 @@ curl http://localhost:8000/api/chat \
 
 ```bash
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "big-nothink",
@@ -715,7 +715,7 @@ curl http://localhost:8000/api/chat \
 
 ```bash
 curl http://localhost:8000/api/delete \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"name": "some-model"}'
 ```
@@ -734,7 +734,7 @@ curl http://localhost:8000/api/delete \
 
 ```bash
 curl http://localhost:8000/api/pull \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"name": "llama3"}'
 ```
@@ -769,7 +769,7 @@ curl http://localhost:8000/docs
 
 ```bash
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:8b","data":"...超大数据..."}'
 ```
@@ -798,7 +798,7 @@ curl http://localhost:8000/api/chat \
 
 ```bash
 curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70"
+  -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
 **响应 (403 Forbidden):**
@@ -819,7 +819,7 @@ curl http://localhost:8000/v1/models \
 
 ```bash
 curl http://localhost:8000/v1/rerank \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '这是无效的 JSON'
 ```
@@ -838,7 +838,7 @@ curl http://localhost:8000/v1/rerank \
 
 ```bash
 curl http://localhost:8000/v1/rerank \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"model": "qwen3-reranker:4b"}'
 ```
@@ -857,7 +857,7 @@ curl http://localhost:8000/v1/rerank \
 
 ```bash
 curl http://localhost:8000/api/chat \
-  -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+  -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "nonexistent-model",
@@ -945,7 +945,7 @@ curl http://localhost:8888/health
 # macOS: brew install httpd
 
 # 测试并发请求
-ab -n 100 -c 10 -H "Authorization: Bearer sk-gateway-9f2c8a1b4d5e6f70" \
+ab -n 100 -c 10 -H "Authorization: Bearer sk-gateway-example-key" \
   http://localhost:8000/v1/models
 ```
 
@@ -958,7 +958,7 @@ import time
 import httpx
 
 url = "http://localhost:8000/api/chat"
-headers = {"Authorization": "Bearer sk-gateway-9f2c8a1b4d5e6f70"}
+headers = {"Authorization": "Bearer sk-gateway-example-key"}
 payload = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "你好"}], "stream": True}
 
 start = time.time()

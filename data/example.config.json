@@ -58,13 +58,17 @@
   "aliases": {
     "qwen3:4b-nothink": {
       "model": "qwen3:4b",
-      "params": { "think": false },
+      "params": {
+        "think": false
+      },
       "description": "4B model with thinking disabled for faster responses"
     },
     "qwen3.6:35b-nothink": {
       "model": "qwen3.6:35b-pruned",
       "upstream": "ollama",
-      "params": { "think": false },
+      "params": {
+        "think": false
+      },
       "description": "35B pruned model with thinking disabled"
     }
   },
@@ -72,7 +76,10 @@
     "enabled": true,
     "endpoint": "/v1/rerank",
     "mode": "logprobs",
-    "models": ["qwen3-reranker:4b-rk", "qwen3-reranker:4b"],
+    "models": [
+      "qwen3-reranker:4b-rk",
+      "qwen3-reranker:4b"
+    ],
     "instruction": "Given a web search query, retrieve relevant passages that answer the query. A passage is relevant only if it directly answers the specific question asked. Passages that merely share the same broad topic, mention related keywords, or talk about the same field or entity without answering the question are NOT relevant.",
     "yes_token": "yes",
     "no_token": "no",
@@ -83,7 +90,9 @@
     "max_tokens": 4,
     "token_scan_depth": 4,
     "stop": [],
-    "options": { "num_ctx": 8192 },
+    "options": {
+      "num_ctx": 8192
+    },
     "keep_alive": "3m",
     "logprobs_fallback": true,
     "fallback_yes": 0.9,
@@ -100,6 +109,14 @@
     "max_document_chars": 0,
     "on_error": "score_zero"
   },
+  "systemone": {
+    "enabled": false,
+    "backend": "http://127.0.0.1:8080",
+    "model": "auto",
+    "api_key_env": "LAYA_SERVER_API_KEY",
+    "path": "v1/systemone",
+    "timeout": 60.0
+  },
   "security": {
     "admin_endpoints": "deny",
     "blocked_paths": [],
@@ -110,7 +127,10 @@
     "expose_health_details": false,
     "fail_on_weak_keys": true,
     "allowed_client_ips": [],
-    "allowed_http_methods": ["GET", "POST"],
+    "allowed_http_methods": [
+      "GET",
+      "POST"
+    ],
     "path_allowlist": [],
     "rate_limit": {
       "enabled": false,
