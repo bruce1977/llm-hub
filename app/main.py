@@ -43,7 +43,7 @@ from systemone import SystemOneService
 logger = logging.getLogger("llm_hub")
 
 #: Gateway version (was previously exposed via the app package __init__)
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 

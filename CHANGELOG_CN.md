@@ -7,6 +7,10 @@
 
 ## [未发布]
 
+---
+
+## [1.2.0] - 2026-09-30
+
 ### 安全
 
 - 新增 HTTP 方法允许列表（`security.allowed_http_methods`，默认 GET/POST → 其他返回 405）
@@ -22,7 +26,7 @@
 
 ### 变更
 
-- `GET /` 改为直接返回系统信息（`{"name": "LLM Hub", "version": "1.1.0"}`），健康探测统一使用 `/health`（返回 `{"ok": true}`）
+- `GET /` 改为直接返回系统信息（`{"name": "LLM Hub", "version": "1.2.0"}`），健康探测统一使用 `/health`（返回 `{"ok": true}`）
 - Dockerfile 健康检查间隔从 30 秒改为 1 小时（被动网关无需频繁探测）
 
 ### 修复

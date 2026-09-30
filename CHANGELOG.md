@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.2.0] - 2026-09-30
+
 ### Security
 
 - Add HTTP method allowlist (`security.allowed_http_methods`, default GET/POST → 405 for others)
@@ -22,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `GET /` now returns system information (`{"name": "LLM Hub", "version": "1.1.0"}`) instead of the `{"ok": true}` health payload; health probing stays on `/health`
+- `GET /` now returns system information (`{"name": "LLM Hub", "version": "1.2.0"}`) instead of the `{"ok": true}` health payload; health probing stays on `/health`
 - Dockerfile HEALTHCHECK interval changed from 30s to 1h (passive gateway needs less probing)
 
 ### Fixed
