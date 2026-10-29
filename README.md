@@ -225,7 +225,9 @@ docker push registry.example.com/llm-hub:1.0.0
   matches `opencode/big-pickle` ( `"opencode:*"` would match nothing)
 - `model_aliases`: maps a verbose upstream id to a short name (see the LM Studio section below)
 - `timeout`: overrides the global timeout; raise it for large models
-- `headers`: optional extra headers added when forwarding (e.g. when the upstream has its own auth)
+- `headers`: optional extra headers added when forwarding (e.g. when the upstream has its own auth).
+  Model discovery (`/v1/models`, `/api/tags`, and the `/probe` health/model checks) sends them too,
+  so an authenticated upstream still shows up in the aggregated catalog
 - `priority`: routing priority (integer, **default `0`**). When the same model name is declared by
   several upstreams, the gateway picks the one with the **smallest** `priority`; ties keep the
   declaration order in `upstreams`. Useful for mounting the same model on a GPU instance and an

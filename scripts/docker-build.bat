@@ -1,17 +1,18 @@
 @echo off
 setlocal EnableExtensions
 rem ----------------------------------------------------------------------
-rem Build and publish the llm-hub image to Docker Hub.
+rem Build the llm-hub image as <image>:latest and <image>:<version>.
 rem
-rem Runs docker_build.bat, then pushes <image>:latest and <image>:<version>.
-rem Nothing is committed or pushed to git - do that yourself first.
-rem
-rem Usage:  scripts\docker_publish.bat [image] [version]
+rem Usage:  scripts\docker-build.bat [image] [version]
 rem default image:   bruce1977/llm-hub
 rem default version: __version__ from app\main.py
 rem ----------------------------------------------------------------------
 
 cd /d "%~dp0.."
+if errorlevel 1 (
+    echo ERROR: cannot change directory to the repository root.
+    exit /b 1
+)
 
 set "IMAGE_NAME=%~1"
 if not defined IMAGE_NAME set "IMAGE_NAME=bruce1977/llm-hub"
@@ -35,38 +36,21 @@ if not defined VERSION (
 )
 
 :have_version
-echo ====================================================
-echo llm-hub publish
-echo   image:   %IMAGE_NAME%
-echo   version: %VERSION%
-echo ====================================================
+echo Image:   %IMAGE_NAME%
+echo Version: %VERSION%
 echo.
 
-call "%~dp0docker_build.bat" "%IMAGE_NAME%" "%VERSION%"
+docker build -t %IMAGE_NAME%:latest -t %IMAGE_NAME%:%VERSION% .
 if errorlevel 1 (
-    echo ERROR: build failed, nothing was pushed.
+    echo.
+    echo ERROR: docker build failed.
     exit /b 1
 )
 
 echo.
-echo Pushing %IMAGE_NAME%:latest
-docker push %IMAGE_NAME%:latest
-if errorlevel 1 (
-    echo ERROR: docker push failed. Are you logged in?  docker login
-    exit /b 1
-)
-
-echo.
-echo Pushing %IMAGE_NAME%:%VERSION%
-docker push %IMAGE_NAME%:%VERSION%
-if errorlevel 1 (
-    echo ERROR: docker push failed. Are you logged in?  docker login
-    exit /b 1
-)
-
-echo.
-echo Published:
+echo Built tags:
 echo   %IMAGE_NAME%:latest
 echo   %IMAGE_NAME%:%VERSION%
-echo https://hub.docker.com/r/%IMAGE_NAME%
+echo.
+echo Push them with:  scripts\docker-publish.bat
 endlocal

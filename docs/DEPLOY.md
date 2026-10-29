@@ -65,18 +65,18 @@ curl http://localhost:8888/v1/models -H "Authorization: Bearer YOUR_API_KEY"
 
 ```bat
 :: 只构建：产出 bruce1977/llm-hub:latest 与 :<版本号>
-scripts\docker_build.bat
+scripts\docker-build.bat
 
 :: 构建并推送到 Docker Hub（需先 docker login）
-scripts\docker_publish.bat
+scripts\docker-publish.bat
 
 :: 覆盖镜像名与版本号
-scripts\docker_build.bat registry.example.com/team/llm-hub 1.3.0
+scripts\docker-build.bat registry.example.com/team/llm-hub 1.3.0
 ```
 
 - 版本号默认读 `app\main.py` 的 `__version__`（即网关 `GET /` 上报的版本），第二个参数可显式指定
 - 两个脚本都会先确认 Docker 可用，否则直接退出并返回错误码 1
-- `docker_publish.bat` 先构建、成功后才依次推送 `latest` 与版本号标签；推送失败立即停止并提示 `docker login`
+- `docker-publish.bat` 先构建、成功后才依次推送 `latest` 与版本号标签；推送失败立即停止并提示 `docker login`
 - 脚本不含任何 git 操作：提交、打 tag 请在发布前自己完成
 
 ---

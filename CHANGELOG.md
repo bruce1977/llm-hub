@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added (Web Search)
 
 - New endpoint `POST /v1/tools/web-search`: keyword web search served by an OpenCode API Gateway. The request body and the provider response are passed through unchanged (`query`, `results[]`, concatenated `text`, `sources`, plus `answer` when `synthesize: true`)
+- `POST /v1/tools/web-search` now logs a diagnostic line when the provider is unreachable: the full exception chain plus a per-address TCP probe (`dns(host) -> ip:port ConnectionRefusedError errno=111`, `TimeoutError`, `gaierror`), since httpx collapses all of them into `All connection attempts failed`
 - New `websearch` config block: `enabled`, `upstream`, `path` (default `v1/web-search`), `api_key_env`, `timeout`. `upstream` selects the provider by name; left empty it picks the first `type: "opencode"` upstream, and an unknown name returns 503 instead of silently falling back
 - New upstream type `opencode`: OpenAI-compatible model discovery (`/v1/models`, `data[].id`), liveness via `/health`. Registering the provider as a normal upstream means its models also join the aggregated `/v1/models` and chat can be routed to it
 - Optional provider signing through `websearch.api_key_env` (empty by default = unsigned, which is what the current gateway needs); `OPENCODE_GATEWAY_API_KEY` documented in `.env.example` and `docs/DEPLOY.md`
@@ -20,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added (Build & publish scripts)
 
-- `scripts/docker_build.bat`: builds `bruce1977/llm-hub:latest` plus `:<version>`, reading the version from `__version__` in `app/main.py` (overridable: `docker_build.bat [image] [version]`); aborts with exit code 1 when Docker is unreachable
-- `scripts/docker_publish.bat`: runs the build first and only then pushes `latest` and `:<version>` to Docker Hub, stopping with a `docker login` hint if a push fails. Neither script touches git - commit and tag by hand before publishing
+- `scripts/docker-build.bat`: builds `bruce1977/llm-hub:latest` plus `:<version>`, reading the version from `__version__` in `app/main.py` (overridable: `docker-build.bat [image] [version]`); aborts with exit code 1 when Docker is unreachable
+- `scripts/docker-publish.bat`: runs the build first and only then pushes `latest` and `:<version>` to Docker Hub, stopping with a `docker login` hint if a push fails. Neither script touches git - commit and tag by hand before publishing
 - `docs/DEPLOY.md`: new "一键构建 / 发布脚本（Windows）" section documenting both scripts
 
 ### Changed (Repository layout)
@@ -37,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `systemone.model` is confirmed to travel to the backend on the wire. It is injected only when it is a concrete value and the caller supplied no `model`; `"local"` remains the "do not inject" sentinel. The code default stays `auto` (valid for laya-server); `data/config.json` and `data/example.config.json` now ship `model: "tev1"` against an Ollama backend, since Ollama answers **404** for `auto` and **400** when the model is missing
 - Error and log wording in `app/systemone.py` is now backend-neutral ("System One backend") and the missing-env-var warning explains that signing only matters if the backend requires a key
 - Docs: `docs/API.md` and README_CN gained the laya-vs-Ollama contract comparison - measured differences are the accepted `model` values, `choice` requiring a non-empty `criteria` object on Ollama (array → 400) while `score` requires a 2-10 item array, unknown top-level fields being rejected by laya-server but ignored by Ollama, and `routing` being present only in laya-server responses - plus a request example valid on both and the observed Ollama response
+
+### Fixed
+
+- Model discovery for `/v1/models`, `/api/tags` and `/probe` now sends `upstreams[].headers`. Previously only chat forwarding (`proxy.py`) and web search (`websearch.py`) applied them, so an upstream requiring auth (e.g. a keyed `opencode`) answered **401** to the discovery call and its models never reached the aggregate - the catalog showed only `auto` while chat and search worked
+- Tests: `test_gateway_new.py` +4 (59 total), using a fake client to assert discovery hits `v1/models` with the `Authorization` header
 
 ---
 

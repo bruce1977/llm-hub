@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 from typing import Any
 
 import httpx
@@ -60,6 +61,49 @@ _EXCLUDED_RESPONSE_HEADERS = {
 
 def _filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in _EXCLUDED_RESPONSE_HEADERS}
+
+
+def _exception_chain(exc: BaseException) -> str:
+    parts: list[str] = []
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen and len(parts) < 5:
+        seen.add(id(exc))
+        parts.append(f"{type(exc).__name__}: {exc}")
+        exc = exc.__cause__ or exc.__context__  # type: ignore[assignment]
+    return " <- ".join(parts)
+
+
+def _tcp_report(url: str) -> str:
+    """Connect to every resolved address and report the per-address outcome.
+
+    httpx collapses all failed connection attempts into "All connection attempts
+    failed", which hides whether the host refused, timed out or was filtered. Only
+    called on the error path, where the extra blocking probes (3s each) are cheap.
+    """
+    target = httpx.URL(url)
+    host, port = target.host, target.port or (443 if target.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return f"dns({host}) failed: {exc}"
+
+    results: list[str] = []
+    seen: set[str] = set()
+    for family, _, _, _, sockaddr in infos:
+        ip = sockaddr[0]
+        if ip in seen:
+            continue
+        seen.add(ip)
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(3.0)
+        try:
+            sock.connect((ip, port))
+            results.append(f"{ip}:{port} ok")
+        except OSError as exc:
+            results.append(f"{ip}:{port} {type(exc).__name__} errno={exc.errno} ({exc.strerror})")
+        finally:
+            sock.close()
+    return f"dns({host}) -> " + ", ".join(results)
 
 
 class WebSearchService:
@@ -151,7 +195,15 @@ class WebSearchService:
                 timeout=timeout,
             )
         except httpx.ConnectError as exc:
-            logger.error("Cannot connect to web search provider '%s' (%s): %s", upstream.name, url, exc)
+            logger.error(
+                "Cannot connect to web search provider '%s' | url=%s | trust_env=%s | "
+                "error=%s | tcp=%s",
+                upstream.name,
+                url,
+                getattr(self.client, "trust_env", None),
+                _exception_chain(exc),
+                _tcp_report(url),
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Web search provider '{upstream.name}' is unreachable: {exc}",

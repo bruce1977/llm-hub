@@ -10,6 +10,7 @@
 ### 新增（联网检索）
 
 - 新增端点 `POST /v1/tools/web-search`：由 OpenCode API Gateway 提供关键词网页检索，请求体与上游响应**原样透传**（`query`、`results[]`、拼接后的 `text`、`sources`，`synthesize: true` 时另有 `answer`）
+- `POST /v1/tools/web-search` 在 provider 不可达时新增诊断日志：完整异常链 + 逐个地址的 TCP 探测结果（`dns(host) -> ip:port ConnectionRefusedError errno=111`、`TimeoutError`、`gaierror`），因为 httpx 会把它们统一收敛成 `All connection attempts failed`
 - 新增 `websearch` 配置段：`enabled`、`upstream`、`path`（默认 `v1/web-search`）、`api_key_env`、`timeout`。`upstream` 按名字选检索方；留空则自动取第一个 `type: "opencode"` 的上游；填了不存在的名字返回 **503**，不会静默回退
 - 新增上游类型 `opencode`：模型发现走 OpenAI 兼容的 `/v1/models`（解析 `data[].id`），存活探测走 `/health`。检索方作为普通上游登记后，其模型同时进入聚合的 `/v1/models`，聊天也可路由过去
 - 可选的上游签名：`websearch.api_key_env` 指定环境变量名（默认为空 = 不签名，当前上游匿名即可访问）；`OPENCODE_GATEWAY_API_KEY` 已写入 `.env.example` 与 `docs/DEPLOY.md`
@@ -20,8 +21,8 @@
 
 ### 新增（构建 / 发布脚本）
 
-- `scripts/docker_build.bat`：构建 `bruce1977/llm-hub:latest` 与 `:<版本号>` 两个标签，版本号取自 `app/main.py` 的 `__version__`（可用参数覆盖：`docker_build.bat [镜像名] [版本号]`）；Docker 不可用时以错误码 1 直接退出
-- `scripts/docker_publish.bat`：先构建，成功后才依次推送 `latest` 与 `:<版本号>`；推送失败立即停止并提示 `docker login`。两个脚本都不碰 git：提交与打 tag 请在发布前自行完成
+- `scripts/docker-build.bat`：构建 `bruce1977/llm-hub:latest` 与 `:<版本号>` 两个标签，版本号取自 `app/main.py` 的 `__version__`（可用参数覆盖：`docker-build.bat [镜像名] [版本号]`）；Docker 不可用时以错误码 1 直接退出
+- `scripts/docker-publish.bat`：先构建，成功后才依次推送 `latest` 与 `:<版本号>`；推送失败立即停止并提示 `docker login`。两个脚本都不碰 git：提交与打 tag 请在发布前自行完成
 - `docs/DEPLOY.md`：新增「一键构建 / 发布脚本（Windows）」小节
 
 ### 变更（仓库结构）
@@ -37,6 +38,11 @@
 - 已确认 `systemone.model` **会随请求体发送到后端**：仅当它是具体值且调用方未自带 `model` 时注入，`"local"` 仍是「不注入」哨兵。代码默认值保持 `auto`（laya-server 合法）；`data/config.json` 与 `data/example.config.json` 改为指向 Ollama 并配 `model: "tev1"`，因为 Ollama 对 `auto` 返回 **404**、缺 `model` 返回 **400**
 - `app/systemone.py` 的日志与报错文案改为后端中立（「System One backend」），缺环境变量的告警也说明「只有后端要求密钥时才有影响」
 - 文档：`docs/API.md` 与 README_CN 新增 laya-server / Ollama 契约对比（实测差异：`model` 取值、Ollama 的 `choice` 必须用非空 `criteria` **object**（数组 → 400）而 `score` 必须是 **2–10 项数组**、未知顶层字段 laya 拒绝 / Ollama 忽略、`routing` 仅 laya 返回），并给出两家都合法的请求示例与 Ollama 实测响应
+
+### 修复
+
+- `/v1/models`、`/api/tags` 与 `/probe` 的模型发现现在会带上 `upstreams[].headers`：此前只有聊天转发（`proxy.py`）和联网检索（`websearch.py`）应用了这些头，需要鉴权的上游（如带密钥的 `opencode`）在发现接口上收到 **401**，其模型因此不出现在聚合列表里——表现为网关只有 `auto`、但聊天和检索都正常
+- 测试：`test_gateway_new.py` +4（共 59），用假客户端断言发现请求命中 `v1/models` 且携带 `Authorization`
 
 ---
 

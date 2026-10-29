@@ -398,6 +398,14 @@ async def health_response(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+def _discovery_headers(upstream) -> dict[str, str] | None:
+    """Headers for control-plane calls (health / model list); providers may require auth here too."""
+    custom = getattr(upstream, "headers", None)
+    if isinstance(custom, dict) and custom:
+        return {str(k): str(v) for k, v in custom.items()}
+    return None
+
+
 async def probe_response(request: Request) -> JSONResponse:
     """Probe all upstreams and check model validity. Requires API key."""
     manager = request.app.state.manager
@@ -414,7 +422,11 @@ async def probe_response(request: Request) -> JSONResponse:
             "models": [],
         }
         try:
-            resp = await client.get(f"{up.base_url_stripped()}/{up.health_path()}", timeout=5.0)
+            resp = await client.get(
+                f"{up.base_url_stripped()}/{up.health_path()}",
+                headers=_discovery_headers(up),
+                timeout=5.0,
+            )
             upstream_info["reachable"] = resp.status_code < 500
             if resp.status_code < 500:
                 try:
@@ -433,7 +445,11 @@ async def probe_response(request: Request) -> JSONResponse:
                 # Exact match: check if model exists in upstream
                 if upstream_info["reachable"]:
                     try:
-                        resp = await client.get(f"{up.base_url_stripped()}/{up.tags_path()}", timeout=8.0)
+                        resp = await client.get(
+                            f"{up.base_url_stripped()}/{up.tags_path()}",
+                            headers=_discovery_headers(up),
+                            timeout=8.0,
+                        )
                         resp.raise_for_status()
                         available_models = up.parse_model_names(resp.json())
                         model_info["available"] = model_name in available_models
@@ -466,7 +482,11 @@ async def fetch_upstream_models(client: httpx.AsyncClient, upstream) -> list[str
         return cached[1]
 
     try:
-        resp = await client.get(f"{upstream.base_url_stripped()}/{upstream.tags_path()}", timeout=8.0)
+        resp = await client.get(
+            f"{upstream.base_url_stripped()}/{upstream.tags_path()}",
+            headers=_discovery_headers(upstream),
+            timeout=8.0,
+        )
         resp.raise_for_status()
         names = upstream.parse_model_names(resp.json())
         _UPSTREAM_MODELS_CACHE[upstream.name] = (now, names)

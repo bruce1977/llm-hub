@@ -28,7 +28,7 @@ llm-hub/
 │   └── example.config.json  # Config template copied to config.json
 ├── tests/
 │   ├── smoke_test.py        # Comprehensive mock tests (104)
-│   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (55)
+│   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (59)
 │   ├── verify_security.py   # Security control tests (15)
 │   ├── test_api.py          # E2E tests against a live server (28)
 │   └── demo.py              # Demo script (requires real Ollama)
@@ -39,8 +39,8 @@ llm-hub/
 │   ├── Ranker.md            # Reranker configuration guide
 │   └── workflow.md          # Development workflow with diagrams
 ├── scripts/
-│   ├── docker_build.bat     # Build the image (latest + version tag)
-│   └── docker_publish.bat   # Build then push both tags to Docker Hub
+│   ├── docker-build.bat     # Build the image (latest + version tag)
+│   └── docker-publish.bat   # Build then push both tags to Docker Hub
 ├── .vscode/
 │   ├── settings.json # VSCode editor settings
 │   ├── extensions.json # Recommended extensions
@@ -111,7 +111,7 @@ python tests/demo.py
 
 ### Test Structure
 - `smoke_test.py` — 104 mock tests (auth, routing, aliases, streaming, rerank, security, `/` system info, upstream types), no external deps
-- `test_gateway_new.py` — 55 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input)
+- `test_gateway_new.py` — 59 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input)
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
 - `test_api.py` — 28 E2E tests against a real running server + Ollama + web search provider
 - `demo.py` — interactive demo (requires real Ollama)
@@ -200,13 +200,18 @@ docker run -d --name llm-hub \
   the gateway's aliases, and nothing is injected
 - The provider is a regular upstream, so its models appear in `/v1/models` and chat can be
   routed to it; model ids are slash-separated (`opencode/big-pickle`), so the wildcard is
-  `"opencode/*"` — a colon form matches nothing
+  `"opencode/*"` — a colon form matches nothing. Discovery (`fetch_upstream_models`) and
+  `/probe` send `upstream.headers`, so a provider that requires auth is still aggregated
+  (a missing header there shows up as a `401` warning and an empty model list)
 - Optional upstream signing: `websearch.api_key_env` names an env var whose value is sent as
   `Authorization: Bearer <key>`; empty (default) = unsigned. Caller credentials are stripped
   before forwarding, as everywhere else in the gateway
 - Statuses: 404 when `websearch.enabled=false`, 503 when the named upstream is missing,
   502/504 on provider connect/read-timeout failures, 405 for non-POST (the path is in
   `POST_ONLY_PATHS`), 400 for a non-JSON-object body
+- A connect failure (502) logs the full exception chain plus a per-address TCP probe
+  (`dns(host) -> ip:port ConnectionRefusedError errno=111`, `TimeoutError`, ...) so
+  `All connection attempts failed` can be traced to refused vs filtered vs DNS
 - An error the provider itself returns (status + body) is passed through unchanged — e.g.
   `synthesize: true` can hit the provider's own 300s inference cap and answer **502**
   `opencode_unavailable`. Keep `websearch.timeout` >= 300 so that error reaches the caller

@@ -116,6 +116,50 @@ def run() -> int:
             check("ps models is a list", isinstance(data.get("models"), list))
             check("ps models is empty", len(data.get("models", [])) == 0)
 
+        # ------------------- discovery forwards upstream.headers ---
+        print("[2b] /v1/models discovery sends upstream.headers")
+        from config import UpstreamConfig
+
+        captured: dict = {}
+
+        class _FakeDiscoveryClient:
+            async def get(self, url, **kwargs):
+                captured["url"] = url
+                captured["headers"] = kwargs.get("headers")
+                return SimpleNamespace(
+                    status_code=200,
+                    raise_for_status=lambda: None,
+                    json=lambda: {"data": [{"id": "opencode/big-pickle"}]},
+                )
+
+        original_client = app.state.client
+        original_upstreams = app.state.manager._config.upstreams
+        app.state.client = _FakeDiscoveryClient()
+        app.state.manager._config.upstreams = [
+            UpstreamConfig(
+                name="opencode-auth",
+                type="opencode",
+                base_url="http://provider.test",
+                models=["opencode/*"],
+                headers={"Authorization": "Bearer t0k"},
+            )
+        ]
+        try:
+            r = client.get("/v1/models", headers=HEADERS)
+            ids = [m["id"] for m in r.json().get("data", [])] if r.status_code == 200 else []
+            check("/v1/models discovery -> 200", r.status_code == 200, f"got {r.status_code}")
+            check("authenticated provider models are listed", "opencode/big-pickle" in ids, str(ids))
+            check("discovery hit the tags path", captured.get("url") == "http://provider.test/v1/models", str(captured.get("url")))
+            check(
+                "discovery sent upstream.headers",
+                (captured.get("headers") or {}).get("Authorization") == "Bearer t0k",
+                str(captured.get("headers")),
+            )
+        finally:
+            app.state.client = original_client
+            app.state.manager._config.upstreams = original_upstreams
+            main._UPSTREAM_MODELS_CACHE.pop("opencode-auth", None)
+
         # --------------------------------------------- /docs hidden ---
         print("[3] /docs switch (off by default)")
         r = client.get("/docs")

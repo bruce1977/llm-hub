@@ -1,18 +1,17 @@
 @echo off
 setlocal EnableExtensions
 rem ----------------------------------------------------------------------
-rem Build the llm-hub image as <image>:latest and <image>:<version>.
+rem Build and publish the llm-hub image to Docker Hub.
 rem
-rem Usage:  scripts\docker_build.bat [image] [version]
+rem Runs docker-build.bat, then pushes <image>:latest and <image>:<version>.
+rem Nothing is committed or pushed to git - do that yourself first.
+rem
+rem Usage:  scripts\docker-publish.bat [image] [version]
 rem default image:   bruce1977/llm-hub
 rem default version: __version__ from app\main.py
 rem ----------------------------------------------------------------------
 
 cd /d "%~dp0.."
-if errorlevel 1 (
-    echo ERROR: cannot change directory to the repository root.
-    exit /b 1
-)
 
 set "IMAGE_NAME=%~1"
 if not defined IMAGE_NAME set "IMAGE_NAME=bruce1977/llm-hub"
@@ -36,21 +35,38 @@ if not defined VERSION (
 )
 
 :have_version
-echo Image:   %IMAGE_NAME%
-echo Version: %VERSION%
+echo ====================================================
+echo llm-hub publish
+echo   image:   %IMAGE_NAME%
+echo   version: %VERSION%
+echo ====================================================
 echo.
 
-docker build -t %IMAGE_NAME%:latest -t %IMAGE_NAME%:%VERSION% .
+call "%~dp0docker-build.bat" "%IMAGE_NAME%" "%VERSION%"
 if errorlevel 1 (
-    echo.
-    echo ERROR: docker build failed.
+    echo ERROR: build failed, nothing was pushed.
     exit /b 1
 )
 
 echo.
-echo Built tags:
+echo Pushing %IMAGE_NAME%:latest
+docker push %IMAGE_NAME%:latest
+if errorlevel 1 (
+    echo ERROR: docker push failed. Are you logged in?  docker login
+    exit /b 1
+)
+
+echo.
+echo Pushing %IMAGE_NAME%:%VERSION%
+docker push %IMAGE_NAME%:%VERSION%
+if errorlevel 1 (
+    echo ERROR: docker push failed. Are you logged in?  docker login
+    exit /b 1
+)
+
+echo.
+echo Published:
 echo   %IMAGE_NAME%:latest
 echo   %IMAGE_NAME%:%VERSION%
-echo.
-echo Push them with:  scripts\docker_publish.bat
+echo https://hub.docker.com/r/%IMAGE_NAME%
 endlocal
