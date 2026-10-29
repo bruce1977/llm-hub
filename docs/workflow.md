@@ -123,7 +123,7 @@
 2. **配置环境**
    ```bash
    cp data/example.config.json data/config.json
-   cp .example.env .env
+   cp .env.example .env
    # 编辑 config.json 添加上游实例
    # 编辑 .env 添加 API 密钥
    ```
@@ -202,7 +202,7 @@ docker pull bruce1977/llm-hub:latest
 # 准备配置
 mkdir -p data
 cp data/example.config.json data/config.json
-cp .example.env .env
+cp .env.example .env
 # 编辑 data/config.json 和 .env
 
 # 启动

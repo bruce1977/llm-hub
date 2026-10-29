@@ -7,6 +7,37 @@
 
 ## [未发布]
 
+### 新增（联网检索）
+
+- 新增端点 `POST /v1/tools/web-search`：由 OpenCode API Gateway 提供关键词网页检索，请求体与上游响应**原样透传**（`query`、`results[]`、拼接后的 `text`、`sources`，`synthesize: true` 时另有 `answer`）
+- 新增 `websearch` 配置段：`enabled`、`upstream`、`path`（默认 `v1/web-search`）、`api_key_env`、`timeout`。`upstream` 按名字选检索方；留空则自动取第一个 `type: "opencode"` 的上游；填了不存在的名字返回 **503**，不会静默回退
+- 新增上游类型 `opencode`：模型发现走 OpenAI 兼容的 `/v1/models`（解析 `data[].id`），存活探测走 `/health`。检索方作为普通上游登记后，其模型同时进入聚合的 `/v1/models`，聊天也可路由过去
+- 可选的上游签名：`websearch.api_key_env` 指定环境变量名（默认为空 = 不签名，当前上游匿名即可访问）；`OPENCODE_GATEWAY_API_KEY` 已写入 `.env.example` 与 `docs/DEPLOY.md`
+- 该端点在 `/docs` 中带完整的请求/响应 schema（`query` 必填，另有 `top_k`、`recency`、`synthesize` 等），仅接受 POST（否则 **405**），并沿用网关 API Key 鉴权（**401** / **403**）
+- `data/config.json` 与 `data/example.config.json` 附带 `opencode` 上游（声明 `auto` 与 `opencode/*` 通配）及 `websearch` 段
+- 文档：API.md 新增「Web Search（OpenCode 网关代理）」章节；README / README_CN 补特性行、`websearch` 配置详解、curl 示例、`opencode` 上游类型说明与斜杠通配注意点（`opencode/*` 而非 `opencode:*`）
+- 测试：`smoke_test.py` +13（共 104）覆盖 `opencode` 类型与 `websearch` 配置解析；`test_gateway_new.py` +22（共 55）覆盖端点鉴权、转发、透传、签名与状态码映射及 OpenAPI schema；`test_api.py` +8（共 28）E2E 用例；docs/TESTCASES.md 新增测试 31-33（含实测响应）
+
+### 新增（构建 / 发布脚本）
+
+- `scripts/docker_build.bat`：构建 `bruce1977/llm-hub:latest` 与 `:<版本号>` 两个标签，版本号取自 `app/main.py` 的 `__version__`（可用参数覆盖：`docker_build.bat [镜像名] [版本号]`）；Docker 不可用时以错误码 1 直接退出
+- `scripts/docker_publish.bat`：先构建，成功后才依次推送 `latest` 与 `:<版本号>`；推送失败立即停止并提示 `docker login`。两个脚本都不碰 git：提交与打 tag 请在发布前自行完成
+- `docs/DEPLOY.md`：新增「一键构建 / 发布脚本（Windows）」小节
+
+### 变更（仓库结构）
+
+- `API.md`、`DEPLOY.md`、`workflow.md`、`Ranker.md` 与 `tests/TESTCASES.md` 移入 `docs/`（用 `git mv` 保留历史）；`README*`、`CHANGELOG*`、`AGENTS.md` 保持在根目录，相关交叉链接同步更新
+- `.example.env` 更名为约定的模板名 `.env.example`；README / README_CN / `docs/DEPLOY.md` / `docs/workflow.md` / `docs/TESTCASES.md` / AGENTS.md 中的拷贝命令全部改用新名字
+- 删除两个孤立根文件：`opencode.jsonc`（它指向的 `.opencode/skills` 已在 9a8bfea 删除，如今指向空目录）与 `Modelfile.reranker`（重排器的权威 Modelfile 在仓库外，由 `docs/Ranker.md` 记录）；`data/example.config.json` 里的交叉引用改指向该文档
+
+### 变更（System One 后端）
+
+- **破坏性（部署）**：`LAYA_SERVER_API_KEY` 更名为 `SYSTEMONE_SERVER_API_KEY`——该端点不再只服务 laya-server。请在 `.env` / 容器环境里同步改名；`systemone.api_key_env` 仍可指向任意变量名
+- Ollama 0.40+ 原生提供 `POST /v1/systemone`，`systemone.backend` 因此可以直接指向任意 Ollama 端口（如 `http://llm.home:11435`）；网关侧无需改代码，转发仍是纯透传
+- 已确认 `systemone.model` **会随请求体发送到后端**：仅当它是具体值且调用方未自带 `model` 时注入，`"local"` 仍是「不注入」哨兵。代码默认值保持 `auto`（laya-server 合法）；`data/config.json` 与 `data/example.config.json` 改为指向 Ollama 并配 `model: "tev1"`，因为 Ollama 对 `auto` 返回 **404**、缺 `model` 返回 **400**
+- `app/systemone.py` 的日志与报错文案改为后端中立（「System One backend」），缺环境变量的告警也说明「只有后端要求密钥时才有影响」
+- 文档：`docs/API.md` 与 README_CN 新增 laya-server / Ollama 契约对比（实测差异：`model` 取值、Ollama 的 `choice` 必须用非空 `criteria` **object**（数组 → 400）而 `score` 必须是 **2–10 项数组**、未知顶层字段 laya 拒绝 / Ollama 忽略、`routing` 仅 laya 返回），并给出两家都合法的请求示例与 Ollama 实测响应
+
 ---
 
 ## [1.2.0] - 2026-09-30
@@ -69,7 +100,7 @@
 
 - AGENTS.md：补充新安全功能描述
 - AGENTS.md：项目结构树补齐 `systemone.py`、内置 `static/swagger/`、四套测试与 `requirements.txt`；类型注解约定更正为 PEP 604 联合类型（`app/` 中 `Optional[...]` 实际 0 处使用）
-- `.example.env` / README / README_CN / API.md / TESTCASES.md：示例 API Key 统一替换为明显可辨的占位值（原 `sk-gateway-…` + 十六进制的形式会命中密钥扫描）
+- `.env.example` / README / README_CN / API.md / TESTCASES.md：示例 API Key 统一替换为明显可辨的占位值（原 `sk-gateway-…` + 十六进制的形式会命中密钥扫描）
 - README.md / README_CN.md：新增安全加固配置表和容器健康检查说明
 
 ---

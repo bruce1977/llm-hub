@@ -934,6 +934,50 @@ def main() -> int:
             str(build_default_config()["auth"]["api_keys"]),
         )
 
+        # ------------------------- OpenCode gateway upstream type + web search config ---
+        print("[17] OpenCode upstream type and web search config")
+        oc_cfg = GatewayConfig(
+            upstreams=[
+                {"name": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["qwen3:8b"]},
+                {
+                    "name": "opencode",
+                    "type": "opencode",
+                    "base_url": "http://127.0.0.1:11430",
+                    "models": ["opencode/*"],
+                },
+            ]
+        )
+        oc_up = oc_cfg.upstreams[1]
+        check("opencode: type parsed", oc_up.type == "opencode", oc_up.type)
+        check("opencode: discovers models via /v1/models", oc_up.tags_path() == "v1/models", oc_up.tags_path())
+        check("opencode: probes via /health", oc_up.health_path() == "health", oc_up.health_path())
+        check(
+            "opencode: parses data[].id (OpenAI format)",
+            oc_up.parse_model_names({"object": "list", "data": [{"id": "opencode/big-pickle"}]})
+            == ["opencode/big-pickle"],
+        )
+        check(
+            "wildcard routes the provider's opencode/* models to it",
+            oc_cfg.find_upstream_for_model("opencode/mimo-v2.6-flash-free") is oc_up,
+        )
+        check(
+            "opencode models reach the aggregated list",
+            any(i["id"] == "opencode/*" for i in oc_cfg.aggregated_models()),
+        )
+        check("websearch: disabled by default", oc_cfg.websearch.enabled is False)
+        check("websearch: provider path defaults to v1/web-search", oc_cfg.websearch.path == "v1/web-search", oc_cfg.websearch.path)
+        check("websearch: unsigned by default", oc_cfg.websearch.api_key_env == "", repr(oc_cfg.websearch.api_key_env))
+        check("websearch: unnamed selection picks the first opencode upstream", oc_cfg.websearch_upstream_obj() is oc_up)
+        oc_cfg.websearch.upstream = "opencode"
+        check("websearch: explicit upstream name resolves", oc_cfg.websearch_upstream_obj() is oc_up)
+        oc_cfg.websearch.upstream = "missing"
+        check("websearch: unknown upstream name never falls back", oc_cfg.websearch_upstream_obj() is None)
+        check(
+            "default config template ships a websearch block",
+            "websearch" in build_default_config(),
+            str(sorted(build_default_config())),
+        )
+
         # ---------------------------------------------------- Real E2E ---
         if os.getenv("E2E") == "1":
             run_e2e(client, good)

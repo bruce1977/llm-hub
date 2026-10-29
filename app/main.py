@@ -5,6 +5,7 @@ Intercepts and handles:
   GET  /                —— system information (gateway name + version)
   GET  /v1/models     —— aggregates the model list of all upstreams
   POST /v1/rerank     —— reranking endpoint (not supported by Ollama natively)
+  POST /v1/tools/web-search —— web search, proxied to an OpenCode API Gateway upstream
   GET  /api/tags      —— aggregates the model list in Ollama format
   GET  /health        —— gateway health status
 
@@ -39,6 +40,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from proxy import ProxyService
 from rerank import RerankService
 from systemone import SystemOneService
+from websearch import WebSearchService
 
 logger = logging.getLogger("llm_hub")
 
@@ -73,7 +75,7 @@ async def lifespan(app: FastAPI):
         keepalive_expiry=cfg.server.upstream_keepalive_expiry,
     )
     # trust_env=False: the gateway always talks to explicitly-configured upstreams
-    # (Ollama / LM Studio / laya-server — all internal addresses). Inheriting ambient
+    # (Ollama / LM Studio / System One backend — all internal addresses). Inheriting ambient
     # HTTP(S)_PROXY from the host breaks pooled keep-alive connections to LAN hosts
     # (first request succeeds, later ones 404 through the proxy). Connect directly.
     client = httpx.AsyncClient(
@@ -88,6 +90,7 @@ async def lifespan(app: FastAPI):
     app.state.proxy = ProxyService(manager, client)
     app.state.rerank = RerankService(manager, client)
     app.state.systemone = SystemOneService(manager, client)
+    app.state.websearch = WebSearchService(manager, client)
     app.state.started_at = time.time()
 
     # Security self-check: never serve an authenticated gateway without any key.
@@ -128,7 +131,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="LLM Hub",
-    description="Unified entrypoint for Ollama / LM Studio instances: model routing / API key auth / Rerank API / alias and parameter injection",
+    description="Unified entrypoint for Ollama / LM Studio / OpenCode-gateway instances: model routing / API key auth / Rerank API / Web Search / alias and parameter injection",
     version=__version__,
     lifespan=lifespan,
     # Disable FastAPI's built-in doc routes: they are registered lazily in
@@ -620,8 +623,14 @@ async def ps_response(request: Request) -> JSONResponse:
 
 
 async def systemone_response(request: Request) -> Response:
-    """Proxy `POST /v1/systemone` to the configured laya-server backend."""
+    """Proxy `POST /v1/systemone` to the configured System One backend."""
     service: SystemOneService = request.app.state.systemone
+    return await service.handle(request)
+
+
+async def websearch_response(request: Request) -> Response:
+    """Proxy `POST /v1/tools/web-search` to the configured web search provider."""
+    service: WebSearchService = request.app.state.websearch
     return await service.handle(request)
 
 
@@ -701,17 +710,18 @@ async def route_ps(request: Request, _auth=Depends(require_api_key)):
 @app.post(
     "/v1/systemone",
     include_in_schema=True,
-    summary="System One decision API (proxied to laya-server)",
+    summary="System One decision API (proxied to the configured System One backend)",
     tags=["systemone"],
     openapi_extra={
         "requestBody": {
             "required": True,
             "description": (
-                "Body is forwarded to laya-server as-is. `state` is a free-form object; "
+                "Body is forwarded to the System One backend as-is. `state` is a free-form object; "
                 "`questions` maps a question id to a tagged question whose `type` selects "
                 "the variant: `noul` (yes/no probability), `choice` (single label) or "
                 "`score` (pick one of >= 2 criteria). Optional top-level `model` selects "
-                "the routing model (`auto` lets laya-server decide)."
+                "the routing model. laya-server takes a routing enum (auto / english / multilingual / "
+                "typed-decisions); an Ollama backend needs a real model name and 404s on `auto`. "
             ),
             "content": {
                 "application/json": {
@@ -740,7 +750,7 @@ async def route_ps(request: Request, _auth=Depends(require_api_key)):
         },
         "responses": {
             "200": {
-                "description": "Decision result returned by laya-server (pass-through).",
+                "description": "Decision result returned by the System One backend (pass-through).",
                 "content": {
                     "application/json": {
                         "example": {
@@ -767,6 +777,105 @@ async def route_ps(request: Request, _auth=Depends(require_api_key)):
 )
 async def route_systemone(request: Request, _auth=Depends(require_api_key)):
     return await systemone_response(request)
+
+
+@app.post(
+    "/v1/tools/web-search",
+    include_in_schema=True,
+    summary="Web search (passages for a keyword query, proxied to the configured provider)",
+    tags=["websearch"],
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "description": (
+                "Body is forwarded to the provider unchanged (unknown fields are preserved). "
+                "Only `query` is required. `model` is optional: when omitted the provider picks "
+                "it, so llm-hub does not rewrite or resolve it against its own aliases. "
+                "`synthesize=true` additionally drives an LLM answer synthesis."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string", "minLength": 1, "description": "Search keywords."},
+                            "model": {"type": "string", "description": "Provider-side model id (passed through verbatim)."},
+                            "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Pages to retrieve."},
+                            "max_chars_per_page": {"type": "integer", "minimum": 1, "description": "Per-page character budget before truncation."},
+                            "locale": {"type": "string", "description": "Search locale hint, e.g. zh-CN."},
+                            "recency": {
+                                "type": "string",
+                                "enum": ["day", "week", "month", "year"],
+                                "description": "Restrict results to the given time window.",
+                            },
+                            "synthesize": {"type": "boolean", "description": "Also produce an `answer` by model synthesis."},
+                            "include_sources": {"type": "boolean", "description": "Include the flat `sources` URL list."},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "example": {"query": "Ollama keep_alive 参数作用", "top_k": 5, "recency": "year"},
+                }
+            },
+        },
+        "responses": {
+            "200": {
+                "description": "Search result returned by the provider (pass-through, status and body unchanged).",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["query", "model", "engine", "truncated", "text", "sources"],
+                            "properties": {
+                                "query": {"type": "string"},
+                                "model": {"type": "string", "description": "Model actually used by the provider."},
+                                "engine": {"type": "string", "description": "Retrieval backend that answered the query."},
+                                "answer": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Present only when synthesize=true."},
+                                "truncated": {"type": "boolean", "description": "True when a page was cut at max_chars_per_page."},
+                                "results": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["title", "url", "snippet", "paragraphs"],
+                                        "properties": {
+                                            "title": {"type": "string"},
+                                            "url": {"type": "string"},
+                                            "snippet": {"type": "string"},
+                                            "paragraphs": {"type": "array", "items": {"type": "string"}},
+                                        },
+                                    },
+                                },
+                                "text": {"type": "string", "description": "All retrieved passages concatenated, ready to stuff into a prompt."},
+                                "sources": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                        "example": {
+                            "query": "Ollama keep_alive 参数作用",
+                            "model": "ollama-local/qwen3.5:9b",
+                            "engine": "opencode-websearch",
+                            "answer": None,
+                            "truncated": True,
+                            "results": [
+                                {
+                                    "title": "FAQ - Ollama",
+                                    "url": "https://github.com/ollama/ollama/blob/main/docs/faq.md",
+                                    "snippet": "keep_alive controls how long a model stays loaded in memory.",
+                                    "paragraphs": ["By default a model stays loaded for 5 minutes."],
+                                }
+                            ],
+                            "text": "By default a model stays loaded for 5 minutes.",
+                            "sources": ["https://github.com/ollama/ollama/blob/main/docs/faq.md"],
+                        },
+                    }
+                },
+            },
+            "404": {"description": "websearch.enabled is false."},
+            "503": {"description": "websearch is enabled but the configured provider upstream is missing."},
+        },
+    },
+)
+async def route_websearch(request: Request, _auth=Depends(require_api_key)):
+    return await websearch_response(request)
 
 
 # --------------------------------------------------------------------------- #
@@ -816,7 +925,9 @@ async def route_docs(request: Request):
 # Paths documented above that only accept POST. The catch-all below accepts every
 # method, so without this guard a GET/PUT/DELETE to e.g. /v1/rerank would be
 # proxied to an upstream instead of being rejected with 405.
-POST_ONLY_PATHS = frozenset({"/v1/rerank", "/rerank", "/api/rerank", "/v1/systemone"})
+POST_ONLY_PATHS = frozenset(
+    {"/v1/rerank", "/rerank", "/api/rerank", "/v1/systemone", "/v1/tools/web-search"}
+)
 
 
 @app.api_route("/", methods=HTTP_METHODS, include_in_schema=False)

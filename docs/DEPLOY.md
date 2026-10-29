@@ -10,7 +10,7 @@
 
 ```bash
 cp data/example.config.json data/config.json
-cp .example.env .env
+cp .env.example .env
 ```
 
 编辑 `.env` 设置 API 密钥：
@@ -59,6 +59,28 @@ curl http://localhost:8888/v1/models -H "Authorization: Bearer YOUR_API_KEY"
 
 ---
 
+## 一键构建 / 发布脚本（Windows）
+
+`scripts\` 下有两个批处理，可在 cmd 或 PowerShell 里从仓库任意位置运行（脚本自己会切到仓库根目录）：
+
+```bat
+:: 只构建：产出 bruce1977/llm-hub:latest 与 :<版本号>
+scripts\docker_build.bat
+
+:: 构建并推送到 Docker Hub（需先 docker login）
+scripts\docker_publish.bat
+
+:: 覆盖镜像名与版本号
+scripts\docker_build.bat registry.example.com/team/llm-hub 1.3.0
+```
+
+- 版本号默认读 `app\main.py` 的 `__version__`（即网关 `GET /` 上报的版本），第二个参数可显式指定
+- 两个脚本都会先确认 Docker 可用，否则直接退出并返回错误码 1
+- `docker_publish.bat` 先构建、成功后才依次推送 `latest` 与版本号标签；推送失败立即停止并提示 `docker login`
+- 脚本不含任何 git 操作：提交、打 tag 请在发布前自己完成
+
+---
+
 ## 环境变量
 
 | 变量 | 必需 | 说明 |
@@ -66,6 +88,8 @@ curl http://localhost:8888/v1/models -H "Authorization: Bearer YOUR_API_KEY"
 | `GATEWAY_API_KEYS` | ✅ | API 密钥，逗号分隔 |
 | `CONFIG_PATH` | ❌ | 配置文件路径，默认 `/data/config.json` |
 | `TZ` | ❌ | 时区，默认 `UTC` |
+| `SYSTEMONE_SERVER_API_KEY` | ❌ | System One 后端密钥，仅当 `systemone.api_key_env` 指向它时才需要；laya-server 必需，Ollama 0.40+ 后端会忽略该头 |
+| `OPENCODE_GATEWAY_API_KEY` | ❌ | 联网检索上游密钥，仅当 `websearch.api_key_env` 指向它时才需要（默认留空 = 不签名） |
 
 ---
 

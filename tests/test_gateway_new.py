@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Unit/integration tests for the new gateway features, exercised with FastAPI's
-TestClient (no live upstreams or laya-server required).
+TestClient (no live upstreams or System One backend required).
 
 Covers:
   - /v1/models and /api/ps aggregation with no upstreams (graceful empty result)
-  - POST /v1/systemone: gateway API-key auth + correct forwarding to laya-server,
+  - POST /v1/systemone: gateway API-key auth + correct forwarding to the backend,
     including the "local" model sentinel (no injection) vs a concrete model (injected)
   - /docs switch (security.allow_docs): 404 when off, 200 + schema when on
 
@@ -35,9 +35,16 @@ _CFG = {
         "enabled": True,
         "backend": "http://laya.example",
         "model": "multilingual",
-        "api_key_env": "LAYA_SERVER_API_KEY",
+        "api_key_env": "SYSTEMONE_SERVER_API_KEY",
         "path": "v1/systemone",
         "timeout": 60.0,
+    },
+    "websearch": {
+        "enabled": True,
+        "upstream": "opencode",
+        "path": "v1/web-search",
+        "api_key_env": "OPENCODE_GATEWAY_API_KEY",
+        "timeout": 30.0,
     },
     "security": {
         "admin_endpoints": "deny",
@@ -53,7 +60,8 @@ with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="ut
     _cfg_path = _tmp.name
 os.environ["CONFIG_PATH"] = _cfg_path
 os.environ["GATEWAY_API_KEYS"] = "sk-test-fixture-key"
-os.environ["LAYA_SERVER_API_KEY"] = "laya-secret-env-key"
+os.environ["SYSTEMONE_SERVER_API_KEY"] = "systemone-secret-env-key"
+os.environ["OPENCODE_GATEWAY_API_KEY"] = "opencode-secret-env-key"
 
 # Make `app/` importable so the suite also runs as `python tests/test_gateway_new.py`.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
@@ -121,6 +129,7 @@ def run() -> int:
         spec = r.json()
         paths = set(spec.get("paths", {}).keys())
         check("/openapi.json includes /v1/systemone", "/v1/systemone" in paths, str(sorted(paths)))
+        check("/openapi.json includes /v1/tools/web-search", "/v1/tools/web-search" in paths, str(sorted(paths)))
         check("/openapi.json includes /api/ps", "/api/ps" in paths, str(sorted(paths)))
         check("/openapi.json includes /v1/models", "/v1/models" in paths, str(sorted(paths)))
         check("/openapi.json includes /", "/" in paths, str(sorted(paths)))
@@ -175,7 +184,7 @@ def run() -> int:
         check("systemone with bad key -> 403", r.status_code == 403, f"got {r.status_code}")
 
         # --------------------------------------------- /v1/systemone: forwarding ---
-        print("[5] POST /v1/systemone forwarding to laya-server")
+        print("[5] POST /v1/systemone forwarding to the backend")
         fake = make_fake_response()
         app.state.client.request = AsyncMock(return_value=fake)
         payload = {
@@ -191,8 +200,8 @@ def run() -> int:
         kwargs = call.kwargs
         check("forwarded to configured backend", kwargs["url"] == "http://laya.example/v1/systemone", kwargs.get("url"))
         check(
-            "forwarded with laya API key",
-            kwargs["headers"].get("Authorization") == "Bearer laya-secret-env-key",
+            "forwarded with the backend API key",
+            kwargs["headers"].get("Authorization") == "Bearer systemone-secret-env-key",
             kwargs["headers"].get("Authorization"),
         )
         check("concrete model injected", kwargs["json"].get("model") == "multilingual", str(kwargs.get("json")))
@@ -226,6 +235,102 @@ def run() -> int:
             check("/ returns the gateway version", bool(data.get("version")), str(data))
         r = client.get("/healthz")
         check("/healthz is no longer a health route (401)", r.status_code == 401, f"got {r.status_code}")
+
+        # --------------------------------------------- /v1/tools/web-search ---
+        print("[9] POST /v1/tools/web-search (web search proxy)")
+        import httpx
+        from config import UpstreamConfig
+
+        ws = app.state.manager._config.websearch
+        ws_payload = {"query": "Ollama keep_alive 参数作用", "top_k": 3, "recency": "year"}
+        provider_json = {
+            "query": "Ollama keep_alive 参数作用",
+            "model": "opencode/big-pickle",
+            "engine": "opencode-websearch",
+            "answer": None,
+            "truncated": True,
+            "results": [{"title": "FAQ", "url": "https://x/faq", "snippet": "s", "paragraphs": ["p"]}],
+            "text": "passage text",
+            "sources": ["https://x/faq"],
+        }
+        provider_body = json.dumps(provider_json, ensure_ascii=False).encode("utf-8")
+
+        # toggle off -> 404
+        ws.enabled = False
+        r = client.post("/v1/tools/web-search", headers=HEADERS, json=ws_payload)
+        check("websearch disabled -> 404", r.status_code == 404, f"got {r.status_code}")
+        ws.enabled = True
+
+        # enabled but the named provider upstream does not exist -> 503
+        app.state.manager._config.upstreams = []
+        r = client.post("/v1/tools/web-search", headers=HEADERS, json=ws_payload)
+        check("websearch with a missing upstream name -> 503", r.status_code == 503, f"got {r.status_code}: {r.text[:160]}")
+
+        # add the provider upstream and forward
+        app.state.manager._config.upstreams = [
+            UpstreamConfig(name="opencode", type="opencode", base_url="http://search.example", models=["opencode/*"])
+        ]
+        app.state.client.request = AsyncMock(return_value=make_fake_response(provider_body))
+        r = client.post("/v1/tools/web-search", headers=HEADERS, json=ws_payload)
+        check("websearch forwards -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
+        check("websearch passes the provider body through", r.json().get("engine") == "opencode-websearch", r.text[:160])
+        check("websearch keeps UTF-8 passages", "参数作用" in r.json().get("query", ""), r.text[:160])
+
+        call = app.state.client.request.call_args.kwargs
+        check("forwarded to the provider upstream path", call["url"] == "http://search.example/v1/web-search", call.get("url"))
+        check("body forwarded verbatim", call["json"] == ws_payload, str(call.get("json")))
+        check("forwarded with the provider key", call["headers"].get("Authorization") == "Bearer opencode-secret-env-key", str(call["headers"].get("Authorization")))
+        check("caller key not forwarded", "x-api-key" not in {k.lower() for k in call["headers"]})
+        check("per-request timeout honored", call["timeout"] == 30.0, str(call.get("timeout")))
+
+        # unsigned when the key env var is unset (and no Authorization leaks through)
+        os.environ.pop("OPENCODE_GATEWAY_API_KEY")
+        app.state.client.request = AsyncMock(return_value=make_fake_response(provider_body))
+        client.post("/v1/tools/web-search", headers=HEADERS, json=ws_payload)
+        call = app.state.client.request.call_args.kwargs
+        check("no provider key -> unsigned call", "authorization" not in {k.lower() for k in call["headers"]}, str(call["headers"]))
+        os.environ["OPENCODE_GATEWAY_API_KEY"] = "opencode-secret-env-key"
+
+        # model is never injected or alias-resolved (pure pass-through)
+        app.state.client.request = AsyncMock(return_value=make_fake_response(provider_body))
+        client.post("/v1/tools/web-search", headers=HEADERS, json={"query": "q"})
+        call = app.state.client.request.call_args.kwargs
+        check("absent model is not injected", "model" not in call["json"], str(call.get("json")))
+
+        # upstream errors are mapped to gateway statuses
+        app.state.client.request = AsyncMock(side_effect=httpx.ConnectError("down"))
+        r = client.post("/v1/tools/web-search", headers=HEADERS, json=ws_payload)
+        check("provider unreachable -> 502", r.status_code == 502, f"got {r.status_code}")
+        app.state.client.request = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
+        r = client.post("/v1/tools/web-search", headers=HEADERS, json=ws_payload)
+        check("provider timeout -> 504", r.status_code == 504, f"got {r.status_code}")
+
+        # body validation + method allowlist
+        app.state.client.request = AsyncMock(return_value=make_fake_response(provider_body))
+        r = client.post(
+            "/v1/tools/web-search", headers={**HEADERS, "Content-Type": "application/json"}, content=b"not json"
+        )
+        check("non-JSON body -> 400", r.status_code == 400, f"got {r.status_code}")
+        r = client.post("/v1/tools/web-search", headers=HEADERS, json=["array"])
+        check("JSON array body -> 400", r.status_code == 400, f"got {r.status_code}")
+        r = client.get("/v1/tools/web-search", headers=HEADERS)
+        check("GET /v1/tools/web-search -> 405", r.status_code == 405, f"got {r.status_code}")
+        r = client.post("/v1/tools/web-search", json=ws_payload)
+        check("websearch without a key -> 401", r.status_code == 401, f"got {r.status_code}")
+
+        # the endpoint is documented with a real request schema (query required)
+        app.state.manager._config.security.allow_docs = True
+        spec = client.get("/openapi.json").json()
+        op = spec["paths"]["/v1/tools/web-search"]["post"]
+        schema = op["requestBody"]["content"]["application/json"]["schema"]
+        check("docs: websearch documents the request schema", schema.get("required") == ["query"], str(schema)[:160])
+        check("docs: websearch request has top_k/recency fields", {"top_k", "recency"} <= set(schema["properties"]), str(sorted(schema["properties"])))
+        check("docs: websearch response schema declares text/sources", set(op["responses"]["200"]["content"]["application/json"]["schema"]["required"]) >= {"text", "sources"})
+        app.state.manager._config.security.allow_docs = False
+
+        # cleanup: leave the fixture config as the other sections expect
+        app.state.manager._config.upstreams = []
+        ws.enabled = False
 
     return 1 if FAILED else 0
 

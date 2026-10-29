@@ -124,7 +124,7 @@ class RoutingConfig(BaseModel):
 
 
 class UpstreamConfig(BaseModel):
-    """A single backend instance: either Ollama (default) or LM Studio.
+    """A single backend instance: Ollama (default), LM Studio, or an OpenCode API Gateway.
 
     `models` supports exact names or prefix wildcards (e.g. qwen3:*).
     `model_aliases` maps a short exposed name to the real upstream id, which is handy
@@ -133,8 +133,9 @@ class UpstreamConfig(BaseModel):
 
     name: str
     base_url: str
-    # Backend flavor: "ollama" (native API) or "lmstudio" (OpenAI-compatible API)
-    type: Literal["ollama", "lmstudio"] = "ollama"
+    # Backend flavor: "ollama" (native API), "lmstudio" (OpenAI-compatible API),
+    # or "opencode" (OpenCode API Gateway: OpenAI-compatible chat + web search)
+    type: Literal["ollama", "lmstudio", "opencode"] = "ollama"
     models: list[str] = Field(default_factory=list)
     # Short exposed name -> real upstream id, e.g. {"qwen3.5:9b": "qwen/qwen3.5-9b"}
     model_aliases: dict[str, str] = Field(default_factory=dict)
@@ -156,6 +157,8 @@ class UpstreamConfig(BaseModel):
 
     def health_path(self) -> str:
         """Liveness endpoint used by /health probes."""
+        if self.type == "opencode":
+            return "health"
         return "api/version" if self.type == "ollama" else "v1/models"
 
     def parse_model_names(self, payload: dict[str, Any]) -> list[str]:
@@ -272,30 +275,60 @@ class RerankConfig(BaseModel):
 
 
 class SystemOneConfig(BaseModel):
-    """Proxy configuration for the laya-server `POST /v1/systemone` (System One) endpoint.
+    """Proxy configuration for the System One decision API (`POST /v1/systemone`).
 
-    llm-hub authenticates the *caller* with its own API key (cfg.auth.api_keys, sourced
-    from `.env` / GATEWAY_API_KEYS - the `.keys` config). The request is then forwarded
-    to the configured laya-server backend, which needs *its own* API key. That key is read
-    from the environment variable named by `api_key_env` (default LAYA_SERVER_API_KEY) so
-    it never has to live in config.json.
+    Two kinds of backend serve that path: a laya-server deployment, and Ollama 0.40+,
+    which exposes it natively. llm-hub authenticates the *caller* with its own API key
+    (cfg.auth.api_keys, sourced from `.env` / GATEWAY_API_KEYS - the `.keys` config), then
+    forwards to `backend` and signs that call with the key read from the environment
+    variable named by `api_key_env` (default SYSTEMONE_SERVER_API_KEY), so the backend key
+    never has to live in config.json. A backend that needs no credential just ignores it.
 
-    `model` is the default model name sent to laya-server. The value "local" is a sentinel:
-    it is NOT forwarded - the caller may set `model` in the request body, otherwise
-    laya-server falls back to its own default ("auto"). Set `model` to a concrete value
-    such as "auto" or "multilingual" to force it. (laya-server only accepts those two -
-    any other value returns HTTP 422.)
+    `model` is the default model name injected into the forwarded body. "local" is a
+    sentinel meaning "do not inject" - the caller then has to set `model` itself. laya-server
+    reads `model` as a routing hint and only accepts the literal enum `auto` / `english` /
+    `multilingual` / `typed-decisions` (anything else is HTTP 422), while an Ollama backend
+    expects a real model name and answers **404** for `auto`. Pointing at Ollama therefore
+    means naming a model that instance actually serves.
     """
 
     enabled: bool = False
-    # laya-server base URL, e.g. http://127.0.0.1:8080 (set to your VM's address)
+    # System One backend base URL, e.g. http://127.0.0.1:8080 (laya-server) or
+    # http://llm.home:11435 (Ollama 0.40+).
     backend: str = "http://127.0.0.1:8080"
     # Default model to send; "local" = do-not-override sentinel (see class docstring).
     model: str = "auto"
-    # Name of the environment variable holding the laya-server API key.
-    api_key_env: str = "LAYA_SERVER_API_KEY"
-    # Endpoint path on the laya-server backend.
+    # Name of the environment variable holding the backend's API key.
+    api_key_env: str = "SYSTEMONE_SERVER_API_KEY"
+    # Endpoint path on the System One backend.
     path: str = "v1/systemone"
+    timeout: float = 60.0
+
+
+class WebSearchConfig(BaseModel):
+    """Web search served by an OpenCode API Gateway upstream (`POST /v1/web-search`).
+
+    The caller authenticates against llm-hub with the gateway's own API key and posts to
+    `POST /v1/tools/web-search`; the body is forwarded verbatim to the search provider's
+    `path`, and its JSON response is passed back unchanged.
+
+    The provider is an entry in `upstreams` (usually `type: "opencode"`), so its address,
+    timeout and extra headers are configured once and shared with model routing and
+    `/v1/models` aggregation:
+      - `upstream` selects it by name; empty means "the first `opencode` upstream".
+        An explicit name that matches no upstream is an error, never a silent fallback.
+      - `api_key_env` names an environment variable holding the provider's API key.
+        Empty (default) = the provider is called unsigned, which is all the current
+        OpenCode gateway needs. When set, its value is sent as `Authorization: Bearer`.
+    """
+
+    enabled: bool = False
+    # Name of the upstream providing web search; "" = first upstream of type "opencode".
+    upstream: str = ""
+    # Search endpoint path on that upstream.
+    path: str = "v1/web-search"
+    # Name of the environment variable holding the provider API key; "" = no signing.
+    api_key_env: str = ""
     timeout: float = 60.0
 
 
@@ -383,6 +416,7 @@ class Config(BaseModel):
     aliases: dict[str, AliasConfig] = Field(default_factory=dict)
     rerank: RerankConfig = Field(default_factory=RerankConfig)
     systemone: SystemOneConfig = Field(default_factory=SystemOneConfig)
+    websearch: WebSearchConfig = Field(default_factory=WebSearchConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     @model_validator(mode="after")
@@ -419,6 +453,17 @@ class Config(BaseModel):
                 return found
         # Falls back to the first upstream when not specified
         return self.upstreams[0] if self.upstreams else None
+
+    def websearch_upstream_obj(self) -> UpstreamConfig | None:
+        """Locate the upstream that provides web search.
+
+        An explicit `websearch.upstream` name wins and never falls back silently; with no
+        name configured, the first `type: "opencode"` upstream is the search provider.
+        """
+        name = (self.websearch.upstream or "").strip()
+        if name:
+            return self.get_upstream(name)
+        return next((up for up in self.upstreams if up.type == "opencode"), None)
 
     @staticmethod
     def _match(up: UpstreamConfig, model: str) -> bool:
@@ -599,14 +644,25 @@ def build_default_config() -> dict[str, Any]:
             "on_error": "score_zero",
         },
         "systemone": {
-            # Proxy for the laya-server System One decision API.
+            # Proxy for the System One decision API (laya-server, or Ollama 0.40+ which
+            # exposes /v1/systemone natively and needs a real model name instead of "auto").
             # The caller authenticates with the gateway's own API key (GATEWAY_API_KEYS);
             # the gateway then forwards to `backend` using the key from `api_key_env`.
             "enabled": False,
             "backend": "http://127.0.0.1:8080",
             "model": "local",
-            "api_key_env": "LAYA_SERVER_API_KEY",
+            "api_key_env": "SYSTEMONE_SERVER_API_KEY",
             "path": "v1/systemone",
+            "timeout": 60.0,
+        },
+        "websearch": {
+            # Web search served by an OpenCode API Gateway upstream (see `upstreams`).
+            # The caller authenticates with the gateway's own API key (GATEWAY_API_KEYS);
+            # the provider address comes from the selected upstream's `base_url`.
+            "enabled": False,
+            "upstream": "",
+            "path": "v1/web-search",
+            "api_key_env": "",
             "timeout": 60.0,
         },
     }

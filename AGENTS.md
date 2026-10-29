@@ -6,6 +6,7 @@ LLM Hub is a FastAPI-based unified gateway that aggregates multiple Ollama insta
 - Multi-upstream routing by model name
 - API key authentication
 - Rerank API implementation
+- Web search pass-through (OpenCode API Gateway upstream)
 - Model aliasing and parameter injection
 - Config hot reload
 
@@ -19,18 +20,27 @@ llm-hub/
 │   ├── auth.py       # API key authentication, security helpers
 │   ├── proxy.py      # Reverse proxy, streaming pass-through
 │   ├── rerank.py     # Rerank API implementation (logprobs/embedding modes)
-│   ├── systemone.py  # System One decision API (proxied to laya-server)
+│   ├── systemone.py  # System One decision API (proxied to laya-server or Ollama 0.40+)
+│   ├── websearch.py  # Web search API (proxied to an OpenCode API Gateway upstream)
 │   └── static/swagger/  # Vendored Swagger UI assets (offline /docs)
 ├── data/
 │   ├── config.json          # Runtime configuration (mounted into container)
 │   └── example.config.json  # Config template copied to config.json
 ├── tests/
-│   ├── smoke_test.py        # Comprehensive mock tests (91)
-│   ├── test_gateway_new.py  # Aggregation / systemone / /docs schema tests (33)
+│   ├── smoke_test.py        # Comprehensive mock tests (104)
+│   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (55)
 │   ├── verify_security.py   # Security control tests (15)
-│   ├── test_api.py          # E2E tests against a live server (20)
-│   ├── demo.py              # Demo script (requires real Ollama)
-│   └── TESTCASES.md         # Test cases documentation with examples
+│   ├── test_api.py          # E2E tests against a live server (28)
+│   └── demo.py              # Demo script (requires real Ollama)
+├── docs/
+│   ├── API.md               # API documentation with all endpoints
+│   ├── TESTCASES.md         # Test cases documentation with examples
+│   ├── DEPLOY.md            # Docker deployment guide
+│   ├── Ranker.md            # Reranker configuration guide
+│   └── workflow.md          # Development workflow with diagrams
+├── scripts/
+│   ├── docker_build.bat     # Build the image (latest + version tag)
+│   └── docker_publish.bat   # Build then push both tags to Docker Hub
 ├── .vscode/
 │   ├── settings.json # VSCode editor settings
 │   ├── extensions.json # Recommended extensions
@@ -38,9 +48,8 @@ llm-hub/
 ├── Dockerfile        # Container build (python:3.12-slim)
 ├── pyproject.toml    # Python tooling config (ruff, mypy, pytest)
 ├── requirements.txt  # Runtime dependencies
-├── API.md            # API documentation with all endpoints
-├── workflow.md       # Development workflow with diagrams
-├── DEPLOY.md         # Docker deployment guide
+├── README.md / README_CN.md
+├── CHANGELOG.md / CHANGELOG_CN.md
 └── AGENTS.md         # This file
 ```
 
@@ -79,7 +88,7 @@ llm-hub/
 # Mock tests only (no external dependencies)
 python tests/smoke_test.py
 
-# Gateway features: aggregation, systemone forwarding, /docs schema (no external deps)
+# Gateway features: aggregation, systemone/websearch forwarding, /docs schema (no external deps)
 python tests/test_gateway_new.py
 
 # Security verification tests (no external dependencies)
@@ -101,10 +110,10 @@ python tests/demo.py
 **Important:** E2E tests always use `data/config.json` from the project root (set via `CONFIG_PATH=./data/config.json`). This config points to the local Ollama instance at `127.0.0.1:11434`. Never hardcode paths in test commands.
 
 ### Test Structure
-- `smoke_test.py` — 91 mock tests (auth, routing, aliases, streaming, rerank, security, `/` system info), no external deps
-- `test_gateway_new.py` — 33 tests for aggregation, systemone forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input)
+- `smoke_test.py` — 104 mock tests (auth, routing, aliases, streaming, rerank, security, `/` system info, upstream types), no external deps
+- `test_gateway_new.py` — 55 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input)
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
-- `test_api.py` — 20 E2E tests against a real running server + Ollama
+- `test_api.py` — 28 E2E tests against a real running server + Ollama + web search provider
 - `demo.py` — interactive demo (requires real Ollama)
 - Tests use `fastapi.testclient.TestClient` (mock) or `httpx.Client` (E2E)
 - No pytest framework - uses custom test runner with `check()` assertions
@@ -150,7 +159,7 @@ docker run -d --name llm-hub \
 
 ### Configuration
 1. Copy `data/example.config.json` to `data/config.json`
-2. Copy `.example.env` to `.env`
+2. Copy `.env.example` to `.env`
 3. Edit config with real upstream URLs
 4. Set API keys in `.env` file
 
@@ -183,6 +192,50 @@ docker run -d --name llm-hub \
 - **logprobs**: Generative scoring using token probabilities
 - **embedding**: Vector cosine similarity scoring
 - Per-model mode override via `model_modes` config
+
+### Web Search (`POST /v1/tools/web-search`)
+- Served by `websearch.py`, which forwards to the upstream named in `websearch.upstream`
+  (or the first `type: "opencode"` upstream) at `websearch.path`
+- Request and response are passed through unchanged; `model` is **never** resolved through
+  the gateway's aliases, and nothing is injected
+- The provider is a regular upstream, so its models appear in `/v1/models` and chat can be
+  routed to it; model ids are slash-separated (`opencode/big-pickle`), so the wildcard is
+  `"opencode/*"` — a colon form matches nothing
+- Optional upstream signing: `websearch.api_key_env` names an env var whose value is sent as
+  `Authorization: Bearer <key>`; empty (default) = unsigned. Caller credentials are stripped
+  before forwarding, as everywhere else in the gateway
+- Statuses: 404 when `websearch.enabled=false`, 503 when the named upstream is missing,
+  502/504 on provider connect/read-timeout failures, 405 for non-POST (the path is in
+  `POST_ONLY_PATHS`), 400 for a non-JSON-object body
+- An error the provider itself returns (status + body) is passed through unchanged — e.g.
+  `synthesize: true` can hit the provider's own 300s inference cap and answer **502**
+  `opencode_unavailable`. Keep `websearch.timeout` >= 300 so that error reaches the caller
+  instead of a gateway-side **504**
+
+### System One (`POST /v1/systemone`)
+- Served by `systemone.py`; forwards to `systemone.backend` + `systemone.path` with no
+  model resolution and no body rewriting beyond the `model` injection below
+- `systemone.model` **does reach the backend** — it is injected into the forwarded body only
+  when it is a concrete value and the caller did not supply `model`; the sentinel `"local"`
+  means "do not inject". The Pydantic default is `auto` (a laya-server enum value), while
+  `build_default_config()` emits `"local"` and the shipped `data/*.config.json` use a real
+  model name (`tev1`) against Ollama
+- Two backends answer the same path with different contracts:
+  - **laya-server** — `model` is a literal enum (`auto` / `english` / `multilingual` /
+    `typed-decisions`), anything else is **422**; unknown top-level fields are rejected;
+    responses include `routing`
+  - **Ollama 0.40+** — `model` must be an installed model name (`auto` → **404**
+    `model 'auto' not found`, missing → **400** `model is required`); unknown top-level
+    fields are ignored; no `routing` in the response
+  - `choice` questions need a non-empty `criteria` **object** on Ollama (array → **400**)
+    while `score` questions need a **2–10 item array** (object → **400**); laya-server
+    accepts either shape for `choice`. Using object+array respectively is valid on both
+- Signing is unconditional: the value of the env var named by `systemone.api_key_env`
+  (default `SYSTEMONE_SERVER_API_KEY`, renamed from `LAYA_SERVER_API_KEY`) is sent as
+  `Authorization: Bearer <key>` even to an Ollama backend, which ignores it. A missing env
+  var logs a warning and forwards unsigned
+- Statuses: 404 when `systemone.enabled=false`, 502 on connect/HTTP errors, 504 on read
+  timeout; backend status and body are passed through unchanged
 
 ## Common Tasks
 

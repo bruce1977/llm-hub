@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Execute test cases from TESTCASES.md against a running LLM Hub instance.
+Execute test cases from docs/TESTCASES.md against a running LLM Hub instance.
 
 Usage:
     # Start the server first, then run:
@@ -145,10 +145,50 @@ def main() -> int:
         r = client.post("/api/pull", headers=headers, json={"name": "test"})
         check("POST /api/pull is blocked (403)", r.status_code == 403, f"got {r.status_code}")
 
-        # --------------------------------------------------- Docs hidden ---
+        # --------------------------------------------------- API docs hidden ---
         print("[9] API docs hidden by default")
         r = client.get("/docs")
         check("/docs returns 404 (hidden)", r.status_code == 404, f"got {r.status_code}")
+
+        # --------------------------------------------------- Web search ---
+        print("[10] Web search (POST /v1/tools/web-search)")
+        # Retrieval + optional synthesis is slow: allow several minutes per call.
+        SEARCH_TIMEOUT = 240.0
+        r = client.post("/v1/tools/web-search", json={"query": "Ollama keep_alive default", "top_k": 2}, timeout=SEARCH_TIMEOUT)
+        check("web search without auth returns 401", r.status_code == 401, f"got {r.status_code}")
+
+        r = client.get("/v1/tools/web-search", headers=headers)
+        check("web search only accepts POST (405)", r.status_code == 405, f"got {r.status_code}")
+
+        r = client.post("/v1/tools/web-search", headers=headers, json={"top_k": 2}, timeout=SEARCH_TIMEOUT)
+        check("web search without a query is rejected (400/422)", r.status_code in (400, 422), f"got {r.status_code}")
+
+        r = client.post(
+            "/v1/tools/web-search", headers=headers, json={"query": "Ollama keep_alive default", "top_k": 2}, timeout=SEARCH_TIMEOUT
+        )
+        if r.status_code == 404:
+            check("web search is enabled on this gateway", False, "websearch.enabled=false in the test config")
+        else:
+            check("web search returns 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+            if r.status_code == 200:
+                data = r.json()
+                check(
+                    "web search echoes the provider contract",
+                    all(k in data for k in ["query", "model", "engine", "text", "sources"]),
+                    str(sorted(data)),
+                )
+                check("web search retrieved passages", bool(data.get("results")) or bool(data.get("text")), str(data)[:200])
+                check("web search query passed through", data.get("query") == "Ollama keep_alive default", str(data)[:120])
+
+        # The search provider upstream must also be visible in the aggregated model list.
+        r = client.get("/v1/models", headers=headers)
+        if r.status_code == 200:
+            ids = [m["id"] for m in r.json().get("data", [])]
+            check(
+                "opencode provider models are aggregated",
+                any(i.startswith("opencode/") for i in ids),
+                str(ids)[:200],
+            )
 
     print(f"\n=== Result: {PASSED} passed, {FAILED} failed ===\n")
     return 1 if FAILED else 0

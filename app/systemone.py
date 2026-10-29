@@ -1,15 +1,17 @@
 """
 System One proxy service.
 
-Integrates the laya-server `POST /v1/systemone` (System One structured decision API,
-Jev-compatible) into llm-hub.
+Integrates the System One structured decision API (`POST /v1/systemone`) into llm-hub.
+Both a laya-server deployment and Ollama 0.40+ (which exposes the same path natively)
+can serve it.
 
 Authentication split:
   - The *caller* authenticates against llm-hub with the gateway's own API key
     (cfg.auth.api_keys, sourced from `.env` / GATEWAY_API_KEYS - the `.keys` config).
-  - llm-hub then forwards the request to the configured laya-server `backend`, signing
-    it with the key read from the environment variable named by `api_key_env`
-    (default LAYA_SERVER_API_KEY). That key never has to live in config.json.
+  - llm-hub then forwards the request to the configured `backend`, signing it with the
+    key read from the environment variable named by `api_key_env` (default
+    SYSTEMONE_SERVER_API_KEY). That key never has to live in config.json, and a backend
+    that needs no credential just ignores the header.
 
 Everything else (request body, response body, status code, content-type) is forwarded
 as-is. The configured `model` is only injected when it is a concrete value (not the
@@ -92,21 +94,23 @@ class SystemOneService:
             body = {}
 
         # Model injection: only when a concrete model is configured (not the "local"
-        # sentinel) and the caller did not already set one. laya-server defaults to "auto".
+        # sentinel) and the caller did not already set one. laya-server reads it as a
+        # routing hint and defaults to "auto"; an Ollama backend wants a real model name
+        # and answers 404 for "auto", so point `systemone.model` at a model it serves.
         if so.model and so.model != "local" and not body.get("model"):
             body["model"] = so.model
 
         # Build upstream request headers.
         headers = self._build_headers(request)
 
-        # Sign the upstream request with the laya-server key from the environment.
+        # Sign the upstream request with the backend key from the environment.
         laya_key = os.getenv(so.api_key_env, "").strip()
         if laya_key:
             headers["Authorization"] = f"Bearer {laya_key}"
         else:
             logger.warning(
-                "Environment variable %s is not set; forwarding /%s without a "
-                "laya-server API key (expect HTTP 401 from the backend).",
+                "Environment variable %s is not set; forwarding /%s to the System One "
+                "backend unsigned (only a problem if that backend requires a key).",
                 so.api_key_env,
                 so.path,
             )
@@ -130,22 +134,22 @@ class SystemOneService:
                 timeout=timeout,
             )
         except httpx.ConnectError as exc:
-            logger.error("Cannot connect to laya-server (%s): %s", url, exc)
+            logger.error("Cannot connect to System One backend (%s): %s", url, exc)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"laya-server '{so.backend}' is unreachable: {exc}",
+                detail=f"System One backend '{so.backend}' is unreachable: {exc}",
             ) from exc
         except httpx.ReadTimeout as exc:
-            logger.error("laya-server read timed out: %s", exc)
+            logger.error("System One backend read timed out: %s", exc)
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail=f"laya-server timed out after {timeout}s.",
+                detail=f"System One backend timed out after {timeout}s.",
             ) from exc
         except httpx.HTTPError as exc:
-            logger.error("laya-server request failed: %s", exc)
+            logger.error("System One backend request failed: %s", exc)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"laya-server error: {exc}",
+                detail=f"System One backend error: {exc}",
             ) from exc
 
         # Pass the response through as-is (status, body, content-type).

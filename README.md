@@ -12,6 +12,7 @@ thinking mode).
 | **Multi-upstream routing** | Route by the `model` field in the request body to the matching backend instance |
 | **API key auth** | Multiple keys, constant-time comparison, `Bearer` / `X-API-Key` compatible |
 | **Rerank API** | `/v1/rerank` with generative (`logprobs`) and vector (`embedding`) scoring |
+| **Web search** | `POST /v1/tools/web-search` proxies keyword search to an OpenCode API Gateway upstream and returns the retrieved passages |
 | **Unified model list** | `/v1/models` aggregates models & aliases from all upstreams instead of proxying to one instance |
 | **Alias + param injection** | `qwen3.5:4b-nothink` → forwards `qwen3.5:4b` and force-injects `think: false` |
 | **Streaming pass-through** | NDJSON (`/api/chat`) and SSE (`/v1/chat/completions`) forwarded as-is |
@@ -30,7 +31,8 @@ llm-hub/
 │   ├── config.py     # Config model, loading, hot reload, alias resolution
 │   ├── auth.py       # API key authentication
 │   ├── proxy.py      # Reverse proxy & streaming pass-through
-│   └── rerank.py     # Rerank API implementation
+│   ├── rerank.py     # Rerank API implementation
+│   └── websearch.py  # Web search proxy (OpenCode API Gateway upstream)
 └── data/
     └── config.json   # Config file (mounted into the container at /data)
 ```
@@ -46,7 +48,7 @@ docker pull bruce1977/llm-hub:latest
 # 2. Prepare config & secrets
 mkdir -p llm-hub/data
 cp data/example.config.json llm-hub/data/config.json
-cp .example.env llm-hub/.env
+cp .env.example llm-hub/.env
 # Edit llm-hub/data/config.json and llm-hub/.env with your settings
 
 # 3. Run
@@ -104,15 +106,15 @@ The repo ships two templates with **no real information**; copy and fill them in
 | Template | Copy to | Description |
 |------|--------|------|
 | `data/example.config.json` | `data/config.json` | Sample config with full `upstreams` / `aliases` / `rerank` / `security` fields, including a `priority` example |
-| `.example.env` | `.env` | Sample secrets; just replace `GATEWAY_API_KEYS` with your own random strings (≥16 chars) |
+| `.env.example` | `.env` | Sample secrets; just replace `GATEWAY_API_KEYS` with your own random strings (≥16 chars) |
 
 ```bash
 cp data/example.config.json data/config.json
-cp .example.env .env
+cp .env.example .env
 # then edit config.json with real upstream base_urls and .env with real keys
 ```
 
-> `config.json` and `.env` are gitignored; the templates `example.config.json` / `.example.env`
+> `config.json` and `.env` are gitignored; the templates `example.config.json` / `.env.example`
 > stay in the repo so others can reuse them.
 > The deployment directory (e.g. `${target folder}`) also holds these two templates; usage is identical.
 
@@ -196,7 +198,7 @@ docker push registry.example.com/llm-hub:1.0.0
   fails); whether `/docs` is public is controlled by `security.allow_docs` (default `false`)
 - `enabled: false` temporarily disables auth
 
-### `upstreams` — backend instances (Ollama / LM Studio)
+### `upstreams` — backend instances (Ollama / LM Studio / OpenCode)
 
 ```json
 "upstreams": [
@@ -216,7 +218,11 @@ docker push registry.example.com/llm-hub:1.0.0
   Default `ollama`
   - `ollama`: model list `/api/tags`, health check `/api/version`
   - `lmstudio`: OpenAI-compatible, model list `/v1/models`, health check `/v1/models`
-- `models`: supports **prefix wildcards** — `"qwen3:*"` matches `qwen3:4b`, `qwen3:8b`, `qwen3:14b`
+  - `opencode`: [OpenCode API Gateway](docs/API.md#web-searchopencode-网关代理) — OpenAI-compatible model
+    list `/v1/models`, health check `/health`; also serves the web search endpoint (see `websearch`)
+- `models`: supports **prefix wildcards** — `"qwen3:*"` matches `qwen3:4b`, `qwen3:8b`, `qwen3:14b`.
+  The wildcard is a literal prefix, so slash-separated ids need the slash form: `"opencode/*"`
+  matches `opencode/big-pickle` ( `"opencode:*"` would match nothing)
 - `model_aliases`: maps a verbose upstream id to a short name (see the LM Studio section below)
 - `timeout`: overrides the global timeout; raise it for large models
 - `headers`: optional extra headers added when forwarding (e.g. when the upstream has its own auth)
@@ -342,6 +348,37 @@ Two scoring modes:
 `mode` is the global default. When mixing reranker types (e.g. generative `qwen3-reranker:4b` +
 vector `bge-m3:latest`), use `model_modes` to set a per-model mode, e.g.
 `{"bge-m3:latest": "embedding"}`.
+
+### `websearch` — web search proxy
+
+```json
+"websearch": {
+  "enabled": true,
+  "upstream": "opencode",
+  "path": "v1/web-search",
+  "api_key_env": "",
+  "timeout": 300.0
+}
+```
+
+Turns the gateway into the front door for a web search provider: `POST /v1/tools/web-search`
+forwards the body unchanged to `<upstream.base_url>/v1/web-search` and returns the provider's
+response as-is (`query`, `results[]`, concatenated `text`, `sources`, and `answer` when
+`synthesize: true`).
+
+- The provider is a normal `upstreams` entry (`type: "opencode"`), so its address, timeout and
+  headers are configured once and shared with model routing and the aggregated model list
+- `upstream`: provider name; leave it empty to pick the **first `type: "opencode"` upstream**.
+  A name that matches no upstream returns **503** instead of silently falling back
+- `api_key_env`: name of the environment variable holding the provider key, sent as
+  `Authorization: Bearer <key>`. Empty (default) = the call is unsigned. Keys stay in the
+  environment, never in `config.json`
+- `model` is **never rewritten**: it is not resolved against the gateway's `aliases`
+- Callers authenticate with the gateway's own key (`GATEWAY_API_KEYS`); the endpoint is
+  POST-only (**405** otherwise) and returns **502** / **504** when the provider is unreachable
+  or slow
+
+Full request/response contract and curl examples: [API.md → Web Search](docs/API.md#web-searchopencode-网关代理).
 
 ## API usage
 
@@ -496,6 +533,41 @@ Response:
 Request fields: `model`, `query`, `documents` (string array or `{text:...}` object array), `top_n`,
 `return_documents`, `instruction` (overrides the default instruction).
 
+### Web search
+
+```bash
+curl -X POST http://localhost:8000/v1/tools/web-search \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Ollama keep_alive default", "top_k": 3}'
+```
+
+Response (passed through from the provider):
+
+```json
+{
+  "query": "Ollama keep_alive default",
+  "model": "ollama-local/qwen3.5:9b",
+  "engine": "opencode-websearch",
+  "truncated": false,
+  "answer": null,
+  "text": "By default, models are loaded into memory for five minutes ...",
+  "sources": ["https://docs.ollama.com/faq"],
+  "results": [
+    {
+      "title": "FAQ",
+      "url": "https://docs.ollama.com/faq",
+      "snippet": "Alternatively, you can change the amount of time all models stay loaded ...",
+      "paragraphs": ["By default, models are loaded into memory for five minutes."]
+    }
+  ]
+}
+```
+
+Request fields: `query` (required), `top_k`, `max_chars_per_page`, `locale`, `recency`
+(`day`/`week`/`month`/`year`), `synthesize`, `include_sources`, `model` (forwarded verbatim).
+`text` is every retrieved paragraph concatenated — ready to drop into a prompt.
+
 ### Health check
 
 ```bash
@@ -627,8 +699,8 @@ cp data/example.config.json data/config.json
 # Edit data/config.json with your upstream URLs
 
 # 3. Prepare secrets (.env) — uvicorn loads these via --env-file below
-cp .example.env .env
-# Edit .env: set GATEWAY_API_KEYS, LAYA_SERVER_API_KEY, etc.
+cp .env.example .env
+# Edit .env: set GATEWAY_API_KEYS, SYSTEMONE_SERVER_API_KEY, etc.
 
 # 4. Run the server (loads ../.env automatically)
 cd app
@@ -642,8 +714,8 @@ python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 pip install -r requirements.txt
 
 # 2. Prepare secrets (.env)
-Copy-Item .example.env .env
-# Edit .env: set GATEWAY_API_KEYS, LAYA_SERVER_API_KEY, etc.
+Copy-Item .env.example .env
+# Edit .env: set GATEWAY_API_KEYS, SYSTEMONE_SERVER_API_KEY, etc.
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.json"
 
 # 3. Run the server (loads ../.env automatically)
@@ -682,6 +754,6 @@ nssm set LLMHub AppEnvironmentExtra "CONFIG_PATH=D:\workspace\github\llm-hub\dat
 nssm start LLMHub
 ```
 
-> **Note:** `uvicorn --env-file` reads `.env` once at startup and injects its variables as environment variables (e.g. `GATEWAY_API_KEYS`, `LAYA_SERVER_API_KEY`). It does **not** hot-reload — after editing `.env`, restart uvicorn. `config.json` changes still hot-reload without restart.
+> **Note:** `uvicorn --env-file` reads `.env` once at startup and injects its variables as environment variables (e.g. `GATEWAY_API_KEYS`, `SYSTEMONE_SERVER_API_KEY`). It does **not** hot-reload — after editing `.env`, restart uvicorn. `config.json` changes still hot-reload without restart.
 
 Interactive docs: <http://localhost:8000/docs> (requires `security.allow_docs: true`; when enabled, `/docs` and `/openapi.json` are API-key-free; each endpoint has an `X-API-Key` input box in its own **Parameters** section — "Try it out" → "Execute" sends it with that request — and the header **Authorize** dialog accepts `Authorization: Bearer` or `X-API-Key` for all requests)

@@ -11,7 +11,8 @@
   - [模型列表](#模型列表)
   - [Ollama 原生模型列表](#ollama-原生模型列表)
   - [实例运行状态 (Process Status)](#实例运行状态-process-status)
-  - [System One 决策 API（laya-server 代理）](#system-one-决策-apilaya-server-代理)
+  - [System One 决策 API（laya-server 与 Ollama 代理）](#system-one-决策-apilaya-server-与-ollama-代理)
+  - [Web Search（OpenCode 网关代理）](#web-searchopencode-网关代理)
   - [重排序](#重排序)
   - [聊天补全](#聊天补全)
   - [文本补全](#文本补全)
@@ -306,14 +307,14 @@ curl http://localhost:8888/api/ps \
 
 ---
 
-### System One 决策 API（laya-server 代理）
+### System One 决策 API（laya-server 与 Ollama 代理）
 
 | 项目 | 值 |
 |------|-----|
 | 路径 | `/v1/systemone` |
 | 方法 | `POST` |
 | 认证 | ✅ 需要（网关自身的 API Key，来自 `.env` / `GATEWAY_API_KEYS`） |
-| 说明 | 将请求原样转发到配置的 laya-server 后端。网关用 `systemone.api_key_env`（默认 `LAYA_SERVER_API_KEY`）环境变量中的密钥对后端签名，请求体与响应体均原样透传。 |
+| 说明 | 将请求原样转发到配置的 System One 后端（`1panel/laya-server`，或 **Ollama 0.40+**——它原生提供 `POST /v1/systemone`）。网关用 `systemone.api_key_env`（默认 `SYSTEMONE_SERVER_API_KEY`）环境变量中的密钥对后端签名，请求体与响应体均原样透传。 |
 
 **配置（`config.json` 的 `systemone` 段）：**
 
@@ -321,36 +322,40 @@ curl http://localhost:8888/api/ps \
 {
   "systemone": {
     "enabled": true,
-    "backend": "http://127.0.0.1:8080",
-    "model": "local",
-    "api_key_env": "LAYA_SERVER_API_KEY",
+    "backend": "http://llm.home:11435",
+    "model": "tev1",
+    "api_key_env": "SYSTEMONE_SERVER_API_KEY",
     "path": "v1/systemone",
     "timeout": 60.0
   }
 }
 ```
 
-- `model` 为 `"local"` 时表示**哨兵值**：不向下游注入 `model`，由调用方自行指定（laya-server 默认 `auto`）；将其改为 `auto` / `multilingual` 才会强制覆盖。
+- `backend` 指向任一 System One 后端即可，网关侧行为完全一致——纯转发，不做模型解析、不改写响应。容器内指向宿主机 Ollama 时用 `http://host.docker.internal:11435`。
+- `model` **会原样出现在转发给后端的请求体里**：仅当它是具体值且调用方自身没带 `model` 时才注入；`"local"` 是**哨兵值**，表示不注入、由调用方自行指定。
 - laya-server 的 `model` 为字面量枚举，**仅接受 `auto` / `english` / `multilingual` / `typed-decisions`**，其它值返回 **HTTP 422** `literal_error`。
-- 后端密钥从环境变量读取，绝不写入 `config.json`。
+- Ollama 的 `model` 必须是**真实模型名**：`auto` → **404** `model 'auto' not found`；缺失 → **400** `model is required`。因此后端换成 Ollama 时，把 `model` 配成实际模型（如示例中的 `tev1`）。
+- 后端密钥从环境变量读取，绝不写入 `config.json`。该 `Authorization` 头对不需要鉴权的 Ollama 后端无副作用，Ollama 会直接忽略。
 
-**请求体结构（实测自 laya-server：`state` / `questions` 必填，且**未知顶层字段被拒绝**）：**
+**请求体结构（两家后端 `state` / `questions` 均必填；差异：laya-server **拒绝未知顶层字段**，实测 Ollama 会忽略）：**
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `state` | object | ✅ | 自由结构，承载上下文，如 `{"message": "..."}` |
 | `questions` | object | ✅ | 问题 id → 问题定义，至少 1 项 |
-| `model` | string | ❌ | 路由提示，取值见上文枚举 |
+| `model` | string | ❌ | 模型名/路由提示，取值规则见上文；缺省时由网关按配置注入 |
 
-`questions.<id>` 是**按 `type` 判别的联合类型**（tag 为 `type`），共三种变体：
+`questions.<id>` 是**按 `type` 判别的联合类型**（tag 为 `type`），共三种变体。`criteria` 的形状是两家唯一的形式差异，下表同时给出兼容写法：
 
-| `type` | 额外必填字段 | 语义 | 响应关键字段 |
-|--------|--------------|------|--------------|
-| `noul` | `instructions: string` | 二值判定 | `noul`（概率）、`confidence` |
-| `choice` | `instructions: string`、`criteria: string[] \| object` | 多选一 | `choice`、`probabilities`、`confidence` |
-| `score` | `instructions: string`、`criteria: string[]`（**至少 2 项**） | 打分/择优 | `score`、`legend`、`probabilities`、`confidence` |
+| `type` | 额外必填字段 | 语义 | `criteria` 兼容要求 | 响应关键字段 |
+|--------|--------------|------|--------------------|--------------|
+| `noul` | `instructions: string` | 二值判定 | 不需要 | `noul`（概率）；laya 另有 `confidence`、`action`，Ollama 只回 `noul` |
+| `choice` | `instructions: string`、`criteria` | 多选一 | laya 接受 `string[]` 或 object；**Ollama 只接受非空 object**（数组 → 400） | `choice`、`probabilities`、`confidence` |
+| `score` | `instructions: string`、`criteria` | 打分/择优 | laya 要求 `string[]`（≥2 项）；**Ollama 要求 2–10 项的数组**（object → 400） | `score`、`legend`、`probabilities`、`confidence` |
 
-**请求示例：**
+> 即：`choice` 用 object、`score` 用数组，同一份请求体在 laya-server 与 Ollama 上都能通过校验。
+
+**请求示例（两种后端均合法）：**
 
 ```bash
 curl -X POST http://localhost:8888/v1/systemone \
@@ -360,14 +365,28 @@ curl -X POST http://localhost:8888/v1/systemone \
     "state": {"message": "I was charged twice and need a refund today."},
     "questions": {
       "refund":  {"type": "noul",   "instructions": "Does the customer ask for a refund?"},
-      "intent":  {"type": "choice", "instructions": "Primary intent?", "criteria": ["refund", "cancel", "other"]},
+      "intent":  {"type": "choice", "instructions": "Primary intent?", "criteria": {
+                    "refund": "asking money back", "cancel": "cancel account", "other": "neither"}},
       "urgency": {"type": "score",  "instructions": "How urgent?",      "criteria": ["urgent", "normal"]}
-    },
-    "model": "auto"
+    }
   }'
 ```
 
-**响应示例：**
+**响应示例（Ollama 0.40+ / `model: tev1` 实测）：**
+
+```json
+{
+  "model": "tev1",
+  "answers": {
+    "refund": {"type": "noul", "noul": 0.9734541266310229},
+    "intent": {"type": "choice", "choice": "refund", "probabilities": {"refund": 0.9864521057032967, "cancel": 0.001990846275500757, "other": 0.011557048021202679}, "confidence": 0.979678158554945},
+    "urgency": {"type": "score", "score": 0.13496998422642553, "legend": {"0": "urgent", "1": "normal"}, "probabilities": {"0": 0.8650300157735745, "1": 0.13496998422642553}, "confidence": 0.7300600315471489}
+  },
+  "usage": {"input_tokens": 369, "output_tokens": 0}
+}
+```
+
+**响应示例（laya-server 实测）：**
 
 ```json
 {
@@ -381,7 +400,101 @@ curl -X POST http://localhost:8888/v1/systemone \
 }
 ```
 
-> 响应（`answers`、`model`、`usage`、`routing`）由 laya-server 原样返回，网关不做任何改写。
+> 响应（`answers`、`model`、`usage`，以及 laya-server 独有的 `routing`）由后端原样返回，网关不做任何改写。后端返回的错误（状态码 + body）同样原样透传。
+
+---
+
+### Web Search（OpenCode 网关代理）
+
+| 项目 | 值 |
+|------|-----|
+| 路径 | `/v1/tools/web-search` |
+| 方法 | `POST` |
+| 认证 | ✅ 需要（网关自身的 API Key，来自 `.env` / `GATEWAY_API_KEYS`） |
+| 说明 | 关键词检索网页正文段落。请求体转发到 `websearch.upstream` 指定的上游（`websearch.path`，默认 `v1/web-search`），上游响应原样返回，网关不改写。 |
+
+**配置（`config.json` 的 `websearch` 段 + 对应上游）：**
+
+```json
+{
+  "upstreams": [
+    {
+      "name": "opencode",
+      "type": "opencode",
+      "base_url": "http://vm.gateway:11430",
+      "models": ["auto", "opencode/*"],
+      "timeout": 300,
+      "priority": 30
+    }
+  ],
+  "websearch": {
+    "enabled": true,
+    "upstream": "opencode",
+    "path": "v1/web-search",
+    "api_key_env": "",
+    "timeout": 300.0
+  }
+}
+```
+
+- 检索方是一个普通的 `upstreams` 条目（`type: "opencode"`）：它的地址、超时、附加 `headers` 只配一次，同时被模型聚合（`/v1/models`、`/api/tags`）、聊天路由和 `/probe` 复用。`opencode` 类型走 OpenAI 兼容的发现接口（`GET /v1/models`，解析 `data[].id`），健康探测走 `GET /health`。
+- `websearch.upstream` 留空时自动选取**第一个 `type: "opencode"` 的上游**；填了名字却找不到对应上游则返回 **503**（不会静默回退到别的上游）。
+- `api_key_env` 默认空字符串 = 不签名（当前 OpenCode 网关匿名可访问）。若上游启用了密钥，把它设成变量名（如 `OPENCODE_GATEWAY_API_KEY`），网关会以 `Authorization: Bearer <值>` 调用上游；密钥只从环境变量读取，绝不写入 `config.json`。
+- `model` 字段**纯透传**：调用方传什么就转什么，不传则由上游自行选择；网关不会用自己的 `aliases` 去解析它。
+- `synthesize: true` 会额外驱动一次模型综合作答，耗时由上游的推理速度决定，可能远超纯检索（实测 5~15s）。上游自身对单次推理有 **300 秒** 的硬上限：绕过本网关直接压测 `vm.gateway:11430`，`synthesize` 在 311s 返回 `502 {"error":{"message":"inference timed out (>300s)","code":"opencode_unavailable"}}`。因此 `websearch.timeout` 至少保持 300（默认即 `300.0`），让上游自己的错误原样透传（**502**）而不是先被网关判成 **504**；再往上调也不会更快拿到答案。需要 `answer` 时建议把 `model` 指向更快的上游。
+
+**请求体字段：**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `query` | string | ✅ | 检索关键词（非空） |
+| `model` | string | ❌ | 上游侧模型 id，原样透传 |
+| `top_k` | int | ❌ | 抓取页数，1~50 |
+| `max_chars_per_page` | int | ❌ | 单页正文字符上限，超出则 `truncated: true` |
+| `locale` | string | ❌ | 检索语言提示，如 `zh-CN` |
+| `recency` | string | ❌ | 时间窗：`day` / `week` / `month` / `year` |
+| `synthesize` | bool | ❌ | 额外驱动模型综合作答，返回填充 `answer`（耗时明显变长） |
+| `include_sources` | bool | ❌ | 是否返回扁平的 `sources` URL 列表 |
+
+**请求示例：**
+
+```bash
+curl -X POST http://localhost:8888/v1/tools/web-search \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Ollama keep_alive 默认值", "top_k": 2}'
+```
+
+**响应示例（实测）：**
+
+```json
+{
+  "query": "Ollama keep_alive 默认值",
+  "model": "ollama-local/qwen3.5:9b",
+  "engine": "opencode-websearch",
+  "truncated": false,
+  "answer": null,
+  "text": "Documentation Index\nFetch the complete documentation index at: /llms.txt\n\nI want the model to stay loaded on the GPUs for an extended period of time, ...",
+  "sources": [
+    "https://docs.ollama.com/faq",
+    "https://www.reddit.com/r/ollama/comments/1cnxnrv/how_to_set_keepalive_1_on_ollama_linux/"
+  ],
+  "results": [
+    {
+      "title": "FAQ",
+      "url": "https://docs.ollama.com/faq",
+      "snippet": "Alternatively, you can change the amount of time all models are loaded into memory by setting the OLLAMA_KEEP_ALIVE environment variable ...",
+      "paragraphs": ["Documentation IndexFetch the complete documentation index at: /llms.txt"]
+    }
+  ]
+}
+```
+
+- `text` 是所有抓取段落的拼接结果，可直接塞进 prompt；`results[]` 保留逐页的标题/URL/摘要/段落；`answer` 仅在 `synthesize: true` 时非 null。
+- 状态码：`websearch.enabled=false` → **404**；上游缺失 → **503**；上游不可达 → **502**；网关等待超过 `websearch.timeout` → **504**；非 POST → **405**；请求体不是 JSON 对象 → **400**。上游自己返回的错误（如 `synthesize` 触发上游 300s 推理上限的 **502**）连同响应体**原样透传**。
+
+> 启用该上游后，它的免费模型也会出现在 `/v1/models` 里，并可直接路由聊天：
+> `{"model": "opencode/big-pickle", ...}` 打到 `POST /v1/chat/completions` 即可。
 
 ---
 

@@ -13,6 +13,7 @@
 - [流式响应](#流式响应)
 - [别名参数注入](#别名参数注入)
 - [安全测试](#安全测试)
+- [联网检索](#联网检索)
 
 ---
 
@@ -884,7 +885,7 @@ curl http://localhost:8000/api/chat \
 ```bash
 # 1. 准备配置
 cp data/example.config.json data/config.json
-cp .example.env .env
+cp .env.example .env
 
 # 2. 编辑配置
 # 编辑 data/config.json 添加真实的上游实例
@@ -970,3 +971,101 @@ with httpx.stream("POST", url, json=payload, headers=headers) as response:
             print(f"首 token 延迟: {first_token_time:.3f}s")
             break
 ```
+
+---
+
+## 联网检索
+
+> 端点由 `config.json` 的 `websearch` 段驱动，检索方是一个 `type: "opencode"` 的上游；
+> 请求体与上游响应均原样透传。以下响应为对 `vm.gateway:11430` 的实测结果。
+
+### 测试 31: 关键词检索网页段落
+
+**请求:**
+
+```bash
+curl -X POST http://localhost:8000/v1/tools/web-search \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Ollama keep_alive 默认值", "top_k": 2}'
+```
+
+**响应 (200 OK):**
+
+```json
+{
+  "query": "Ollama keep_alive 默认值",
+  "model": "ollama-local/qwen3.5:9b",
+  "engine": "opencode-websearch",
+  "truncated": false,
+  "answer": null,
+  "text": "Documentation Index\nFetch the complete documentation index at: /llms.txt\n\nI want the model to stay loaded on the GPUs for an extended period of time, ...",
+  "sources": [
+    "https://docs.ollama.com/faq",
+    "https://www.reddit.com/r/ollama/comments/1cnxnrv/how_to_set_keepalive_1_on_ollama_linux/"
+  ],
+  "results": [
+    {
+      "title": "FAQ",
+      "url": "https://docs.ollama.com/faq",
+      "snippet": "Alternatively, you can change the amount of time all models are loaded into memory by setting the OLLAMA_KEEP_ALIVE environment variable when starting the ...",
+      "paragraphs": ["Documentation IndexFetch the complete documentation index at: /llms.txt"]
+    }
+  ]
+}
+```
+
+**断言:**
+- `200`，`engine` 非空，`results` 或 `text` 至少一项有内容
+- `query` 与请求一致（透传，网关不改写）
+- `synthesize: true` 时 `answer` 才非 null
+
+### 测试 32: 联网检索的鉴权、方法与参数校验
+
+**请求与期望:**
+
+```bash
+# 缺少 API Key -> 401
+curl -X POST http://localhost:8000/v1/tools/web-search \
+  -H "Content-Type: application/json" -d '{"query": "test"}'
+
+# 只接受 POST -> 405
+curl http://localhost:8000/v1/tools/web-search \
+  -H "Authorization: Bearer sk-gateway-example-key"
+
+# 缺少 query -> 上游校验打回 400（响应体原样透传）
+curl -X POST http://localhost:8000/v1/tools/web-search \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" -d '{"top_k": 2}'
+# {"error":{"message":"body must have required property 'query'", ...}}
+
+# 请求体不是 JSON 对象 -> 网关直接 400
+curl -X POST http://localhost:8000/v1/tools/web-search \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" -d 'not json'
+```
+
+**开关与故障映射:**
+
+| 场景 | 状态码 |
+|------|--------|
+| `websearch.enabled = false` | 404 |
+| `websearch.upstream` 指向上游名但不存在 | 503 |
+| 上游不可达 | 502 |
+| 上游超过 `websearch.timeout` | 504 |
+
+### 测试 33: 检索上游同时提供模型与聊天
+
+`type: "opencode"` 的上游除检索外，其免费模型也会进入聚合列表并可路由聊天：
+
+```bash
+# /v1/models 中可见 auto、opencode/mimo-v2.6-flash-free、opencode/deepseek-v4.1-flash-free、opencode/big-pickle
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "opencode/big-pickle", "messages": [{"role": "user", "content": "Say OK"}], "stream": false}'
+```
+
+> 上游模型 id 用斜杠分隔（`opencode/big-pickle`），`upstreams[].models` 里的通配必须写成
+> `"opencode/*"`，`"opencode:*"` 匹配不到任何模型。
+

@@ -10,6 +10,7 @@
 | **多上游路由** | 按请求体中的 `model` 字段，转发到对应端口的 Ollama 实例 |
 | **API Key 鉴权** | 支持多 Key 并存，常量时间比较，兼容 `Bearer` / `X-API-Key` |
 | **Rerank API** | 提供 `/v1/rerank`，支持生成式（`logprobs`）与向量（`embedding`）两种打分 |
+| **联网检索** | `POST /v1/tools/web-search`，把 OpenCode API Gateway 的关键词网页检索收敛到统一入口 |
 | **统一模型列表** | `/v1/models` 聚合配置中所有实例与别名，而非代理到单个实例 |
 | **别名 + 参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并强制注入 `think: false` |
 | **流式透传** | NDJSON（`/api/chat`）与 SSE（`/v1/chat/completions`）原样转发 |
@@ -28,7 +29,8 @@ llm-hub/
 │   ├── config.py     # 配置模型、加载与热重载、别名解析
 │   ├── auth.py       # API Key 鉴权
 │   ├── proxy.py      # 反向代理与流式透传
-│   └── rerank.py     # Rerank API 实现
+│   ├── rerank.py     # Rerank API 实现
+│   └── websearch.py  # 联网检索代理（OpenCode API Gateway 上游）
 └── data/
     └── config.json   # 配置文件（挂载到容器 /data）
 ```
@@ -44,7 +46,7 @@ docker pull bruce1977/llm-hub:latest
 # 2. 准备配置与密钥
 mkdir -p llm-hub/data
 cp data/example.config.json llm-hub/data/config.json
-cp .example.env llm-hub/.env
+cp .env.example llm-hub/.env
 # 编辑 llm-hub/data/config.json 和 llm-hub/.env，填入你的配置
 
 # 3. 启动
@@ -100,15 +102,15 @@ curl http://localhost:8888/health
 | 模板 | 复制为 | 说明 |
 |------|--------|------|
 | `data/example.config.json` | `data/config.json` | 网关配置样例，含 `upstreams` / `aliases` / `rerank` / `security` 全字段，已示范 `priority` 路由优先级 |
-| `.example.env` | `.env` | 密钥样例，只需把 `GATEWAY_API_KEYS` 换成你自己的随机串（≥16 位） |
+| `.env.example` | `.env` | 密钥样例，只需把 `GATEWAY_API_KEYS` 换成你自己的随机串（≥16 位） |
 
 ```bash
 cp data/example.config.json data/config.json
-cp .example.env .env
+cp .env.example .env
 # 然后编辑 config.json 填真实的 upstream base_url，编辑 .env 填真实密钥
 ```
 
-> `config.json` 与 `.env` 已在 `.gitignore` 中忽略，不会被提交；模板 `example.config.json` / `.example.env` 保留在版本库，方便他人直接取用。
+> `config.json` 与 `.env` 已在 `.gitignore` 中忽略，不会被提交；模板 `example.config.json` / `.env.example` 保留在版本库，方便他人直接取用。
 > 部署目录（如 `${target folder}`）同样放置了这两份模板，用法一致。
 
 ## 构建镜像（docker build）
@@ -180,7 +182,7 @@ docker push registry.example.com/llm-hub:1.0.0
 - `allow_anonymous_health`：`/health` 免鉴权（建议保持 `true`，否则容器健康检查会失败）；`/docs` 等文档是否公开由 `security.allow_docs` 控制（默认 `false`）
 - `enabled: false` 可临时关闭鉴权
 
-### `upstreams` —— 后端实例列表（Ollama / LM Studio）
+### `upstreams` —— 后端实例列表（Ollama / LM Studio / OpenCode）
 
 ```json
 "upstreams": [
@@ -199,7 +201,11 @@ docker push registry.example.com/llm-hub:1.0.0
 - `type`：后端类型，决定模型发现与健康探测走哪套接口，缺省为 `ollama`
   - `ollama`：模型列表 `/api/tags`、健康检查 `/api/version`
   - `lmstudio`：OpenAI 兼容协议，模型列表 `/v1/models`、健康检查 `/v1/models`
-- `models`：**支持前缀通配**，`"qwen3:*"` 可命中 `qwen3:4b`、`qwen3:8b`、`qwen3:14b`
+  - `opencode`：OpenCode API Gateway，模型列表 `/v1/models`、健康检查 `/health`；同时充当联网检索的
+    提供方（见下方 `websearch`）
+- `models`：**支持前缀通配**，`"qwen3:*"` 可命中 `qwen3:4b`、`qwen3:8b`、`qwen3:14b`。
+  通配是**字面前缀**，斜杠分隔的 id 要写成斜杠形式：`"opencode/*"` 才能命中 `opencode/big-pickle`
+  （写成 `"opencode:*"` 会一个都匹配不到）
 - `model_aliases`：把该实例中冗长的模型 id 映射成短名（见下方 LM Studio 章节）
 - `timeout`：覆盖全局超时，大模型建议调大
 - `headers`：可选，转发到该实例时附加的自定义请求头（如上游自身也有鉴权）
@@ -319,6 +325,33 @@ Dify / RAGFlow / WorkBuddy 等客户端看到的模型列表是整齐的短名�
 
 `mode` 是全局默认打分方式；当 reranker 混用不同类型模型（如生成式 `qwen3-reranker:4b` + 向量 `bge-m3:latest`）时，
 可用 `model_modes` 为单个模型单独指定模式，例如 `{"bge-m3:latest": "embedding"}`。
+
+### `websearch` —— 联网检索配置
+
+```json
+"websearch": {
+  "enabled": true,
+  "upstream": "opencode",
+  "path": "v1/web-search",
+  "api_key_env": "",
+  "timeout": 300.0
+}
+```
+
+把网页检索收敛到网关：`POST /v1/tools/web-search` 将请求体原样转发到
+`<upstream.base_url>/v1/web-search`，上游响应也原样返回（`query`、`results[]`、拼接好的 `text`、
+`sources`，`synthesize: true` 时另有 `answer`）。
+
+- 检索方就是一个普通的 `upstreams` 条目（`type: "opencode"`）：地址、超时、附加 header 只配一次，
+  同时被模型聚合（`/v1/models`、`/api/tags`）、聊天路由与 `/probe` 复用
+- `upstream`：检索提供方名称；留空则自动取**第一个 `type: "opencode"` 的上游**。填了名字却找不到
+  对应上游会返回 **503**，不会静默回退到别的上游
+- `api_key_env`：保存上游密钥的环境变量名，命中后以 `Authorization: Bearer <值>` 调用上游；
+  留空（默认）= 不签名（当前 OpenCode 网关匿名可访问）。密钥只放环境变量，绝不写进 `config.json`
+- `model` 字段**纯透传**：不传由上游自选，传了也不会用网关的 `aliases` 去解析
+- 调用方用网关自身 API Key 鉴权；只接受 POST（否则 **405**），上游不可达 / 超时分别返回 **502** / **504**
+
+请求/响应字段与 curl 示例见 [API 文档](docs/API.md#web-searchopencode-网关代理)。
 
 ## API 使用
 
@@ -473,6 +506,41 @@ curl http://localhost:8000/v1/rerank \
 请求字段：`model`、`query`、`documents`（字符串数组或 `{text:...}` 对象数组）、
 `top_n`、`return_documents`、`instruction`（覆盖默认指令）。
 
+### 联网检索
+
+```bash
+curl -X POST http://localhost:8000/v1/tools/web-search \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Ollama keep_alive 默认值", "top_k": 3}'
+```
+
+响应（由检索方原样返回）：
+
+```json
+{
+  "query": "Ollama keep_alive 默认值",
+  "model": "ollama-local/qwen3.5:9b",
+  "engine": "opencode-websearch",
+  "truncated": false,
+  "answer": null,
+  "text": "默认情况下，模型会在显存中保留 5 分钟 ...",
+  "sources": ["https://docs.ollama.com/faq"],
+  "results": [
+    {
+      "title": "FAQ",
+      "url": "https://docs.ollama.com/faq",
+      "snippet": "也可以通过 OLLAMA_KEEP_ALIVE 环境变量统一调整所有模型的驻留时间 ...",
+      "paragraphs": ["默认情况下，模型会在显存中保留 5 分钟。"]
+    }
+  ]
+}
+```
+
+请求字段：`query`（必填）、`top_k`、`max_chars_per_page`、`locale`、`recency`
+（`day`/`week`/`month`/`year`）、`synthesize`、`include_sources`、`model`（原样透传）。
+`text` 是抓取到的全部段落拼接结果，可直接塞进 prompt；`answer` 仅在 `synthesize: true` 时非 null。
+
 ### 健康检查
 
 ```bash
@@ -575,12 +643,12 @@ export GATEWAY_API_KEYS="sk-gateway-example-key,sk-gateway-example-two"
 
 网关启动时会把环境变量里的 Key 合并进 `auth.api_keys`，`config.json` 里即可只写 `[]` 或不写。
 
-### System One（laya-server 代理）
+### System One（laya-server 与 Ollama 代理）
 
-网关可把 `1panel/laya-server` 的 `POST /v1/systemone`（System One 结构化决策 API，兼容 Jev 线协议）统一收敛进来：
+网关可把 System One 结构化决策 API（`POST /v1/systemone`，兼容 Jev 线协议）统一收敛进来。后端两种都支持：`1panel/laya-server`，以及 **Ollama 0.40+**（原生提供该端点）：
 
 - **调用方鉴权**用网关自己的 Key（`.env` / `GATEWAY_API_KEYS`，即 `.keys` 配置）；
-- 网关再以 `config.json` 里 `systemone.api_key_env`（默认 `LAYA_SERVER_API_KEY`）环境变量中的密钥对 laya-server 后端签名；
+- 网关再以 `config.json` 里 `systemone.api_key_env`（默认 `SYSTEMONE_SERVER_API_KEY`）环境变量中的密钥对后端签名；
 - 请求体 / 响应体**原样透传**，网关不做改写。
 
 `config.json` 的 `systemone` 段：
@@ -589,19 +657,21 @@ export GATEWAY_API_KEYS="sk-gateway-example-key,sk-gateway-example-two"
 {
   "systemone": {
     "enabled": true,
-    "backend": "http://127.0.0.1:8080",
-    "model": "local",
-    "api_key_env": "LAYA_SERVER_API_KEY",
+    "backend": "http://llm.home:11435",
+    "model": "tev1",
+    "api_key_env": "SYSTEMONE_SERVER_API_KEY",
     "path": "v1/systemone",
     "timeout": 60.0
   }
 }
 ```
 
-- `model` 为 `"local"` 是**哨兵值**：不向下游注入 `model`（laya-server 默认 `auto`）；改成 `auto` / `multilingual` 才会强制覆盖。注意 laya-server 只接受这两个值，其它值返回 **422**。
-- 后端密钥只能从环境变量读取，绝不写入 `config.json`。
+- `model` **会被注入到转发给后端的请求体**（仅当它是具体值、且调用方没自带 `model`）；`"local"` 是**哨兵值**，表示不注入。
+- laya-server 只接受 `auto` / `english` / `multilingual` / `typed-decisions` 四个字面量，其它值返回 **422**。
+- Ollama 要的是**真实模型名**：`auto` → **404**，缺失 → **400**；所以后端换成 Ollama 时把 `model` 改成实际模型（如 `tev1`）。
+- 后端密钥只能从环境变量读取，绝不写入 `config.json`；Ollama 不需要它，会忽略这个 `Authorization` 头。
 
-详情见 [API 文档](API.md#system-one-决策-apilaya-server-代理)。
+详情见 [API 文档](docs/API.md#system-one-决策-apilaya-server-与-ollama-代理)。
 
 ### 公网部署 checklist
 
@@ -625,8 +695,8 @@ cp data/example.config.json data/config.json
 # 编辑 data/config.json，填入真实的上游地址
 
 # 3. 准备密钥文件（.env）—— 下文的 --env-file 会自动加载
-cp .example.env .env
-# 编辑 .env：设置 GATEWAY_API_KEYS、LAYA_SERVER_API_KEY 等
+cp .env.example .env
+# 编辑 .env：设置 GATEWAY_API_KEYS、SYSTEMONE_SERVER_API_KEY 等
 
 # 4. 启动服务（自动加载 ../.env）
 cd app
@@ -640,8 +710,8 @@ python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 pip install -r requirements.txt
 
 # 2. 准备密钥文件（.env）
-Copy-Item .example.env .env
-# 编辑 .env：设置 GATEWAY_API_KEYS、LAYA_SERVER_API_KEY 等
+Copy-Item .env.example .env
+# 编辑 .env：设置 GATEWAY_API_KEYS、SYSTEMONE_SERVER_API_KEY 等
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.json"
 
 # 3. 启动服务（自动加载 ../.env）
@@ -680,6 +750,6 @@ nssm set LLMHub AppEnvironmentExtra "CONFIG_PATH=D:\workspace\github\llm-hub\dat
 nssm start LLMHub
 ```
 
-> **说明：**`uvicorn --env-file` 会在启动时一次性读取 `.env` 并把其中的变量注入为环境变量（如 `GATEWAY_API_KEYS`、`LAYA_SERVER_API_KEY` 等），**不会热重载**——改了 `.env` 后需重启 uvicorn。而 `config.json` 的改动仍无需重启即可热加载。
+> **说明：**`uvicorn --env-file` 会在启动时一次性读取 `.env` 并把其中的变量注入为环境变量（如 `GATEWAY_API_KEYS`、`SYSTEMONE_SERVER_API_KEY` 等），**不会热重载**——改了 `.env` 后需重启 uvicorn。而 `config.json` 的改动仍无需重启即可热加载。
 
 交互式文档：<http://localhost:8000/docs>（需设置 `security.allow_docs: true`；开启后访问 `/docs`、`/openapi.json` 均无需 API Key；每个端点的 **Parameters** 区都有 `X-API-Key` 输入框——**Try it out** 后填写，**Execute** 时随该次请求发送；顶部 **Authorize** 则可一次性填入 `Authorization: Bearer` 或 `X-API-Key` 供所有请求使用）
