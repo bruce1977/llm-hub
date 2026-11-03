@@ -199,6 +199,31 @@ class ProxyService:
             forward_body = body
             forward_body = self._normalize_tool_calls(forward_body)
 
+        # num_ctx 固化：按真实模型名强制覆盖 Ollama 的 options.num_ctx，忽略客户端请求值。
+        # 只对 Ollama 上游生效（OpenAI / LM Studio 用 max_tokens，不认 num_ctx）。
+        # 无论客户端是否显式传 num_ctx，最终都以这里的约定值为准，避免同一模型因不同 ctx
+        # 被 Ollama 反复新建实例、显存叠加。
+        if (
+            forward_body is not None
+            and isinstance(forward_body, dict)
+            and upstream is not None
+            and getattr(upstream, "type", None) == "ollama"
+            and resolved is not None
+            and resolved.target in cfg.num_ctx_overrides
+        ):
+            override = cfg.num_ctx_overrides[resolved.target]
+            options = forward_body.get("options")
+            if not isinstance(options, dict):
+                options = {}
+                forward_body["options"] = options
+            if options.get("num_ctx") != override:
+                options["num_ctx"] = override
+                logger.info(
+                    "num_ctx clamped: model=%s -> options.num_ctx=%d (client value ignored)",
+                    resolved.target,
+                    override,
+                )
+
         # Body serialization: pass through raw bytes when JSON parsing fails
         content: bytes | None = None
         json_body: dict[str, Any] | None = None

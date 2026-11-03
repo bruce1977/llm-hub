@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import hmac
 import httpx
 import uvicorn
 from auth import (
@@ -33,10 +34,18 @@ from auth import (
     ip_allowed,
     require_api_key,
 )
+from admin_auth import (
+    ADMIN_COOKIE_NAME,
+    ADMIN_SESSION_TTL,
+    create_admin_token,
+    get_admin_password,
+    require_admin,
+)
 from config import CONFIG_PATH, ConfigManager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from proxy import ProxyService
 from rerank import RerankService
 from systemone import SystemOneService
@@ -244,6 +253,22 @@ DOCS_CSP = (
     "frame-ancestors 'none'"
 )
 
+# CSP for the (future) web management console under /admin. Unlike the locked-down
+# default and the docs scope, the admin SPA needs first-party scripts/styles plus
+# inline bootstrap (most single-file UIs embed inline JS/CSS). It stays locked to
+# 'self' origins and forbids framing by other sites.
+ADMIN_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "font-src 'self' data:; "
+    "form-action 'self'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'self'"
+)
+
 # Compiled path-allowlist regexes, cached by the pattern tuple.
 _PATH_ALLOWLIST_CACHE: dict[tuple, list[re.Pattern]] = {}
 
@@ -270,13 +295,17 @@ def _path_allowed(path: str, patterns: list[str]) -> bool:
 def _harden_response(resp: Response, path: str = "") -> Response:
     """Attach defensive security headers without clobbering existing ones.
 
-    The Swagger UI document needs scripts/styles, so docs paths get the scoped
-    DOCS_CSP instead of the blanket `default-src 'none'` default.
+    The Swagger UI document and the admin console need scripts/styles, so those
+    paths get the scoped DOCS_CSP / ADMIN_CSP instead of the blanket
+    `default-src 'none'` default.
     """
     for name, value in SECURITY_HEADERS.items():
         resp.headers.setdefault(name, value)
-    if path.rstrip("/") in DOCS_PATHS:
+    clean = path.rstrip("/")
+    if clean in DOCS_PATHS:
         resp.headers["Content-Security-Policy"] = DOCS_CSP
+    elif path.startswith("/admin"):
+        resp.headers["Content-Security-Policy"] = ADMIN_CSP
     return resp
 
 
@@ -344,7 +373,10 @@ async def gateway_security_middleware(request: Request, call_next):
 
     if sec is not None:
         # 2. path regex allowlist (perimeter control) --------------------------
-        if sec.path_allowlist and not _path_allowed(path, sec.path_allowlist):
+        # The admin console authenticates with its own password, so the perimeter
+        # allowlist must never lock it out -- exempt /admin (and the docs, which
+        # have their own allow_docs gate).
+        if not path.startswith("/admin") and sec.path_allowlist and not _path_allowed(path, sec.path_allowlist):
             logger.warning("Path not in allowlist: %s %s", method, path)
             return _deny(status.HTTP_403_FORBIDDEN, "Path not allowed.")
 
@@ -937,6 +969,52 @@ async def route_docs(request: Request):
             "persistAuthorization": True,
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# Admin console authentication (single password from ADMIN_PASSWORD env var)
+# --------------------------------------------------------------------------- #
+class AdminLogin(BaseModel):
+    password: str
+
+
+@app.post("/admin/login", include_in_schema=False, tags=["admin"])
+async def route_admin_login(request: Request, response: Response, body: AdminLogin):
+    """Validate the admin password and mint a signed session cookie."""
+    key = get_admin_password()
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin is not configured: set the ADMIN_PASSWORD environment variable.",
+        )
+    # Constant-time compare; a small delay blunts online brute-force.
+    if not hmac.compare_digest(body.password, key):
+        await asyncio.sleep(0.1)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin password.")
+    token = create_admin_token(key)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        ADMIN_COOKIE_NAME,
+        token,
+        httponly=True,
+        samesite="lax",
+        max_age=ADMIN_SESSION_TTL,
+        secure=request.url.scheme == "https",
+    )
+    return resp
+
+
+@app.post("/admin/logout", include_in_schema=False, tags=["admin"])
+async def route_admin_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(ADMIN_COOKIE_NAME)
+    return resp
+
+
+@app.get("/admin/ping", include_in_schema=False, tags=["admin"])
+async def route_admin_ping(_=Depends(require_admin)):
+    """Liveness check for the admin session; 200 only with a valid admin auth."""
+    return JSONResponse({"ok": True, "admin": True})
 
 
 # --------------------------------------------------------------------------- #

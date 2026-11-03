@@ -84,6 +84,10 @@
       "description": "35B pruned model with thinking disabled"
     }
   },
+  "num_ctx_overrides": {
+    "qwen3.6:35b-pruned": 65536,
+    "qwen3.5:9b": 16384
+  },
   "rerank": {
     "enabled": true,
     "endpoint": "/v1/rerank",

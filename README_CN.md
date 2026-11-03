@@ -247,6 +247,28 @@ docker push registry.example.com/llm-hub:1.0.0
 请求 `qwen3.5:4b-nothink` 时，网关会把 `model` 替换为 `qwen3.5:4b`，
 并将 `params` 中的字段**强制覆盖**进请求体（同名参数以别名为准）。
 
+### `num_ctx_overrides` —— 按模型名固定上下文长度（避免 Ollama 反复创建）
+
+Ollama 会为「模型 + `options.num_ctx`」的每种组合创建**独立实例**（KV cache 一次性预分配），
+客户端每次传不同的 `num_ctx` 就会导致同一模型被反复新建、显存叠加。
+这个映射用于**由网关统一钳制**指定模型的上下文长度，忽略客户端请求里携带的 `num_ctx`：
+
+```json
+"num_ctx_overrides": {
+  "qwen3.6:35b-pruned": 65536,
+  "qwen3.5:9b": 16384
+}
+```
+
+- **键是真实模型名**（别名/短名解析后的 `resolved.target`，即实际转发给上游的 `model` 字段，通常就是 `ollama list` / `/api/tags` 里看到的名字）。例如别名 `fast` → `qwen3:4b`，要钳制就填 `qwen3:4b`。
+- **值是固定的 `num_ctx`**（整数，token 数）。
+- **只对 `type=="ollama"` 的上游生效**；LM Studio / OpenAI 兼容上游用的是 `max_tokens`，不认 `num_ctx`，不会被钳制。
+- 无论客户端是否显式传 `num_ctx`，最终都以这里的值为准；当覆盖生效时网关会打印 `num_ctx clamped` 日志。
+- 支持**热重载**：改完约 1 秒后对新请求生效，无需重启网关。
+
+> 用途示例：大上下文模型（如 35B-pruned）固定 64K 上下文，避免客户端误传更大的 ctx 撑爆显存；
+> 或把小模型统一钳到 8K，防止不同客户端请求触发 Ollama 反复重分配 KV cache。
+
 ## 集成 LM Studio
 
 LM Studio 提供的是 OpenAI 兼容接口，模型 id 通常带发布方前缀、名字很长

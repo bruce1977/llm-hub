@@ -19,6 +19,12 @@
 - 文档：API.md 新增「Web Search（OpenCode 网关代理）」章节；README / README_CN 补特性行、`websearch` 配置详解、curl 示例、`opencode` 上游类型说明与斜杠通配注意点（`opencode/*` 而非 `opencode:*`）
 - 测试：`smoke_test.py` +13（共 104）覆盖 `opencode` 类型与 `websearch` 配置解析；`test_gateway_new.py` +22（共 55）覆盖端点鉴权、转发、透传、签名与状态码映射及 OpenAPI schema；`test_api.py` +8（共 28）E2E 用例；docs/TESTCASES.md 新增测试 31-33（含实测响应）
 
+### 新增（配置 / 上下文钳制）
+
+- 新增顶层配置 `num_ctx_overrides`：`{ "<真实模型名>": <num_ctx 整数> }`，网关按 `resolved.target` 匹配后**强制覆盖** Ollama 上游请求体里的 `options.num_ctx`，忽略客户端传入值；仅对 `type=="ollama"` 上游生效（LM Studio / OpenAI 兼容用 `max_tokens`，不受影响）。目的：避免同一模型因客户端传入不同 `num_ctx` 被 Ollama 反复新建实例、显存叠加
+- 实现：`config.py` 新增 `Config.num_ctx_overrides` 字段（Pydantic 校验 `dict[str,int]`）；`proxy.py` 在别名解析与参数注入之后、序列化之前执行钳制，覆盖时打印 `num_ctx clamped` 日志
+- 文档补齐（此前仅落代码、未补配置说明）：`data/example.config.json` 加入示例；README / README_CN 的「配置详解」新增 `num_ctx_overrides` 专节（键为真实模型名、值为固定 ctx、仅 Ollama 生效、支持热重载）；本条目同步记录
+
 ### 新增（构建 / 发布脚本）
 
 - `scripts/docker-build.bat`：构建 `bruce1977/llm-hub:latest` 与 `:<版本号>` 两个标签，版本号取自 `app/main.py` 的 `__version__`（可用参数覆盖：`docker-build.bat [镜像名] [版本号]`）；Docker 不可用时以错误码 1 直接退出

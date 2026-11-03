@@ -266,6 +266,28 @@ The final upstream is decided in this order:
 Requesting `qwen3.5:4b-nothink` replaces `model` with `qwen3.5:4b` and **force-overwrites** the
 request body with the fields in `params` (the alias wins on name collisions).
 
+### `num_ctx_overrides` — pin context length per model (avoid Ollama re-spawning)
+
+Ollama creates a **separate instance** for each "model + `options.num_ctx`" combination (the KV
+cache is pre-allocated up front). If clients keep sending different `num_ctx` values, the same model
+gets re-spawned repeatedly and VRAM stacks up. This mapping lets the gateway **clamp** the context
+length for specific models, ignoring any `num_ctx` the client sends:
+
+```json
+"num_ctx_overrides": {
+  "qwen3.6:35b-pruned": 65536,
+  "qwen3.5:9b": 16384
+}
+```
+
+- **Keys are real model names** (the resolved `resolved.target` after alias expansion — the actual `model` field forwarded upstream, i.e. what you see in `ollama list` / `/api/tags`). E.g. alias `fast` → `qwen3:4b`; to clamp it, use `qwen3:4b`.
+- **Values are fixed `num_ctx`** (integer, token count).
+- **Only applies to `type=="ollama"` upstreams.** LM Studio / OpenAI-compatible backends use `max_tokens` and don't recognize `num_ctx`, so they are unaffected.
+- Whatever the client sends, the value here wins; when an override is applied the gateway logs `num_ctx clamped`.
+- **Hot-reloaded**: takes effect on new requests ~1 second after editing, no gateway restart needed.
+
+> Example use: pin a large-context model (e.g. 35B-pruned) to 64K so a client can't blow up VRAM with a bigger ctx; or clamp small models to 8K to stop different clients from triggering repeated KV-cache re-allocation on Ollama.
+
 ## Integrating LM Studio
 
 LM Studio exposes an OpenAI-compatible API, and its model ids usually carry a publisher prefix and

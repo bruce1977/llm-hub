@@ -414,6 +414,12 @@ class Config(BaseModel):
     upstreams: list[UpstreamConfig] = Field(default_factory=list)
     default_upstream: str | None = None
     aliases: dict[str, AliasConfig] = Field(default_factory=dict)
+    # num_ctx 固化：按真实模型名（resolved.target）强制覆盖 Ollama 上游的 options.num_ctx，
+    # 忽略客户端请求里携带的 num_ctx。仅对 type=="ollama" 的 upstream 生效
+    # （LM Studio / OpenAI 兼容用 max_tokens，不认 num_ctx）。
+    # 目的：客户端无法控制上下文长度时，由网关统一钳制，避免同一模型因不同 ctx
+    # 被 Ollama 反复新建实例、显存叠加。例: {"qwen3.6:35b-pruned": 65536, "qwen3.5:9b": 16384}
+    num_ctx_overrides: dict[str, int] = Field(default_factory=dict)
     rerank: RerankConfig = Field(default_factory=RerankConfig)
     systemone: SystemOneConfig = Field(default_factory=SystemOneConfig)
     websearch: WebSearchConfig = Field(default_factory=WebSearchConfig)
