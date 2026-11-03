@@ -28,7 +28,8 @@
       ],
       "timeout": 600,
       "priority": 0,
-      "description": "Primary Ollama instance (GPU): keep the reranker here. qwen3-reranker:4b-rk is a num_ctx=8192 variant of qwen3-reranker:4b (see docs/Ranker.md) - same scores, ~4 GB VRAM instead of ~9.3 GB."
+      "vram_total_gb": 32.0,
+      "description": "Primary Ollama instance (GPU): keep the reranker here. qwen3-reranker:4b-rk is a num_ctx=8192 variant of qwen3-reranker:4b (see docs/Ranker.md) - same scores, ~4 GB VRAM instead of ~9.3 GB. vram_total_gb feeds the management console's VRAM gauge (not discoverable over the API)."
     },
     {
       "name": "ollama-ipex-llm",
@@ -39,6 +40,7 @@
       ],
       "timeout": 1800,
       "priority": 10,
+      "vram_total_gb": 16.0,
       "description": "Second Ollama instance (iGPU) - lower priority, used as fallback for overlapping models. Do NOT route the reranker here if this is the archived IPEX-LLM build (Ollama 0.9.3): it silently ignores 'logprobs'."
     },
     {
@@ -139,6 +141,9 @@
     "path": "v1/web-search",
     "api_key_env": "",
     "timeout": 300.0
+  },
+  "request_log": {
+    "enabled": true
   },
   "security": {
     "admin_endpoints": "deny",

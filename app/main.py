@@ -23,9 +23,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import hmac
 import httpx
 import uvicorn
+from admin_auth import require_admin
 from auth import (
     DOCS_PATHS,
     client_ip,
@@ -34,19 +34,16 @@ from auth import (
     ip_allowed,
     require_api_key,
 )
-from admin_auth import (
-    ADMIN_COOKIE_NAME,
-    ADMIN_SESSION_TTL,
-    create_admin_token,
-    get_admin_password,
-    require_admin,
-)
 from config import CONFIG_PATH, ConfigManager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from management import AdminLogin
+from management import login as admin_login
+from management import logout as admin_logout
+from management import router as management_router
 from proxy import ProxyService
+from request_log import RequestLog
 from rerank import RerankService
 from systemone import SystemOneService
 from websearch import WebSearchService
@@ -96,7 +93,9 @@ async def lifespan(app: FastAPI):
 
     app.state.manager = manager
     app.state.client = client
-    app.state.proxy = ProxyService(manager, client)
+    app.state.request_log = RequestLog()
+    await app.state.request_log.start()
+    app.state.proxy = ProxyService(manager, client, app.state.request_log)
     app.state.rerank = RerankService(manager, client)
     app.state.systemone = SystemOneService(manager, client)
     app.state.websearch = WebSearchService(manager, client)
@@ -134,6 +133,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await app.state.request_log.stop()
         await client.aclose()
         logger.info("LLM Hub stopped")
 
@@ -374,9 +374,15 @@ async def gateway_security_middleware(request: Request, call_next):
     if sec is not None:
         # 2. path regex allowlist (perimeter control) --------------------------
         # The admin console authenticates with its own password, so the perimeter
-        # allowlist must never lock it out -- exempt /admin (and the docs, which
-        # have their own allow_docs gate).
-        if not path.startswith("/admin") and sec.path_allowlist and not _path_allowed(path, sec.path_allowlist):
+        # allowlist must never lock it out -- exempt /admin and the management API
+        # (and the docs, which have their own allow_docs gate).
+        management_api = path.startswith("/v1/management")
+        if (
+            not path.startswith("/admin")
+            and not management_api
+            and sec.path_allowlist
+            and not _path_allowed(path, sec.path_allowlist)
+        ):
             logger.warning("Path not in allowlist: %s %s", method, path)
             return _deny(status.HTTP_403_FORBIDDEN, "Path not allowed.")
 
@@ -974,47 +980,29 @@ async def route_docs(request: Request):
 # --------------------------------------------------------------------------- #
 # Admin console authentication (single password from ADMIN_PASSWORD env var)
 # --------------------------------------------------------------------------- #
-class AdminLogin(BaseModel):
-    password: str
-
-
+# The canonical implementation lives in management.py alongside /v1/management/auth/*;
+# these legacy paths are kept for old bookmarks and behave identically.
 @app.post("/admin/login", include_in_schema=False, tags=["admin"])
-async def route_admin_login(request: Request, response: Response, body: AdminLogin):
+async def route_admin_login(request: Request, body: AdminLogin):
     """Validate the admin password and mint a signed session cookie."""
-    key = get_admin_password()
-    if not key:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Admin is not configured: set the ADMIN_PASSWORD environment variable.",
-        )
-    # Constant-time compare; a small delay blunts online brute-force.
-    if not hmac.compare_digest(body.password, key):
-        await asyncio.sleep(0.1)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin password.")
-    token = create_admin_token(key)
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        ADMIN_COOKIE_NAME,
-        token,
-        httponly=True,
-        samesite="lax",
-        max_age=ADMIN_SESSION_TTL,
-        secure=request.url.scheme == "https",
-    )
-    return resp
+    return await admin_login(request, body)
 
 
 @app.post("/admin/logout", include_in_schema=False, tags=["admin"])
 async def route_admin_logout():
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie(ADMIN_COOKIE_NAME)
-    return resp
+    return admin_logout()
 
 
 @app.get("/admin/ping", include_in_schema=False, tags=["admin"])
 async def route_admin_ping(_=Depends(require_admin)):
     """Liveness check for the admin session; 200 only with a valid admin auth."""
     return JSONResponse({"ok": True, "admin": True})
+
+
+# Management API for the web console: read-only dashboard, upstream probes,
+# config projections and request-log queries. Registered before the catch-all,
+# otherwise every /v1/management call would be proxied to an upstream.
+app.include_router(management_router)
 
 
 # --------------------------------------------------------------------------- #

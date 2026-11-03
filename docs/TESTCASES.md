@@ -1069,3 +1069,288 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 > 上游模型 id 用斜杠分隔（`opencode/big-pickle`），`upstreams[].models` 里的通配必须写成
 > `"opencode/*"`，`"opencode:*"` 匹配不到任何模型。
 
+
+---
+
+## 管理 API（Web 管理台）
+
+> 端点统一挂在 `/v1/management` 下（实现在 `app/management.py`），由 `ADMIN_PASSWORD` 单独鉴权，
+> 不占用 `GATEWAY_API_KEYS`。未设置 `ADMIN_PASSWORD` 时所有接口返回 **503**；凭据缺失或错误返回 **401**。
+> `/v1/management` 与 `/admin` 一样豁免 `security.path_allowlist`。
+
+### 测试 34: 登录、会话与鉴权方式
+
+```bash
+# 登录：校验密码并下发 HttpOnly 会话 Cookie（12 小时）
+curl -i -X POST http://localhost:8000/v1/management/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"password": "change-me"}'
+# HTTP/1.1 200 OK
+# Set-Cookie: llmhub_admin=<expiry>.<sig>; HttpOnly; SameSite=lax; Max-Age=43200
+# {"ok": true}
+
+# 会话心跳（管理台刷新页面时调用）
+curl http://localhost:8000/v1/management/auth/ping \
+  -H "Cookie: llmhub_admin=<expiry>.<sig>"
+# {"ok": true, "admin": true}
+
+# headless / 脚本：同样先登录，用 Cookie jar 访问（密码不是请求凭据）
+curl -c cookie.txt -X POST http://localhost:8000/v1/management/auth/login \
+  -H "Content-Type: application/json" -d '{"password": "change-me"}'
+curl -b cookie.txt http://localhost:8000/v1/management/overview
+
+# 登出：清除 Cookie
+curl -X POST http://localhost:8000/v1/management/auth/logout
+# {"ok": true}
+```
+
+**断言:**
+- 密码错误 -> `401`，且响应带约 100 ms 延迟（钝化在线暴力破解）
+- 未带 Cookie，或会话 token 被篡改、过期 -> `401`
+- 把密码或网关 API Key 放到 `Authorization: Bearer` / `X-API-Key` -> `401`（只认 Cookie）
+- 修改 `ADMIN_PASSWORD` 后旧会话立即失效（签名密钥即密码本身）
+- Cookie 为 HttpOnly + SameSite=Lax，仅在 HTTPS 下加 `Secure`
+- 未配置 `ADMIN_PASSWORD` -> 登录与所有受保护接口均为 `503`
+
+### 测试 35: 总览与上游探测
+
+```bash
+curl -b cookie.txt http://localhost:8000/v1/management/overview
+curl -b cookie.txt http://localhost:8000/v1/management/upstreams
+curl -b cookie.txt http://localhost:8000/v1/management/upstreams/ollama
+```
+
+**响应 (200 OK, 节选):**
+
+```json
+{
+  "kpi": {
+    "upstreams_online": 1,
+    "upstreams_total": 2,
+    "running_models": 2,
+    "vram_used_gib": 9.6,
+    "vram_total_gib": 32.0,
+    "requests_today": 128,
+    "p95_ms": 740,
+    "error_rate": 0.0234
+  },
+  "upstreams": [
+    {
+      "name": "ollama",
+      "type": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "status": "online",
+      "reachable": true,
+      "probe_ms": 3.2,
+      "loaded": 2,
+      "vram_used_gib": 9.6,
+      "vram_total_gib": 32.0,
+      "ps_supported": true,
+      "error": null
+    }
+  ],
+  "running_models": [
+    {
+      "model": "qwen3:8b",
+      "upstream": "ollama",
+      "device": "gpu",
+      "device_ratio": 1.0,
+      "num_ctx": 40960,
+      "size_gib": 5.2,
+      "vram_gib": 5.2,
+      "expires_at": "2026-11-03T12:30:00Z"
+    }
+  ],
+  "generated_at": "2026-11-03T12:00:00"
+}
+```
+
+**断言:**
+- `overview` 并行探测所有上游；单个上游不可达不影响整体，仍返回 `200`
+- 设备分类看 `size_vram / size`：`>= 0.999` -> `gpu`，`> 0` -> `partial`，`0` -> `cpu`
+- `num_ctx` 取 `/api/ps` 的 `context_length`，缺失时回退 `num_ctx_overrides`
+- 只有 `type: "ollama"` 会探测 `/api/ps`（`ps_supported: true`），其他类型只做健康检查
+- `vram_total_gib` 来自 `upstreams[].vram_total_gb`；所有上游都没配时为 `null`
+- `upstreams/{name}`：名字不存在 -> `404`；探测失败 -> `503` 且响应体带 `"unreachable": true`；
+  可达时额外返回 `models`（已安装模型）；模型列表拉取失败时带 `models_error`
+
+### 测试 36: 配置投影与凭据脱敏
+
+```bash
+curl -b cookie.txt http://localhost:8000/v1/management/models/llm
+curl -b cookie.txt http://localhost:8000/v1/management/models/rerank
+curl -b cookie.txt http://localhost:8000/v1/management/models/systemone
+```
+
+**断言:**
+- `models/llm`：`models[]`（`model`、`upstream`、`type`、`alias`、`num_ctx`、`wildcard`、`running`）、
+  `aliases[]`、`num_ctx_overrides`；通配条目 `qwen3:*` 原样展示并标 `wildcard: true`
+- `models/rerank`：`enabled`、`endpoint`、`mode`、`upstream_api`（`auto` / `generate` / `chat`）、
+  `on_error`（`score_zero` / `fail`）、`models[]`、`scoring`、`limits`，外加可直接复制的
+  `request_example` / `response_example`
+- `models/systemone`：`backend`、`path`、`linked_model`、`api_key_env`、`timeout` 及请求示例
+- 任何投影都不回显明文凭据：上游 / rerank / systemone 的 Key 显示为 `••••••`，环境变量缺失时为 `null`
+- 这些接口均为 GET 只读投影，不提供写操作
+
+### 测试 37: 请求日志查询与详情
+
+```bash
+# 最近记录（默认 page=1、page_size=15）
+curl -b cookie.txt "http://localhost:8000/v1/management/requests"
+
+# 组合筛选（时间 + 上游 + 模型 + 状态档位 + 路径）
+curl -b cookie.txt "http://localhost:8000/v1/management/requests?start=2026-11-03T00:00:00&end=2026-11-03T23:59:59&upstream=ollama&model=qwen3:8b&status=5xx&path=/v1/chat/completions&page=2&page_size=50"
+
+# 单条详情（含请求体 / 响应体）
+curl -b cookie.txt "http://localhost:8000/v1/management/requests/42"
+```
+
+**响应 (200 OK):**
+
+```json
+{
+  "stats": {"count": 2, "p50_ms": 1180, "p95_ms": 2400, "p99_ms": 2400, "error_rate": 0.5},
+  "rows": [
+    {"id": 42, "ts": "2026-11-03T12:02:11", "ts_end": "2026-11-03T12:02:13", "method": "POST",
+     "path": "/v1/chat/completions", "query": null, "requested_model": "q35", "model": "qwen3:8b",
+     "upstream": "ollama", "status": 200, "duration_ms": 2400, "ttfb_ms": 210, "stream": 1, "tokens": 12}
+  ],
+  "pagination": {"page": 1, "page_size": 15, "total": 2, "pages": 1},
+  "request_log": {"enabled": true, "db": "/data/llmhub.db", "retention_days": 30, "dropped": 0}
+}
+```
+
+**断言:**
+- 每笔经网关的请求都会落库：方法、路径、模型、上游、状态码、耗时、TTFT、是否流式、token 数、
+  请求/响应大小、客户端 IP、错误信息；流式请求在流结束后落库
+- `status` 只接受档位 `2xx` / `3xx` / `4xx` / `5xx`（传具体数字 -> `400`）
+- `page < 1`、`page_size` 不在 `1..200`、`status` 非法 -> `400`；时间戳非法或 `start > end` -> `400`
+- 记录不存在 -> `404`
+- 请求/响应体各截断到 8 KB，并用 `request_body_truncated` / `response_body_truncated` 标记；
+  `api_key`、`authorization`、`password` 等字段递归替换为 `***`
+
+### 测试 38: 统计、分布与失败归因
+
+```bash
+curl -b cookie.txt "http://localhost:8000/v1/management/stats/timeseries?bucket=hour&start=2026-11-03T00:00:00&end=2026-11-03T23:59:59"
+curl -b cookie.txt "http://localhost:8000/v1/management/stats/distribution?group_by=upstream"
+curl -b cookie.txt "http://localhost:8000/v1/management/stats/failures?start=2026-11-03T00:00:00&end=2026-11-03T23:59:59"
+```
+
+**响应 (200 OK, 节选):**
+
+```json
+{
+  "bucket": "hour",
+  "start": "2026-11-03T00:00:00",
+  "end": "2026-11-03T23:59:59",
+  "points": [{"ts": "2026-11-03T12:00", "count": 18, "errors": 1, "p95": 2400}]
+}
+```
+
+```json
+{
+  "group_by": "upstream",
+  "start": "2026-11-02T12:00:00",
+  "end": "2026-11-03T12:00:00",
+  "items": [{"key": "ollama", "count": 14}, {"key": "lmstudio", "count": 5}, {"key": "-", "count": 1}]
+}
+```
+
+```json
+{
+  "total": 20,
+  "ok": 19,
+  "error_rate": 0.05,
+  "by_code": {"502": 1},
+  "by_upstream": {"ollama": 1},
+  "samples": [{"ts": "2026-11-03T12:02:11", "path": "/v1/chat/completions",
+               "model": "qwen3:8b", "upstream": "ollama", "status": 502, "duration_ms": 30}]
+}
+```
+
+**断言:**
+- `bucket` 只接受 `hour` / `day`（其他 -> `400`）；`start` / `end` 缺省为最近 24 小时
+- 时间桶格式：`hour` 为 `YYYY-MM-DDTHH:00`，`day` 为 `YYYY-MM-DD`
+- P95 为**桶内**分位数（窗口函数），不是整段时间的全局值
+- `distribution` 的 `group_by` 只接受 `upstream` / `model` / `status`（其他 -> `400`），按 `count` 倒序返回
+- `group_by=status` 只分两桶：`ok`（`status < 400`）与 `error`（`status >= 400`）
+- 未命中上游的行（被拦截 403 / 过大 413 / 无可用上游 404）在 `upstream`、`model` 分组里计入 `-`，
+  因此 `items` 相加恒等于同期 `/requests` 的 `pagination.total`
+- `failures` 只统计 `status >= 400` 的请求，按状态码与上游聚合，另附最近 20 条样本
+- 数据存于同一 SQLite 库（默认 `llmhub.db`，可用 `REQUEST_LOG_DB` 覆盖），
+  `REQUEST_LOG_RETENTION_DAYS` 控制保留天数（`0` = 永久，默认 30 天，按小时清理）
+
+### 测试 39: 明细字段与入库开关
+
+`requests` 表逐笔记录三段信息（时间 / 请求参数 / 响应结果）：
+
+| 分组 | 字段 |
+|------|------|
+| 时间 | `ts` 到达、`ts_end` 完成（流式在流关闭时写入）、`duration_ms`、`ttfb_ms`；`ts`/`ts_end` 精确到秒，亚秒耗时以 `duration_ms` 为准 |
+| 请求 | `method`、`path`、`query`、`requested_model`（客户端写的名字）、`model`（别名解析后）、`request_body`、`req_size`、`stream`、`client_ip` |
+| 结果 | `status`、`upstream`、`response_body`、`res_size`、`tokens`、`error` |
+
+```bash
+# 别名调用的详情：requested_model 保留别名，model 是解析后的真实模型
+curl -b cookie.txt "http://localhost:8000/v1/management/requests/<id>"
+# {"requested_model": "q35", "model": "qwen3:8b", "ts_end": "...", "query": null, ...}
+
+# GET 带查询串时，path 与 query 分开存
+curl -b cookie.txt "http://localhost:8000/api/version?format=json" -H "Authorization: Bearer <API_KEY>"
+curl -b cookie.txt "http://localhost:8000/v1/management/requests/<id>"   # "query": "format=json"
+```
+
+> 无 `model` 的 GET 无法路由，网关回 `404` 且 `error` 写明原因，但这一行**仍会入库**
+> （本地 Ollama 实测：`status=404`、`requested_model=null`、`query="format=json&verbose=1"`）。
+
+**入库开关（`config.json` -> `request_log.enabled`，默认 `true`，逐请求读取）:**
+
+```bash
+# 关闭：把 "request_log": {"enabled": false} 写进 config.json 并保存
+# 配置的 mtime 每秒最多比对一次，等约 1 秒再验证下一条请求
+curl -b cookie.txt http://localhost:8000/v1/management/overview
+# {"request_log": {"enabled": false, "db": "/data/llmhub.db", "retention_days": 30, "dropped": 0}, ...}
+```
+
+**断言:**
+- 关闭后请求照常转发（仍返回 `200`），但明细总数不再增加，请求体也不再采集
+- `/overview` 与 `/requests` 的 `request_log.enabled` 同步回报 `false`，前端可提示「日志已停用」
+- 改回 `true` 后，越过约 1 秒的热加载窗口，下一条请求即入库（无需重启容器）
+- 自动化用例里直接调用 `ConfigManager.reload()` 跳过该窗口；对真实服务需等待或先发一次探测请求
+- 旧版本留下的 `llmhub.db` 在启动时自动 `ALTER TABLE ADD COLUMN` 补上新列，历史行不受影响
+
+### 测试 40: Web Search 配置投影
+
+```bash
+curl -b cookie.txt http://localhost:8000/v1/management/tools/websearch
+```
+
+**响应 (200 OK):**
+
+```json
+{
+  "enabled": true,
+  "endpoint": "/v1/tools/web-search",
+  "upstream": "opencode",
+  "upstream_type": "opencode",
+  "path": "v1/web-search",
+  "base_url": "https://api.opencode.ai",
+  "api_key_env": "OPENCODE_API_KEY",
+  "api_key": "••••••",
+  "timeout": 300.0,
+  "provider_configured": true
+}
+```
+
+**断言:**
+- `upstream` / `base_url` / `upstream_type` 由 `Config.websearch_upstream_obj()` 解析：
+  `websearch.upstream` 显式点名时用该上游，留空时取第一个 `type: "opencode"` 上游——
+  投影与真实转发共用同一个解析器，管理台不会显示网关其实不会调的地址
+- `endpoint` 固定为 `/v1/tools/web-search`（对外路径不可配置），`path` 才是提供方侧的路径
+- `api_key` 只在 `api_key_env` 命名的环境变量确有值时返回掩码 `••••••`，缺失时为 `null`；
+  响应里永不出现密钥明文，`api_key_env` 只回显变量名
+- 点名了不存在的上游，或配置里根本没有 `opencode` 上游：`provider_configured: false`、
+  `base_url` / `upstream_type` 为 `null`（前者 `upstream` 保留配置的名字），实际调用会返回 **503**
+- `enabled: false` 时投影照常返回配置（前端据此提示「联网检索已停用」），实际调用返回 **404**
+- 与其他 `/v1/management/*` 一样是只读 GET，只认管理台会话 Cookie

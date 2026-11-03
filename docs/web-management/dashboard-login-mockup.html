@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>llm-hub 管理台 · 登录（风格稿）</title>
+<style>
+  :root{
+    --page:#0b0e13; --surface:#161a22; --surface-2:#1e2430; --surface-3:#232a38;
+    --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.14);
+    --text:#e6e8ec; --text-dim:#8b95a5; --text-mute:#5d6675;
+    --accent:#4f8cff; --accent-soft:rgba(79,140,255,.16);
+    --green:#3fb950; --amber:#d29922; --red:#f85149; --grid:rgba(255,255,255,.06);
+    --radius:12px; --radius-sm:8px;
+    color-scheme:dark;
+  }
+  [data-theme="light"]{
+    --page:#eaeef4; --surface:#ffffff; --surface-2:#f4f6fa; --surface-3:#eef1f6;
+    --border:rgba(15,23,42,.10); --border-strong:rgba(15,23,42,.16);
+    --text:#1b2230; --text-dim:#5b6675; --text-mute:#8a94a3;
+    --accent:#2563eb; --accent-soft:rgba(37,99,235,.12);
+    --green:#1a9e4b; --amber:#b8791b; --red:#d83a3a; --grid:rgba(15,23,42,.08);
+    color-scheme:light;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:var(--page); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+    font-size:13px; line-height:1.5; padding:24px;
+    -webkit-font-smoothing:antialiased; position:relative;
+  }
+
+  /* theme toggle (top-right floating) */
+  .theme-toggle{
+    position:fixed; top:20px; right:22px; z-index:10;
+    border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text-dim);
+    border-radius:8px; padding:7px 12px; cursor:pointer; font-size:12px; display:flex; gap:6px; align-items:center;
+  }
+  .theme-toggle:hover{color:var(--text); border-color:var(--accent);}
+
+  /* login card */
+  .login-wrap{width:392px; max-width:100%;}
+  .login-card{
+    background:var(--surface-2); border:1px solid var(--border); border-radius:16px;
+    padding:30px 30px 26px; box-shadow:0 1px 0 rgba(255,255,255,.03) inset;
+  }
+  .brand{display:flex; align-items:center; gap:11px; margin-bottom:22px;}
+  .brand .logo{
+    width:38px; height:38px; border-radius:10px; flex:0 0 38px;
+    background:linear-gradient(135deg,var(--accent),#7b5cff);
+    display:flex; align-items:center; justify-content:center; font-weight:700; color:#fff; font-size:19px;
+  }
+  .brand .name{font-weight:700; font-size:18px; letter-spacing:.3px;}
+  .brand .ver{font-size:11px; color:var(--text-mute); margin-top:1px;}
+
+  .title{font-size:19px; font-weight:700; margin:0 0 5px;}
+  .subtitle{font-size:12.5px; color:var(--text-dim); margin:0 0 20px; display:flex; align-items:center; gap:8px;}
+  .tag{font-size:10.5px; font-weight:600; color:var(--text-mute); border:1px solid var(--border); padding:1px 7px; border-radius:6px;}
+
+  .field{display:flex; flex-direction:column; gap:6px; margin-bottom:14px;}
+  .field label{font-size:11.5px; color:var(--text-dim);}
+  .pw-wrap{position:relative;}
+  .inp{
+    width:100%; background:var(--surface); color:var(--text); border:1px solid var(--border-strong);
+    border-radius:8px; padding:10px 38px 10px 11px; font-size:13px; font-family:inherit; color-scheme:dark;
+  }
+  .inp:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft);}
+  .pw-eye{
+    position:absolute; right:8px; top:50%; transform:translateY(-50%);
+    border:none; background:transparent; color:var(--text-mute); cursor:pointer; font-size:14px; padding:4px;
+  }
+  .pw-eye:hover{color:var(--text);}
+
+  .btn-primary{
+    width:100%; border:none; background:var(--accent); color:#fff; border-radius:8px;
+    padding:11px; font-size:13.5px; font-weight:700; cursor:pointer; margin-top:2px; transition:background .15s;
+  }
+  .btn-primary:hover{background:#3f7bf0;}
+
+  .err{
+    display:none; align-items:center; gap:8px; background:rgba(248,81,73,.12); border:1px solid rgba(248,81,73,.4);
+    color:var(--red); border-radius:8px; padding:9px 11px; font-size:12px; margin-bottom:14px;
+  }
+  .err.show{display:flex;}
+
+  .hint{font-size:11.5px; color:var(--text-mute); margin-top:16px; line-height:1.6;}
+  .hint code{font-family:ui-monospace,monospace; color:var(--text-dim); background:var(--surface-3); padding:1px 5px; border-radius:5px;}
+
+  .foot{font-size:11px; color:var(--text-mute); text-align:center; margin-top:18px;}
+
+  /* locked (503) state card */
+  .locked-card{display:none; text-align:center; padding:14px 6px;}
+  .locked-card .ico{font-size:40px; margin-bottom:10px;}
+  .locked-card .t{font-size:17px; font-weight:700; margin-bottom:6px;}
+  .locked-card .d{font-size:12.5px; color:var(--text-dim); max-width:300px; margin:0 auto 14px;}
+  .locked-card .code{display:inline-block; font-family:ui-monospace,monospace; color:var(--amber); background:var(--surface-3); padding:4px 10px; border-radius:7px; font-size:12px;}
+
+  .alt{margin-top:14px; text-align:center; font-size:11.5px; color:var(--text-mute);}
+  .alt a{color:var(--accent); cursor:pointer; font-weight:600;}
+  .alt a:hover{text-decoration:underline;}
+</style>
+</head>
+<body>
+  <button class="theme-toggle" id="themeBtn" onclick="toggleTheme()">
+    <span id="themeIco">☀</span><span id="themeTxt">浅色</span>
+  </button>
+
+  <div class="login-wrap">
+    <!-- ===== normal login card ===== -->
+    <div class="login-card" id="loginCard">
+      <div class="brand">
+        <div class="logo">L</div>
+        <div>
+          <div class="name">llm-hub</div>
+          <div class="ver">v1.2.0 · 管理台</div>
+        </div>
+      </div>
+
+      <div class="title">管理员登录</div>
+      <div class="subtitle">只读管理台 <span class="tag">只读视图</span></div>
+
+      <div class="err" id="errBox"><span>⚠</span><span id="errMsg">密码错误，请重试</span></div>
+
+      <div class="field">
+        <label for="pw">管理员密码（ADMIN_PASSWORD）</label>
+        <div class="pw-wrap">
+          <input class="inp" id="pw" type="password" placeholder="请输入管理台密码" autocomplete="off" />
+          <button class="pw-eye" type="button" onclick="togglePw()" title="显示/隐藏">👁</button>
+        </div>
+      </div>
+
+      <button class="btn-primary" onclick="doLogin()">登 录</button>
+
+      <div class="hint">
+        管理台鉴权仅依赖环境变量 <code>ADMIN_PASSWORD</code>，不写入 <code>config.json</code>。<br>
+        登录后凭 12h HttpOnly 会话 Cookie 访问管理接口；<code>Bearer</code> / <code>X-API-Key</code> 仅用于网关 API Key。
+      </div>
+
+      <div class="alt"><a onclick="showLocked()">预览：未配置状态</a></div>
+    </div>
+
+    <!-- ===== locked (503) state ===== -->
+    <div class="login-card locked-card" id="lockedCard">
+      <div class="ico">🔒</div>
+      <div class="t">管理台未启用</div>
+      <div class="d">当前未设置环境变量 <code style="color:var(--text-dim)">ADMIN_PASSWORD</code>，管理台处于锁定状态，任何访问均返回 503。</div>
+      <div class="code">HTTP 503 · Service Unavailable</div>
+      <div class="alt"><a onclick="showLogin()">返回登录</a></div>
+    </div>
+  </div>
+
+  <div class="foot">llm-hub 管理台 · 登录页风格稿（非最终产品，纯静态预览）</div>
+
+  <script>
+    function toggleTheme(){
+      var h = document.documentElement;
+      var next = h.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      h.setAttribute('data-theme', next);
+      document.getElementById('themeIco').textContent = next === 'dark' ? '☀' : '☾';
+      document.getElementById('themeTxt').textContent = next === 'dark' ? '浅色' : '深色';
+    }
+    function togglePw(){
+      var p = document.getElementById('pw');
+      p.type = p.type === 'password' ? 'text' : 'password';
+    }
+    function doLogin(){
+      var v = document.getElementById('pw').value;
+      var box = document.getElementById('errBox');
+      // 风格稿：仅演示错误态，留空或任意值都提示「密码错误」（真实接口校验 ADMIN_PASSWORD）
+      box.classList.add('show');
+      document.getElementById('pw').focus();
+    }
+    function showLocked(){ document.getElementById('loginCard').style.display='none'; document.getElementById('lockedCard').style.display='block'; }
+    function showLogin(){ document.getElementById('lockedCard').style.display='none'; document.getElementById('loginCard').style.display='block'; document.getElementById('errBox').classList.remove('show'); }
+    // 回车提交（演示）
+    document.getElementById('pw').addEventListener('keydown', function(e){ if(e.key==='Enter') doLogin(); });
+  </script>
+</body>
+</html>

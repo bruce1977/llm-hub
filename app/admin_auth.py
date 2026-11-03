@@ -2,9 +2,10 @@
 Admin authentication for the (future) web management console.
 
 A single admin password is supplied via the ``ADMIN_PASSWORD`` environment variable
--- there is no config.json entry for it. A successful login mints a short-lived,
-HMAC-signed session cookie; protected admin routes depend on ``require_admin``. The
-same password also works as a ``Bearer`` / ``X-API-Key`` token for headless/API use.
+-- there is no config.json entry for it. The password is only accepted by the login
+endpoint: a successful login mints a short-lived, HMAC-signed session cookie, and
+protected admin routes depend on ``require_admin``, which accepts that cookie alone.
+``Bearer`` / ``X-API-Key`` belong to the gateway API keys and are not admin credentials.
 
 Design notes:
   * No external dependencies. The session token is ``<expiry>.<signature>`` where the
@@ -22,15 +23,14 @@ import hashlib
 import hmac
 import os
 import time
-from typing import Optional
 
-from fastapi import Cookie, HTTPException, Request, Response, status
+from fastapi import Cookie, HTTPException, status
 
 ADMIN_COOKIE_NAME = "llmhub_admin"
 ADMIN_SESSION_TTL = 12 * 3600  # seconds (12h)
 
 
-def get_admin_password() -> Optional[str]:
+def get_admin_password() -> str | None:
     """Return the configured admin password, or None when not set (admin disabled)."""
     pw = (os.getenv("ADMIN_PASSWORD") or "").strip()
     return pw or None
@@ -45,7 +45,7 @@ def create_admin_token(key: str) -> str:
     return f"{expiry}.{_sign(expiry, key)}"
 
 
-def verify_admin_token(token: Optional[str], key: str) -> bool:
+def verify_admin_token(token: str | None, key: str) -> bool:
     if not token or "." not in token:
         return False
     expiry_str, sig = token.rsplit(".", 1)
@@ -58,23 +58,15 @@ def verify_admin_token(token: Optional[str], key: str) -> bool:
     return expiry > int(time.time())
 
 
-def _password_from_request(request: Request) -> Optional[str]:
-    """Reuse the gateway's header extraction so the admin password can be passed as
-    ``Authorization: Bearer <pw>`` or ``X-API-Key: <pw>`` (headless/API use)."""
-    from auth import extract_api_key  # local import avoids a circular import at module load
-
-    return extract_api_key(request)
-
-
 async def require_admin(
-    request: Request,
-    admin_cookie: Optional[str] = Cookie(default=None, alias=ADMIN_COOKIE_NAME),
+    admin_cookie: str | None = Cookie(default=None, alias=ADMIN_COOKIE_NAME),
 ) -> None:
     """FastAPI dependency that gates admin routes.
 
-    Accepts either the signed session cookie or the admin password presented as a
-    Bearer / X-API-Key token. Raises 503 when admin is not configured (no
-    ADMIN_PASSWORD), 401 when authentication is missing or invalid.
+    Accepts only the signed session cookie minted by the login endpoint: the admin
+    password itself is not a request credential, so ``Bearer`` / ``X-API-Key`` are
+    ignored here. Raises 503 when admin is not configured (no ADMIN_PASSWORD), 401
+    when the session is missing or invalid.
     """
     key = get_admin_password()
     if not key:
@@ -84,11 +76,7 @@ async def require_admin(
         )
     if verify_admin_token(admin_cookie, key):
         return
-    presented = _password_from_request(request)
-    if presented and hmac.compare_digest(presented, key):
-        return
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Admin authentication required.",
-        headers={"WWW-Authenticate": "Bearer"},
     )

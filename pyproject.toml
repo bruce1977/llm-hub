@@ -46,6 +46,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "T20", "S110"]
 "app/main.py" = ["T20", "B008"]
+# SQL is assembled from code-controlled fragments only; every value is bound as a parameter.
+"app/request_log.py" = ["S608"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]

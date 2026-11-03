@@ -18,6 +18,7 @@
   - [文本补全](#文本补全)
   - [嵌入向量](#嵌入向量)
   - [模型管理](#模型管理)
+  - [管理 API（Web 管理台）](#管理-apiweb-管理台)
 - [流式响应](#流式响应)
 - [错误响应](#错误响应)
 - [别名参数注入](#别名参数注入)
@@ -831,6 +832,105 @@ curl http://localhost:8888/api/pull \
   -H "Content-Type: application/json" \
   -d '{"name": "llama3"}'
 ```
+
+---
+
+### 管理 API（Web 管理台）
+
+Web 管理台使用的只读接口，统一挂在 `/v1/management` 前缀下（实现在
+`app/management.py`，请求明细由 `app/request_log.py` 落库）。除登录/登出外，
+除登录/登出外全部接口都要求 **管理员会话**（由环境变量 `ADMIN_PASSWORD` 登录换取），
+与网关的 API Key 是两套独立认证。
+
+**认证方式：**
+
+```bash
+# 登录换取 12 小时 HttpOnly 会话 Cookie，之后所有请求靠 Cookie 认证
+curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
+  -H "Content-Type: application/json" -d '{"password": "your-admin-password"}'
+
+curl -b cookie.txt http://localhost:8888/v1/management/overview
+```
+
+`ADMIN_PASSWORD` 只用于登录页换取会话，不是请求凭据：`Authorization: Bearer` /
+`X-API-Key` 属于网关 API Key，传给管理接口一律 **401**。headless 调用同样先登录、
+再用 Cookie jar（如上面的 `-c` / `-b`）。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/v1/management/auth/login` | Body `{"password": "..."}`；成功 `200` 并下发 Cookie，密码错误 `401` |
+| `POST` | `/v1/management/auth/logout` | 清除会话 Cookie |
+| `GET` | `/v1/management/auth/ping` | 受保护心跳，返回 `{"ok": true, "admin": true}` |
+| `GET` | `/v1/management/overview` | KPI、上游摘要、运行中模型（含 GPU/部分/CPU 判定）、`request_log` 开关与库信息 |
+| `GET` | `/v1/management/upstreams` | 上游实例列表（状态 / 已加载数 / 显存 / 探测延迟） |
+| `GET` | `/v1/management/upstreams/{name}` | 单实例详情：`/api/ps` 运行中模型 + `/api/tags` 已装模型；不可达返回 `503` 且带 `"unreachable": true` |
+| `GET` | `/v1/management/models/llm` | 模型 / 别名 / `num_ctx_overrides` 只读投影 |
+| `GET` | `/v1/management/models/rerank` | Rerank 配置投影（`api_key` 一律掩码为 `••••••`），含 `upstream_api` / `on_error` 与请求/响应示例 |
+| `GET` | `/v1/management/models/systemone` | System One 配置投影（同样掩码），含请求/SSE 示例 |
+| `GET` | `/v1/management/tools/websearch` | Web Search 配置投影：`enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url`（由 provider upstream 派生）/ `api_key_env` / `api_key`（掩码）/ `timeout` / `provider_configured` |
+| `GET` | `/v1/management/requests` | 请求明细：`start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`，返回 `stats` + `rows` + `pagination` + `request_log`（开关状态） |
+| `GET` | `/v1/management/requests/{id}` | 单条明细（含截断至 8 KB 的请求/响应体，敏感字段已脱敏） |
+| `GET` | `/v1/management/stats/timeseries` | 时序聚合：`bucket=hour\|day`，每桶 `count` / `errors` / `p95` |
+| `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count}]}`；`status` 只分 `ok`(<400) / `error`(≥400)，未命中上游的行计入 `-` |
+| `GET` | `/v1/management/stats/failures` | 失败统计：`by_code` / `by_upstream` / `samples` |
+
+**状态码：**
+
+| 码 | 场景 |
+|----|------|
+| `200` | 正常 |
+| `400` | 时间格式非法、`start > end`、`page`/`page_size`/`status`/`bucket`/`group_by` 取值非法 |
+| `401` | 未携带有效会话 Cookie，或登录密码错误 |
+| `404` | `upstream` 名称或请求记录 `id` 不存在 |
+| `503` | 未配置 `ADMIN_PASSWORD`；或探测的上游不可达（`upstreams/{name}`） |
+
+**分布与配置投影示例：**
+
+```json
+// GET /v1/management/stats/distribution?group_by=upstream
+{ "group_by": "upstream", "start": "2026-11-02T05:00:00", "end": "2026-11-03T05:00:00",
+  "items": [ { "key": "ollama-gpu", "count": 642 },
+             { "key": "lmstudio", "count": 380 },
+             { "key": "-", "count": 12 } ] }
+
+// group_by=status 只有两个键：ok（status < 400）与 error（status >= 400）
+
+// GET /v1/management/tools/websearch
+{ "enabled": true, "endpoint": "/v1/tools/web-search", "upstream": "opencode",
+  "upstream_type": "opencode", "path": "v1/web-search",
+  "base_url": "http://vm.gateway:11430", "api_key_env": "OPENCODE_API_KEY",
+  "api_key": "••••••", "timeout": 300.0, "provider_configured": true }
+```
+
+`base_url` / `upstream_type` 由 `websearch.upstream`（未指名时取第一个 `type: "opencode"` 上游）派生，
+与 `WebSearchService` 的路径解析用的是同一函数 `Config.websearch_upstream_obj()`；
+`api_key` 只回报 `websearch.api_key_env` 所指环境变量是否已设置，值永远不外泄。
+
+**请求日志（SQLite）：**
+
+每笔请求在 `requests` 表中占一行，字段覆盖请求参数、耗时与响应结果：
+
+| 分类 | 字段 |
+|------|------|
+| 时间 | `ts`（到达）、`ts_end`（完成，流式在流关闭时写入）、`duration_ms`、`ttfb_ms`；`ts`/`ts_end` 精确到秒，亚秒耗时看 `duration_ms` |
+| 请求 | `method`、`path`、`query`、`requested_model`（客户端写的名字）、`model`（别名解析后）、`request_body`、`req_size`、`stream`、`client_ip` |
+| 结果 | `status`、`upstream`、`response_body`、`res_size`、`tokens`、`error` |
+| 标记 | `request_body_truncated`、`response_body_truncated` |
+
+- **入库开关**：`config.json` 的 `request_log.enabled`（默认 `true`）逐请求读取，无需重启。
+  关掉后代理不再采集请求/响应体、也不写库，`/overview` 与 `/requests` 里的
+  `request_log.enabled` 会回报 `false`；改回 `true` 即恢复记录。
+  配置热加载每秒最多比对一次文件 mtime，所以开关在**约 1 秒内**生效（已实测）。
+  数据库路径与保留天数仍由环境变量决定。
+- 默认写入 `config.json` 同级目录的 `llmhub.db`（容器内即 `/data/llmhub.db`），WAL 模式；
+  可用 `REQUEST_LOG_DB` 覆盖路径、`REQUEST_LOG_RETENTION_DAYS`（默认 30，0 表示永久保留）控制清理。
+- 旧库自动升级：启动时比对 `PRAGMA table_info(requests)`，缺失的列用 `ALTER TABLE ADD COLUMN` 补齐。
+- 写入通过有界内存队列异步批量落盘，不阻塞转发主链路；队列满时丢弃并告警。
+- 请求/响应体截断至 8 KB，`authorization`、`api_key`、`token`、`password` 等字段在落库前替换为 `***`。
+
+**网关边界：** `/v1/management` 与 `/admin` 一样不受 `security.path_allowlist` 限制（它使用
+独立的会话认证），但仍受 HTTP 方法白名单、客户端 IP 白名单与速率限制约束。管理台只读，
+不提供任何修改 `config.json` 的写接口。
 
 ---
 

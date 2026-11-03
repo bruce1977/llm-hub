@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>llm-hub 管理台 · 全页面风格稿</title>
+<style>
+  :root{
+    --page:#0b0e13; --surface:#161a22; --surface-2:#1e2430; --surface-3:#232a38;
+    --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.14);
+    --text:#e6e8ec; --text-dim:#8b95a5; --text-mute:#5d6675;
+    --accent:#4f8cff; --accent-soft:rgba(79,140,255,.16);
+    --green:#3fb950; --amber:#d29922; --red:#f85149; --grid:rgba(255,255,255,.06);
+    --violet:#a371f7;
+    --radius:12px; --radius-sm:8px;
+    color-scheme:dark;
+  }
+  [data-theme="light"]{
+    --page:#eaeef4; --surface:#ffffff; --surface-2:#f4f6fa; --surface-3:#eef1f6;
+    --border:rgba(15,23,42,.10); --border-strong:rgba(15,23,42,.16);
+    --text:#1b2230; --text-dim:#5b6675; --text-mute:#8a94a3;
+    --accent:#2563eb; --accent-soft:rgba(37,99,235,.12);
+    --green:#1a9e4b; --amber:#b8791b; --red:#d83a3a; --grid:rgba(15,23,42,.08);
+    --violet:#7c3aed;
+    color-scheme:light;
+  }
+  *{box-sizing:border-box;}
+  /* 始终预留滚动条槽位：避免各页面内容高度不同导致滚动条出现/消失，
+     使中间容器宽度来回跳动（Requests 内容高、Dashboard 内容矮） */
+  html{scrollbar-gutter:stable; overflow-y:scroll;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--page);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+    font-size:13px; line-height:1.5;
+    padding:24px; /* 四周留白，不撑满屏幕 */
+    -webkit-font-smoothing:antialiased;
+  }
+  .app{
+    position:relative;
+    width:1180px; max-width:100%; margin:0 auto;
+    display:flex; background:var(--surface);
+    border:1px solid var(--border); border-radius:14px; overflow:hidden;
+  }
+
+  /* ---------- sidebar ---------- */
+  .sidebar{
+    width:210px; flex:0 0 210px; background:var(--surface-2);
+    border-right:1px solid var(--border); padding:18px 14px;
+    display:flex; flex-direction:column; gap:4px;
+  }
+  .brand{display:flex; align-items:center; gap:9px; padding:4px 8px 14px;}
+  .brand .logo{
+    width:30px; height:30px; border-radius:8px; flex:0 0 30px;
+    background:linear-gradient(135deg,var(--accent),#7b5cff);
+    display:flex; align-items:center; justify-content:center;
+    font-weight:700; color:#fff; font-size:15px;
+  }
+  .brand .name{font-weight:700; font-size:15px; letter-spacing:.3px;}
+  .brand .ver{font-size:11px; color:var(--text-mute); margin-top:1px;}
+  .nav-label{font-size:10.5px; color:var(--text-mute); text-transform:uppercase; letter-spacing:.6px; padding:14px 8px 4px;}
+  .nav-item{
+    display:flex; align-items:center; gap:9px; padding:8px 9px;
+    border-radius:var(--radius-sm); color:var(--text-dim); cursor:pointer;
+    font-weight:500; user-select:none;
+  }
+  .nav-item:hover{background:var(--surface-3); color:var(--text);}
+  .nav-item.active{background:var(--accent-soft); color:var(--accent); font-weight:600;}
+  .nav-item .ico{width:16px; text-align:center; opacity:.9;}
+  .nav-sub{padding-left:14px;}
+  .nav-item.soon{opacity:.45; cursor:not-allowed;}
+  .nav-item.soon::after{content:"soon"; font-size:9px; margin-left:auto; color:var(--text-mute); border:1px solid var(--border-strong); padding:1px 5px; border-radius:6px;}
+  .sidebar .spacer{flex:1;}
+  .user{display:flex; align-items:center; gap:9px; padding:9px 8px; border-top:1px solid var(--border);}
+  .user .av{width:28px; height:28px; border-radius:50%; background:var(--surface-3); display:flex; align-items:center; justify-content:center; font-size:12px; color:var(--text-dim);}
+  .user .un{font-size:12px;} .user .rl{font-size:10.5px; color:var(--text-mute);}
+
+  /* ---------- content ---------- */
+  .content{flex:1; min-width:0; padding:22px 24px; display:flex; flex-direction:column; gap:18px;}
+  .topbar{display:flex; align-items:flex-end; justify-content:space-between;}
+  .topbar h1{font-size:20px; margin:0 0 3px; font-weight:700;}
+  .topbar .sub{font-size:12px; color:var(--text-dim); display:flex; align-items:center; gap:8px;}
+  .topbar .actions{display:flex; align-items:center; gap:10px;}
+  .refresh{font-size:11.5px; color:var(--text-mute);}
+  .toggle{
+    border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text-dim);
+    border-radius:8px; padding:6px 11px; cursor:pointer; font-size:12px; display:flex; gap:6px; align-items:center;
+  }
+  .toggle:hover{color:var(--text); border-color:var(--accent);}
+
+  /* ---------- sidebar collapse ---------- */
+  .sidebar{transition:width .22s ease, flex-basis .22s ease, opacity .22s ease, padding .22s ease;}
+  .app.collapsed .sidebar{width:0; flex-basis:0; padding-left:0; padding-right:0; opacity:0; border-right:none; overflow:hidden;}
+  .collapse-btn{margin-left:auto; border:1px solid var(--border-strong); background:var(--surface-3); color:var(--text-dim); cursor:pointer; font-size:16px; line-height:1; padding:4px 9px; border-radius:8px; transition:background .15s,color .15s,border-color .15s;}
+  .collapse-btn:hover{color:#fff; background:var(--accent); border-color:var(--accent);}
+  .restore-btn{position:absolute; top:20px; left:14px; z-index:6; display:none; width:30px; height:30px; align-items:center; justify-content:center;
+    border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text-dim); border-radius:8px; cursor:pointer; font-size:15px;}
+  .restore-btn:hover{color:var(--text); border-color:var(--accent);}
+  .app.collapsed .restore-btn{display:flex;}
+
+  /* ---------- refresh icon button ---------- */
+  .icon-btn{border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text-dim); border-radius:7px; width:26px; height:26px; cursor:pointer; font-size:14px; display:inline-flex; align-items:center; justify-content:center; transition:transform .3s ease, color .2s, border-color .2s;}
+  .icon-btn:hover{color:var(--accent); border-color:var(--accent);}
+  .icon-btn.spin{animation:spin .6s linear;}
+  @keyframes spin{from{transform:rotate(0)} to{transform:rotate(360deg)}}
+
+  /* ---------- time range picker (start -> end) ---------- */
+  .range-pick{display:inline-flex; align-items:center; gap:8px; margin-left:auto;}
+  .dt{background:var(--surface-2); color:var(--text); border:1px solid var(--border-strong); border-radius:7px; padding:5px 8px; font-size:11.5px; font-family:inherit; color-scheme:dark;}
+  .range-pick .arrow{color:var(--text-mute);}
+  .apply{border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); border-radius:7px; padding:5px 13px; font-size:11.5px; cursor:pointer; font-weight:600;}
+  .apply:hover{background:var(--accent); color:#fff;}
+
+  /* ---------- failure: detail + proportion ---------- */
+  .fail-wrap{display:grid; grid-template-columns:1.45fr 1fr; gap:14px; margin-top:14px;}
+  .card-h{font-size:12.5px; font-weight:700; margin-bottom:11px; display:flex; align-items:center; gap:8px;}
+  .card-h .tag{font-size:10.5px; font-weight:600; color:var(--text-mute); border:1px solid var(--border); padding:1px 7px; border-radius:6px;}
+  .fail-pie{display:flex; flex-direction:column; align-items:center; justify-content:center; padding:18px 16px;}
+  .donut-wrap{position:relative; width:150px; height:150px;}
+  .donut-center{position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;}
+  .donut-center .pct{font-size:26px; font-weight:750;}
+  .donut-center .pct.bad{color:var(--red);}
+  .donut-center .lbl{font-size:11px; color:var(--text-mute); margin-top:2px;}
+
+  /* ---------- recent requests clickable ---------- */
+  .req-row.clickable{cursor:pointer; transition:background .15s;}
+  .req-row.clickable:hover{background:var(--surface-3);}
+  .section-title .req-all{margin-left:auto; font-size:11.5px; color:var(--accent); cursor:pointer; font-weight:600;}
+  .section-title .req-all:hover{text-decoration:underline;}
+
+  /* ---------- toast ---------- */
+  .toast{position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(20px); background:var(--surface-3); color:var(--text); border:1px solid var(--border-strong); padding:9px 16px; border-radius:9px; font-size:12.5px; opacity:0; pointer-events:none; transition:opacity .25s, transform .25s; z-index:20;}
+  .toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
+
+  .section-title{font-size:13.5px; font-weight:700; margin:0 0 11px; display:flex; align-items:center; gap:8px;}
+  .section-title .tag{font-size:10.5px; font-weight:600; color:var(--text-mute); border:1px solid var(--border); padding:1px 7px; border-radius:6px;}
+
+  /* KPI cards */
+  .kpis{display:grid; grid-template-columns:repeat(4,1fr); gap:14px;}
+  .card{background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius); padding:15px 16px;}
+  /* 宽表格在窄窗口下横向滚动，而不是被 .app 的 overflow:hidden 裁掉 */
+  .card:has(> table){overflow-x:auto;}
+  .kpi .label{font-size:11.5px; color:var(--text-dim); display:flex; align-items:center; gap:7px;}
+  .kpi .dot{width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 0 3px rgba(63,185,80,.16);}
+  .kpi .val{font-size:26px; font-weight:750; margin:9px 0 2px; letter-spacing:.5px;}
+  .kpi .val small{font-size:14px; color:var(--text-dim); font-weight:600;}
+  .kpi .meta{font-size:11.5px; color:var(--text-mute);}
+  .bar{height:6px; border-radius:4px; background:var(--surface-3); margin-top:10px; overflow:hidden;}
+  .bar > i{display:block; height:100%; border-radius:4px; background:linear-gradient(90deg,var(--accent),#7b5cff);}
+
+  /* table */
+  table{width:100%; border-collapse:collapse; font-size:12px;}
+  th{text-align:left; color:var(--text-mute); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.4px; padding:6px 10px; border-bottom:1px solid var(--border);}
+  td{padding:6px 10px; border-bottom:1px solid var(--border);}
+  tr:last-child td{border-bottom:none;}
+  .mono{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; font-size:11.5px;}
+  .badge{display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:600; padding:2px 8px; border-radius:6px;}
+  .badge.gpu{color:var(--green); background:rgba(63,185,80,.12);}
+  .badge.part{color:var(--amber); background:rgba(210,153,34,.12);}
+  .badge.cpu{color:#e5673a; background:rgba(229,103,58,.16); border:1px solid rgba(229,103,58,.5); font-weight:700;}
+  .badge.idle{color:var(--text-mute); background:var(--surface-3); border:1px solid var(--border);}
+  .badge.ok{color:var(--green); background:rgba(63,185,80,.12);}
+  .badge.err{color:var(--red); background:rgba(248,81,73,.12);}
+  .chip{font-size:11px; font-weight:600; padding:1px 7px; border-radius:6px; background:var(--surface-3); color:var(--text-dim);}
+  .chip.s2{color:var(--accent); background:var(--accent-soft);}
+
+  /* chart */
+  .chart-card{background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius); padding:15px 16px;}
+  .legend{display:flex; gap:16px; font-size:11px; color:var(--text-dim); margin-top:6px;}
+  .legend i{display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:5px; vertical-align:-1px;}
+
+  .req-row{display:grid; grid-template-columns:96px 1fr 130px 70px 70px; gap:10px; align-items:center; padding:8px 4px; border-bottom:1px solid var(--border); font-size:12px;}
+  .req-row:last-child{border-bottom:none;}
+  .req-row .t{color:var(--text-mute); font-family:ui-monospace,monospace; font-size:11px;}
+  .req-row .p{color:var(--text);}
+  .req-row .m{color:var(--text-dim);}
+  .foot{font-size:11px; color:var(--text-mute); text-align:center; padding:4px 0 2px;}
+
+  /* ---------- views (router) ---------- */
+  .view{display:none;}
+  .view.active{display:contents;}
+  .view-title{font-size:13.5px; font-weight:700; margin:0 0 11px; display:flex; align-items:center; gap:8px;}
+  .view-title .tag{font-size:10.5px; font-weight:600; color:var(--text-mute); border:1px solid var(--border); padding:1px 7px; border-radius:6px;}
+
+  /* filters */
+  .filters{display:flex; flex-wrap:wrap; align-items:flex-end; gap:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px;}
+  .field{display:flex; flex-direction:column; gap:5px;}
+  .field label{font-size:11px; color:var(--text-dim);}
+  .sel,.inp{background:var(--surface); color:var(--text); border:1px solid var(--border-strong); border-radius:7px; padding:6px 9px; font-size:12px; font-family:inherit; color-scheme:dark; min-width:118px;}
+  .inp{min-width:150px;}
+  .filters .apply{margin-left:auto; align-self:flex-end;}
+  .btn{border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text-dim); border-radius:7px; padding:6px 13px; font-size:12px; cursor:pointer; font-weight:600;}
+  .btn:hover{color:var(--accent); border-color:var(--accent);}
+  .btn.primary{border-color:var(--accent); background:var(--accent-soft); color:var(--accent);}
+  .btn.primary:hover{background:var(--accent); color:#fff;}
+
+  /* mini kpi (requests stats) */
+  .minikpis{display:grid; grid-template-columns:repeat(5,1fr); gap:12px;}
+  .minikpi{background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius-sm); padding:11px 13px;}
+  .minikpi .l{font-size:11px; color:var(--text-dim);}
+  .minikpi .v{font-size:19px; font-weight:700; margin-top:4px;}
+  .minikpi .v.bad{color:var(--red);}
+  .minikpi .v small{font-size:12px; color:var(--text-dim); font-weight:600;}
+
+  /* pager */
+  .pager{display:flex; align-items:center; justify-content:space-between; font-size:12px; color:var(--text-dim);}
+  .pager .pg-btns{display:flex; gap:6px;}
+  .pager button{border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text-dim); border-radius:7px; padding:5px 11px; cursor:pointer; font-size:12px;}
+  .pager button:hover:not(:disabled){color:var(--accent); border-color:var(--accent);}
+  .pager button:disabled{opacity:.4; cursor:not-allowed;}
+  .pager button.cur{color:var(--accent); border-color:var(--accent); background:var(--accent-soft);}
+
+  /* drawer (request detail) */
+  .drawer-mask{position:fixed; inset:0; background:rgba(0,0,0,.5); opacity:0; pointer-events:none; transition:opacity .25s; z-index:30;}
+  .drawer-mask.show{opacity:1; pointer-events:auto;}
+  .drawer{position:fixed; top:0; right:0; height:100%; width:540px; max-width:92vw; background:var(--surface); border-left:1px solid var(--border-strong); transform:translateX(100%); transition:transform .28s ease; z-index:31; display:flex; flex-direction:column;}
+  .drawer.show{transform:translateX(0);}
+  .drawer .dh{display:flex; align-items:center; justify-content:space-between; padding:16px 18px; border-bottom:1px solid var(--border);}
+  .drawer .dh h3{margin:0; font-size:15px;}
+  .drawer .db{padding:16px 18px; overflow:auto; display:flex; flex-direction:column; gap:16px;}
+  .kv{display:grid; grid-template-columns:108px 1fr; gap:8px 12px; font-size:12px;}
+  .kv .k{color:var(--text-dim);}
+  .kv .v{color:var(--text); word-break:break-all;}
+  .code{background:var(--surface-2); border:1px solid var(--border); border-radius:8px; padding:12px; font-family:ui-monospace,Monaco,Consolas,monospace; font-size:11px; white-space:pre-wrap; word-break:break-word; color:var(--text-dim); max-height:240px; overflow:auto; line-height:1.55;}
+  .code .h{color:var(--text-mute);}
+  .dt-row{cursor:pointer;} .dt-row:hover{background:var(--surface-3);}
+
+  /* accordion row detail (upstream expand) */
+  .row-expand{background:var(--surface-3);}
+  .row-expand td{padding:10px 14px !important;}
+  .exp-grid{display:grid; grid-template-columns:1fr 1fr; gap:18px;}
+  .link{color:var(--accent); cursor:pointer; font-weight:600;}
+  .link:hover{text-decoration:underline;}
+
+  /* settings placeholder */
+  .soon-box{display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:60px 20px; text-align:center; background:var(--surface-2); border:1px dashed var(--border-strong); border-radius:var(--radius);}
+  .soon-box .big{font-size:34px;}
+  .soon-box .t{font-size:16px; font-weight:700;}
+  .soon-box .d{font-size:12.5px; color:var(--text-dim); max-width:440px;}
+  .soon-list{display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-top:6px;}
+
+  /* ---------- ECharts chart cards ---------- */
+  .pie-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:14px;}
+  .echart-card{background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px;}
+  .echart-card .card-h{margin-bottom:6px;}
+  .echart-box{width:100%; height:220px;}
+
+  /* ---------- API doc (request/response + param table) ---------- */
+  .api-doc{background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius); padding:16px 18px;}
+  .api-grid{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:14px;}
+  .api-grid.one{grid-template-columns:1fr;}
+  .api-pane{border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden; background:var(--surface);}
+  .api-pane .ph{display:flex; align-items:center; gap:9px; padding:9px 12px; border-bottom:1px solid var(--border); background:var(--surface-3); font-size:12px; font-weight:700;}
+  .api-pane .ph .pill{font-family:ui-monospace,monospace; font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; background:var(--accent-soft); color:var(--accent);}
+  .api-pane .ph .pill.get{background:rgba(63,185,80,.14); color:var(--green);}
+  .api-pane .ph .pill.post{background:var(--accent-soft); color:var(--accent);}
+  .api-pane .ph .path{font-family:ui-monospace,monospace; font-size:11.5px; color:var(--text-dim);}
+  .api-pane .pb{padding:12px 13px;}
+  .hdrs{font-family:ui-monospace,monospace; font-size:11px; color:var(--text-mute); margin-bottom:10px; line-height:1.7;}
+  .hdrs b{color:var(--text-dim); font-weight:600;}
+  .code2{background:var(--surface-2); border:1px solid var(--border); border-radius:8px; padding:11px 12px; font-family:ui-monospace,Monaco,Consolas,monospace; font-size:11px; white-space:pre; overflow:auto; color:var(--text-dim); line-height:1.6;}
+  .code2 .k{color:var(--accent);} .code2 .s{color:var(--green);} .code2 .n{color:var(--amber);} .code2 .c{color:var(--text-mute);} .code2 .b{color:var(--violet);}
+  .param-table{width:100%; border-collapse:collapse; font-size:11.5px; margin-top:6px;}
+  .param-table th{text-align:left; color:var(--text-mute); font-weight:600; font-size:10.5px; text-transform:uppercase; letter-spacing:.4px; padding:6px 8px; border-bottom:1px solid var(--border);}
+  .param-table td{padding:6px 8px; border-bottom:1px solid var(--border); color:var(--text-dim); vertical-align:top;}
+  .param-table tr:last-child td{border-bottom:none;}
+  .param-table .pn{font-family:ui-monospace,monospace; color:var(--text); font-size:11px;}
+  .param-table .pt{font-family:ui-monospace,monospace; color:var(--accent); font-size:10.5px;}
+  .param-table .pr{color:var(--green); font-weight:600;}
+  .param-table .pr.no{color:var(--text-mute);}
+  .param-table .pd{color:var(--text-dim);}
+  .api-note{font-size:11.5px; color:var(--text-mute); margin-top:10px; line-height:1.6;}
+</style>
+</head>
+<body>
+  <div class="app">
+    <button class="restore-btn" title="显示菜单" onclick="toggleSidebar()">☰</button>
+    <!-- ===================== SIDEBAR ===================== -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">L</div>
+        <div>
+          <div class="name">llm-hub</div>
+          <div class="ver">v1.2.0 · 管理台</div>
+        </div>
+        <button class="collapse-btn" title="隐藏菜单" onclick="toggleSidebar()">«</button>
+      </div>
+
+      <div class="nav-item active" data-view="dashboard" onclick="navTo('dashboard', this)"><span class="ico">▦</span> Dashboard</div>
+      <div class="nav-item" data-view="upstreams" onclick="navTo('upstreams', this)"><span class="ico">⛁</span> Upstreams</div>
+
+      <div class="nav-label">Models</div>
+      <div class="nav-item nav-sub" data-view="models-llm" onclick="navTo('models-llm', this)"><span class="ico">✦</span> LLM</div>
+      <div class="nav-item nav-sub" data-view="models-rerank" onclick="navTo('models-rerank', this)"><span class="ico">⚡</span> Rerank</div>
+      <div class="nav-item nav-sub" data-view="models-systemone" onclick="navTo('models-systemone', this)"><span class="ico">◈</span> System one</div>
+
+      <div class="nav-label">Tools</div>
+      <div class="nav-item nav-sub" data-view="tools-websearch" onclick="navTo('tools-websearch', this)"><span class="ico">🔍</span> Web Search</div>
+
+      <div class="nav-item" data-view="requests" onclick="navTo('requests', this)"><span class="ico">☰</span> Requests</div>
+      <div class="nav-item soon" title="即将开放"><span class="ico">⚙</span> Settings</div>
+
+      <div class="spacer"></div>
+      <div class="user">
+        <div class="av">A</div>
+        <div>
+          <div class="un">admin</div>
+          <div class="rl">Administrator</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ===================== CONTENT ===================== -->
+    <main class="content">
+      <section class="view active" id="view-dashboard">
+      <div class="topbar">
+        <div>
+          <h1>Dashboard</h1>
+          <div class="sub">聚合视图 · 数据每 5s 自动刷新
+            <button class="icon-btn" id="refreshBtn" title="立即刷新" onclick="manualRefresh()">↻</button>
+          </div>
+        </div>
+        <div class="actions">
+          <span class="refresh">最后更新 10:17:24</span>
+          <button class="toggle" id="themeBtn" onclick="toggleTheme()">
+            <span id="themeIco">☀</span><span id="themeTxt">浅色</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- KPI -->
+      <div class="kpis">
+        <div class="card kpi">
+          <div class="label"><span class="dot"></span> 上游在线</div>
+          <div class="val">2<small> / 2</small></div>
+          <div class="meta">Ollama-Arc-B65 · Ollama-iGPU</div>
+        </div>
+        <div class="card kpi">
+          <div class="label">运行中模型</div>
+          <div class="val">3</div>
+          <div class="meta">跨 2 个上游实例</div>
+        </div>
+        <div class="card kpi">
+          <div class="label">显存占用</div>
+          <div class="val">21.4<small> / 31.8 GiB</small></div>
+          <div class="bar"><i style="width:67%"></i></div>
+        </div>
+        <div class="card kpi">
+          <div class="label">今日请求</div>
+          <div class="val">1,284</div>
+          <div class="meta">P95 412ms · 错误 0.6%</div>
+        </div>
+      </div>
+
+      <!-- upstreams (table) -->
+      <div>
+        <div class="section-title">上游实例 <span class="tag">live</span></div>
+        <div class="card" style="padding:4px 6px;">
+          <table>
+            <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>已加载模型</th><th>显存占用</th><th>探测延迟</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="mono">Ollama-Arc-B65</td>
+                <td><span class="chip">ollama</span></td>
+                <td><span class="badge ok">● 在线</span></td>
+                <td>2</td>
+                <td class="mono">18.2 / 31.8 GiB</td>
+                <td class="mono">42 ms</td>
+              </tr>
+              <tr>
+                <td class="mono">Ollama-iGPU</td>
+                <td><span class="chip">ollama</span></td>
+                <td><span class="badge ok">● 在线</span></td>
+                <td>1</td>
+                <td class="mono">3.2 / 31.8 GiB</td>
+                <td class="mono">58 ms</td>
+              </tr>
+              <tr>
+                <td class="mono">LM-Studio-local</td>
+                <td><span class="chip">lmstudio</span></td>
+                <td><span class="badge ok">● 在线</span></td>
+                <td>0</td>
+                <td class="mono">—</td>
+                <td class="mono">31 ms</td>
+              </tr>
+              <tr>
+                <td class="mono">Ollama-Backup</td>
+                <td><span class="chip">ollama</span></td>
+                <td><span class="badge err">● 离线</span></td>
+                <td>0</td>
+                <td class="mono">—</td>
+                <td class="mono">超时</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- running models -->
+      <div>
+        <div class="section-title">运行中模型 <span class="tag">device</span></div>
+        <div class="card" style="padding:4px 6px;">
+          <table>
+            <thead><tr><th>模型</th><th>上游</th><th>设备</th><th>上下文</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td>
+                <td><span class="badge gpu">● GPU 100%</span></td><td class="mono">65536</td>
+              </tr>
+              <tr>
+                <td class="mono">qwen3.5:9b</td><td>Ollama-Arc-B65</td>
+                <td><span class="badge gpu">● GPU 100%</span></td><td class="mono">16384</td>
+              </tr>
+              <tr>
+                <td class="mono">qwen3-reranker:4b-rk</td><td>Ollama-iGPU</td>
+                <td><span class="badge part">● 部分 62%</span></td><td class="mono">8192</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- trend chart -->
+      <div>
+        <div class="section-title">
+          <span id="trendTitle">24h 请求趋势</span> <span class="tag">req/h · P95</span>
+          <div class="range-pick" id="rangePick">
+            <input type="datetime-local" id="startT" class="dt" value="2026-11-03T02:00" />
+            <span class="arrow">→</span>
+            <input type="datetime-local" id="endT" class="dt" value="2026-11-03T08:00" />
+            <button class="apply" onclick="applyRange()">应用</button>
+          </div>
+        </div>
+        <div class="echart-card">
+          <div id="trendChart" class="echart-box" style="height:240px"></div>
+        </div>
+
+        <!-- distribution pies (echarts) -->
+        <div class="pie-grid">
+          <div class="echart-card">
+            <div class="card-h">各 Upstream 请求分布 <span class="tag">by upstream</span></div>
+            <div id="pieUpstream" class="echart-box"></div>
+          </div>
+          <div class="echart-card">
+            <div class="card-h">各 Model 请求分布 <span class="tag">by model</span></div>
+            <div id="pieModel" class="echart-box"></div>
+          </div>
+          <div class="echart-card">
+            <div class="card-h">成功 / 失败分布 <span class="tag">by status</span></div>
+            <div id="pieStatus" class="echart-box"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="foot">llm-hub 管理台 · Dashboard（只读视图风格稿）</div>
+      </section>
+
+      <!-- ===================== UPSTREAMS ===================== -->
+      <section class="view" id="view-upstreams">
+        <div class="topbar">
+          <div><h1>Upstreams</h1><div class="sub">上游实例运行状态 · 点击任意行展开查看运行中 / 已装模型</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div>
+          <div class="section-title">上游实例 <span class="tag">live</span></div>
+          <div class="card" style="padding:4px 6px;">
+            <table>
+              <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>已加载</th><th>显存占用</th><th>探测延迟</th></tr></thead>
+              <tbody>
+                <tr class="dt-row" onclick="toggleUp('up1')">
+                  <td class="mono">Ollama-Arc-B65</td><td><span class="chip">ollama</span></td>
+                  <td><span class="badge ok">● 在线</span></td><td>2</td><td class="mono">18.2 / 31.8 GiB</td><td class="mono">42 ms</td>
+                </tr>
+                <tr class="row-expand" id="up1"><td colspan="6"><div class="exp-grid">
+                  <div><div class="card-h">运行中模型 <span class="tag">/api/ps</span></div>
+                    <table><thead><tr><th>模型</th><th>设备</th><th>上下文</th></tr></thead>
+                      <tbody>
+                        <tr><td class="mono">qwen3.6:35b-pruned</td><td><span class="badge gpu">● GPU 100%</span></td><td class="mono">65536</td></tr>
+                        <tr><td class="mono">qwen3.5:9b</td><td><span class="badge gpu">● GPU 100%</span></td><td class="mono">16384</td></tr>
+                      </tbody></table></div>
+                  <div><div class="card-h">已装模型 <span class="tag">/api/tags</span></div>
+                    <table><thead><tr><th>模型</th><th>大小</th></tr></thead>
+                      <tbody>
+                        <tr><td class="mono">qwen3.6:35b-pruned</td><td class="mono">17.1 GiB</td></tr>
+                        <tr><td class="mono">qwen3.5:9b</td><td class="mono">5.6 GiB</td></tr>
+                        <tr><td class="mono">bge-m3</td><td class="mono">2.3 GiB</td></tr>
+                      </tbody></table></div>
+                </div></td></tr>
+
+                <tr class="dt-row" onclick="toggleUp('up2')">
+                  <td class="mono">Ollama-iGPU</td><td><span class="chip">ollama</span></td>
+                  <td><span class="badge ok">● 在线</span></td><td>1</td><td class="mono">3.2 / 31.8 GiB</td><td class="mono">58 ms</td>
+                </tr>
+                <tr class="row-expand" id="up2"><td colspan="6"><div class="exp-grid">
+                  <div><div class="card-h">运行中模型 <span class="tag">/api/ps</span></div>
+                    <table><thead><tr><th>模型</th><th>设备</th><th>上下文</th></tr></thead>
+                      <tbody>
+                        <tr><td class="mono">qwen3-reranker:4b-rk</td><td><span class="badge part">● 部分 62%</span></td><td class="mono">8192</td></tr>
+                        <tr><td class="mono">qwen3-reranker:4b</td><td><span class="badge cpu">● 纯 CPU</span></td><td class="mono">8192</td></tr>
+                      </tbody></table></div>
+                  <div><div class="card-h">已装模型 <span class="tag">/api/tags</span></div>
+                    <table><thead><tr><th>模型</th><th>大小</th></tr></thead>
+                      <tbody>
+                        <tr><td class="mono">qwen3-reranker:4b-rk</td><td class="mono">4.1 GiB</td></tr>
+                        <tr><td class="mono">qwen3-reranker:4b</td><td class="mono">4.1 GiB</td></tr>
+                      </tbody></table></div>
+                </div></td></tr>
+
+                <tr class="dt-row" onclick="toggleUp('up3')">
+                  <td class="mono">LM-Studio-local</td><td><span class="chip">lmstudio</span></td>
+                  <td><span class="badge ok">● 在线</span></td><td>0</td><td class="mono">—</td><td class="mono">31 ms</td>
+                </tr>
+                <tr class="row-expand" id="up3"><td colspan="6"><div class="exp-grid">
+                  <div><div class="card-h">运行中模型 <span class="tag">/api/ps</span></div>
+                    <div class="meta" style="font-size:12px;color:var(--text-dim);">LM Studio 不支持 /api/ps，无运行态探测。</div></div>
+                  <div><div class="card-h">已装模型 <span class="tag">/api/tags</span></div>
+                    <table><thead><tr><th>模型</th><th>大小</th></tr></thead>
+                      <tbody><tr><td class="mono">llama-3.1-8b-instruct</td><td class="mono">4.7 GiB</td></tr></tbody></table></div>
+                </div></td></tr>
+
+                <tr class="dt-row" onclick="toggleUp('up4')">
+                  <td class="mono">Ollama-Backup</td><td><span class="chip">ollama</span></td>
+                  <td><span class="badge err">● 离线</span></td><td>0</td><td class="mono">—</td><td class="mono">超时</td>
+                </tr>
+                <tr class="row-expand" id="up4"><td colspan="6">
+                  <div class="meta" style="font-size:12px;color:var(--red);">实例不可达（探测超时），无法获取运行态与已装模型。</div></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="foot">llm-hub 管理台 · Upstreams（只读视图风格稿）</div>
+      </section>
+
+      <!-- ===================== MODELS · LLM ===================== -->
+      <section class="view" id="view-models-llm">
+        <div class="topbar">
+          <div><h1>Models · LLM</h1><div class="sub">LLM 模型配置（只读投影自 config.json）</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div>
+          <div class="view-title">上游模型映射 <span class="tag">upstreams → models</span></div>
+          <div class="card" style="padding:4px 6px;">
+            <table>
+              <thead><tr><th>模型名</th><th>上游</th><th>类型</th><th>别名</th><th>num_ctx</th><th>运行态</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td><td><span class="chip">ollama</span></td><td class="mono">q35-35b</td><td class="mono">65536</td><td><span class="badge ok">● 运行中</span></td></tr>
+                <tr><td class="mono">qwen3.5:9b</td><td>Ollama-Arc-B65</td><td><span class="chip">ollama</span></td><td class="mono">q35-9b</td><td class="mono">16384</td><td><span class="badge ok">● 运行中</span></td></tr>
+                <tr><td class="mono">llama-3.1-8b-instruct</td><td>LM-Studio-local</td><td><span class="chip">lmstudio</span></td><td class="mono">—</td><td class="mono">—</td><td><span class="badge cpu">● 未加载</span></td></tr>
+                <tr><td class="mono">deepseek-r1:14b</td><td>Ollama-Backup</td><td><span class="chip">ollama</span></td><td class="mono">ds14</td><td class="mono">32768</td><td><span class="badge err">● 上游离线</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div class="view-title">别名映射 <span class="tag">aliases</span></div>
+          <div class="card" style="padding:4px 6px;">
+            <table>
+              <thead><tr><th>别名</th><th>目标模型</th><th>上游</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">q35-35b</td><td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td></tr>
+                <tr><td class="mono">q35-9b</td><td class="mono">qwen3.5:9b</td><td>Ollama-Arc-B65</td></tr>
+                <tr><td class="mono">ds14</td><td class="mono">deepseek-r1:14b</td><td>Ollama-Backup</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="foot">llm-hub 管理台 · Models · LLM（只读视图风格稿）</div>
+      </section>
+
+      <!-- ===================== MODELS · RERANK ===================== -->
+      <section class="view" id="view-models-rerank">
+        <div class="topbar">
+          <div><h1>Models · Rerank</h1><div class="sub">Rerank 配置（只读）</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">Rerank 配置 <span class="tag">rerank</span></div>
+          <div class="kv">
+            <div class="k">Endpoint</div><div class="v mono">/v1/rerank</div>
+            <div class="k">Enabled</div><div class="v"><span class="badge ok">● 开启</span></div>
+            <div class="k">Models</div><div class="v mono">qwen3-reranker:4b <span class="chip" style="margin-left:6px;">可多值</span></div>
+            <div class="k">打分方式 (mode)</div><div class="v mono">logprobs</div>
+            <div class="k">keep_alive</div><div class="v mono">3m <span class="chip" style="margin-left:6px;">空闲后卸载</span></div>
+            <div class="k">top_logprobs</div><div class="v mono">20</div>
+            <div class="k">上游协议 (upstream_api)</div><div class="v mono">auto</div>
+            <div class="k">失败策略 (on_error)</div><div class="v mono">score_zero</div>
+            <div class="k">并发上限</div><div class="v mono">8</div>
+          </div>
+        </div>
+        <div>
+          <div class="view-title">请求 API 格式 <span class="tag">/v1/rerank</span></div>
+          <div class="api-doc">
+            <div class="card-h">请求参数 <span class="tag">POST /v1/rerank</span></div>
+            <table class="param-table">
+              <thead><tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td class="pn">model</td><td class="pt">string</td><td class="pr">是</td><td class="pd">Rerank 模型名，取值见上方配置 <code>Models</code>（可多值，命中其一即可）</td></tr>
+                <tr><td class="pn">query</td><td class="pt">string</td><td class="pr">是</td><td class="pd">用于检索排序的查询文本</td></tr>
+                <tr><td class="pn">documents</td><td class="pt">string[]</td><td class="pr">是</td><td class="pd">待排序的候选文档数组</td></tr>
+                <tr><td class="pn">top_n</td><td class="pt">integer</td><td class="pr no">否</td><td class="pd">返回前 N 条，默认全部；打分方式见「logprobs」</td></tr>
+                <tr><td class="pn">return_documents</td><td class="pt">boolean</td><td class="pr no">否</td><td class="pd">是否在结果中回带原文，默认取 <code>rerank.return_documents</code></td></tr>
+                <tr><td class="pn">options</td><td class="pt">object</td><td class="pr no">否</td><td class="pd">本次覆盖上游推理选项（合并到 <code>rerank.options</code>）</td></tr>
+              </tbody>
+            </table>
+
+            <div class="api-grid">
+              <div class="api-pane">
+                <div class="ph"><span class="pill post">POST</span><span class="path">/v1/rerank</span></div>
+                <div class="pb">
+                  <div class="hdrs"><b>Authorization</b>: Bearer &lt;API_KEY&gt;<br><b>Content-Type</b>: application/json</div>
+                  <div class="code2">{
+  <span class="k">"model"</span>: <span class="s">"qwen3-reranker:4b"</span>,
+  <span class="k">"query"</span>: <span class="s">"什么是向量数据库？"</span>,
+  <span class="k">"documents"</span>: [
+    <span class="s">"向量数据库用于存储高维向量并支持近似最近邻检索。"</span>,
+    <span class="s">"关系型数据库以二维表结构组织数据。"</span>
+  ],
+  <span class="k">"top_n"</span>: <span class="n">1</span>
+}</div>
+                </div>
+              </div>
+              <div class="api-pane">
+                <div class="ph"><span class="pill">200</span><span class="path">application/json</span></div>
+                <div class="pb">
+                  <div class="hdrs"><b>字段</b> · results[] 每项含 index / relevance_score</div>
+                  <div class="code2">{
+  <span class="k">"results"</span>: [
+    { <span class="k">"index"</span>: <span class="n">0</span>, <span class="k">"relevance_score"</span>: <span class="n">0.92</span> },
+    { <span class="k">"index"</span>: <span class="n">1</span>, <span class="k">"relevance_score"</span>: <span class="n">0.31</span> }
+  ]
+}</div>
+                </div>
+              </div>
+            </div>
+            <div class="api-note">说明：rerank 由 Ollama 上的 qwen3-reranker 提供打分（logprobs），网关负责协议转换与结果归一化；错误返回见 Requests 页面。</div>
+          </div>
+        </div>
+        <div class="foot">llm-hub 管理台 · Models · Rerank（只读视图风格稿）</div>
+      </section>
+
+      <!-- ===================== MODELS · SYSTEMONE ===================== -->
+      <section class="view" id="view-models-systemone">
+        <div class="topbar">
+          <div><h1>Models · SystemOne</h1><div class="sub">SystemOne 配置（只读）</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">SystemOne 配置 <span class="tag">systemone</span></div>
+          <div class="kv">
+            <div class="k">Endpoint</div><div class="v mono">/v1/systemone</div>
+            <div class="k">Enabled</div><div class="v"><span class="badge ok">● 开启</span></div>
+            <div class="k">Backend</div><div class="v mono">http://llm.home:11435</div>
+            <div class="k">默认 model</div><div class="v mono">tev1 <span class="chip" style="margin-left:6px;">local = 不注入</span></div>
+            <div class="k">API Key Env</div><div class="v mono">SYSTEMONE_SERVER_API_KEY</div>
+            <div class="k">Timeout</div><div class="v mono">60s</div>
+          </div>
+        </div>
+        <div>
+          <div class="view-title">请求 API 格式 <span class="tag">/v1/systemone</span></div>
+          <div class="api-doc">
+            <div class="card-h">请求参数 <span class="tag">POST /v1/systemone</span></div>
+            <table class="param-table">
+              <thead><tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td class="pn">state</td><td class="pt">object</td><td class="pr">是</td><td class="pd">自由结构，承载待判定的上下文（如 <code>message</code>），原样透传给后端</td></tr>
+                <tr><td class="pn">questions</td><td class="pt">object</td><td class="pr">是</td><td class="pd">问题 id → 标签化问题；<code>type</code> 决定判定形态</td></tr>
+                <tr><td class="pn">questions[].type</td><td class="pt">string</td><td class="pr">是</td><td class="pd"><code>noul</code>(是/否概率) · <code>choice</code>(单选标签) · <code>score</code>(≥2 标准打分)</td></tr>
+                <tr><td class="pn">questions[].instructions</td><td class="pt">string</td><td class="pr">是</td><td class="pd">该问题的判定指令</td></tr>
+                <tr><td class="pn">questions[].criteria</td><td class="pt">string[]</td><td class="pr no">否</td><td class="pd"><code>choice</code> / <code>score</code> 必填的候选标签</td></tr>
+                <tr><td class="pn">model</td><td class="pt">string</td><td class="pr no">否</td><td class="pd">路由模型；laya-server 接受 auto / english / multilingual / typed-decisions，Ollama 后端需真实模型名</td></tr>
+              </tbody>
+            </table>
+
+            <div class="api-grid one">
+              <div class="api-pane">
+                <div class="ph"><span class="pill post">POST</span><span class="path">/v1/systemone</span></div>
+                <div class="pb">
+                  <div class="hdrs"><b>Authorization</b>: Bearer &lt;API_KEY&gt;<br><b>Content-Type</b>: application/json</div>
+                  <div class="code2">{
+  <span class="k">"state"</span>: { <span class="k">"message"</span>: <span class="s">"I was charged twice and need a refund today."</span> },
+  <span class="k">"questions"</span>: {
+    <span class="k">"refund"</span>: { <span class="k">"type"</span>: <span class="s">"noul"</span>, <span class="k">"instructions"</span>: <span class="s">"Does the customer ask for a refund?"</span> },
+    <span class="k">"intent"</span>: { <span class="k">"type"</span>: <span class="s">"choice"</span>, <span class="k">"instructions"</span>: <span class="s">"Primary intent?"</span>,
+                <span class="k">"criteria"</span>: [ <span class="s">"refund"</span>, <span class="s">"cancel"</span>, <span class="s">"other"</span> ] }
+  },
+  <span class="k">"model"</span>: <span class="s">"auto"</span>
+}</div>
+                </div>
+              </div>
+              <div class="api-pane">
+                <div class="ph"><span class="pill">200</span><span class="path">application/json</span></div>
+                <div class="pb">
+                  <div class="hdrs"><b>透传</b> · 决策结果由 System One 后端返回</div>
+                  <div class="code2">{
+  <span class="k">"model"</span>: <span class="s">"laya-rl-agent"</span>,
+  <span class="k">"answers"</span>: {
+    <span class="k">"refund"</span>: {
+      <span class="k">"type"</span>: <span class="s">"noul"</span>, <span class="k">"noul"</span>: <span class="n">0.9937</span>,
+      <span class="k">"confidence"</span>: <span class="n">0.9937</span>,
+      <span class="k">"action"</span>: { <span class="k">"act_probability"</span>: <span class="n">1.0</span> }
+    }
+  },
+  <span class="k">"usage"</span>: { <span class="k">"input_tokens"</span>: <span class="n">49</span>, <span class="k">"output_tokens"</span>: <span class="n">0</span> },
+  <span class="k">"routing"</span>: { <span class="k">"model"</span>: <span class="s">"multilingual"</span>, <span class="k">"reason"</span>: <span class="s">"explicit model"</span> }
+}</div>
+                </div>
+              </div>
+            </div>
+            <div class="api-note">说明：请求体与响应体均<b>原样透传</b>给 System One 后端（laya-server 或 Ollama 0.40+），llm-hub 只用调用方的 API Key 鉴权，并用 <code>api_key_env</code> 指向的密钥签名上游调用；<code>systemone.model</code> 为默认注入模型（<code>local</code> = 不注入）。</div>
+          </div>
+        </div>
+        <div class="foot">llm-hub 管理台 · Models · SystemOne（只读视图风格稿）</div>
+      </section>
+
+      <!-- ===================== TOOLS · WEB SEARCH ===================== -->
+      <section class="view" id="view-tools-websearch">
+        <div class="topbar">
+          <div><h1>Tools · Web Search</h1><div class="sub">Web Search 配置（只读）</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">Web Search 配置 <span class="tag">web-search</span></div>
+          <div class="kv">
+            <div class="k">Endpoint</div><div class="v mono">/v1/tools/web-search</div>
+            <div class="k">Enabled</div><div class="v"><span class="badge ok">● 开启</span></div>
+            <div class="k">Upstream</div><div class="v mono">opencode <span class="chip" style="margin-left:6px;">type: opencode</span></div>
+            <div class="k">Base URL</div><div class="v mono">http://127.0.0.1:8787 <span class="chip" style="margin-left:6px;">来自 upstream</span></div>
+            <div class="k">Provider Path</div><div class="v mono">v1/web-search</div>
+            <div class="k">API Key Env</div><div class="v"><span class="badge cpu">— 未设置（不签名）</span></div>
+            <div class="k">Timeout</div><div class="v mono">300s</div>
+          </div>
+        </div>
+        <div>
+          <div class="view-title">请求 API 格式 <span class="tag">/v1/tools/web-search</span></div>
+          <div class="api-doc">
+            <div class="card-h">请求参数 <span class="tag">POST /v1/tools/web-search</span></div>
+            <table class="param-table">
+              <thead><tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td class="pn">query</td><td class="pt">string</td><td class="pr">是</td><td class="pd">搜索关键词或自然语言问题（唯一必填字段）</td></tr>
+                <tr><td class="pn">model</td><td class="pt">string</td><td class="pr no">否</td><td class="pd">Provider 侧模型 id，原样透传；省略时由 Provider 决定，不参与本地 alias 解析</td></tr>
+                <tr><td class="pn">top_k</td><td class="pt">integer</td><td class="pr no">否</td><td class="pd">检索页面数，范围 1–50；省略时取 Provider 默认值</td></tr>
+                <tr><td class="pn">max_chars_per_page</td><td class="pt">integer</td><td class="pr no">否</td><td class="pd">单页字符预算，超出截断，响应 truncated=true</td></tr>
+                <tr><td class="pn">locale</td><td class="pt">string</td><td class="pr no">否</td><td class="pd">地区/语言提示，如 zh-CN</td></tr>
+                <tr><td class="pn">recency</td><td class="pt">string</td><td class="pr no">否</td><td class="pd">时间范围枚举：day / week / month / year</td></tr>
+                <tr><td class="pn">synthesize</td><td class="pt">boolean</td><td class="pr no">否</td><td class="pd">true 时额外返回 answer（由模型综合生成的答案）</td></tr>
+                <tr><td class="pn">include_sources</td><td class="pt">boolean</td><td class="pr no">否</td><td class="pd">true 时在响应中附带扁平 sources[] URL 列表</td></tr>
+              </tbody>
+            </table>
+
+            <div class="api-grid">
+              <div class="api-pane">
+                <div class="ph"><span class="pill post">POST</span><span class="path">/v1/tools/web-search</span></div>
+                <div class="pb">
+                  <div class="hdrs"><b>Authorization</b>: Bearer &lt;API_KEY&gt;<br><b>Content-Type</b>: application/json</div>
+                  <div class="code2">{
+  <span class="k">"query"</span>: <span class="s">"llm-hub 网关 使用教程"</span>,
+  <span class="k">"top_k"</span>: <span class="n">5</span>,
+  <span class="k">"locale"</span>: <span class="s">"zh-CN"</span>,
+  <span class="k">"recency"</span>: <span class="s">"month"</span>,
+  <span class="k">"synthesize"</span>: <span class="b">false</span>
+}</div>
+                </div>
+              </div>
+              <div class="api-pane">
+                <div class="ph"><span class="pill">200</span><span class="path">application/json</span></div>
+                <div class="pb">
+                  <div class="hdrs"><b>透传</b> · 状态码与响应体原样返回 Provider 契约</div>
+                  <div class="code2">{
+  <span class="k">"query"</span>: <span class="s">"llm-hub 网关 使用教程"</span>,
+  <span class="k">"model"</span>: <span class="s">"ollama-local/qwen3.5:9b"</span>,
+  <span class="k">"engine"</span>: <span class="s">"opencode-websearch"</span>,
+  <span class="k">"answer"</span>: <span class="b">null</span>,
+  <span class="k">"truncated"</span>: <span class="b">true</span>,
+  <span class="k">"results"</span>: [
+    {
+      <span class="k">"title"</span>: <span class="s">"llm-hub 快速开始"</span>,
+      <span class="k">"url"</span>: <span class="s">"https://example.com/doc"</span>,
+      <span class="k">"snippet"</span>: <span class="s">"llm-hub 是统一代理本地模型的网关…"</span>,
+      <span class="k">"paragraphs"</span>: [ <span class="s">"完整段落文本 …"</span> ]
+    }
+  ],
+  <span class="k">"text"</span>: <span class="s">"所有检索段落拼接，可直接塞进 prompt"</span>,
+  <span class="k">"sources"</span>: [ <span class="s">"https://example.com/doc"</span> ]
+}</div>
+                </div>
+              </div>
+            </div>
+            <div class="api-note">说明：请求体原样转发给 Provider（未知字段保留、不重写），响应体与状态码也原样回传，因此字段以 Provider 契约为准；<code>query</code> 为唯一必填。<code>websearch.enabled=false</code> 返回 404，Provider upstream 缺失返回 503。</div>
+          </div>
+        </div>
+        <div class="foot">llm-hub 管理台 · Tools · Web Search（只读视图风格稿）</div>
+      </section>
+
+      <!-- ===================== REQUESTS ===================== -->
+      <section class="view" id="view-requests">
+        <div class="topbar">
+          <div><h1>Requests</h1><div class="sub">请求明细与统计 · 数据源 SQLite · 入库开关已开启（关闭时此处提示「日志已停用」）</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="filters">
+          <div class="field"><label>起始时间</label><input type="datetime-local" class="dt" value="2026-11-03T02:00" /></div>
+          <div class="field"><label>结束时间</label><input type="datetime-local" class="dt" value="2026-11-03T08:00" /></div>
+          <div class="field"><label>上游</label><select class="sel"><option>全部</option><option>Ollama-Arc-B65</option><option>Ollama-iGPU</option><option>LM-Studio-local</option></select></div>
+          <div class="field"><label>模型</label><select class="sel"><option>全部</option><option>qwen3.6:35b-pruned</option><option>qwen3.5:9b</option><option>qwen3-reranker:4b-rk</option><option>bge-m3</option></select></div>
+          <div class="field"><label>状态</label><select class="sel"><option>全部</option><option>2xx</option><option>4xx</option><option>5xx</option></select></div>
+          <div class="field"><label>路径 / 关键字</label><input class="inp" placeholder="/v1/chat/completions" /></div>
+          <button class="btn primary apply">应用筛选</button>
+          <button class="btn">重置</button>
+        </div>
+        <div class="minikpis">
+          <div class="minikpi"><div class="l">区间请求</div><div class="v">1,284</div></div>
+          <div class="minikpi"><div class="l">P50</div><div class="v">318<small>ms</small></div></div>
+          <div class="minikpi"><div class="l">P95</div><div class="v">412<small>ms</small></div></div>
+          <div class="minikpi"><div class="l">P99</div><div class="v">980<small>ms</small></div></div>
+          <div class="minikpi"><div class="l">错误率</div><div class="v bad">0.6%</div></div>
+        </div>
+        <div>
+          <div class="view-title">请求明细 <span class="tag">SQLite · 每页 15</span></div>
+          <div class="card" style="padding:4px 6px;">
+            <table>
+              <thead><tr><th>时间</th><th>方法</th><th>路径 / 模型</th><th>上游</th><th>状态</th><th>耗时</th><th>流式</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">10:17:21</td><td>POST</td><td class="p">/v1/chat/completions<br><span class="mono" style="color:var(--text-dim)">qwen3.6:35b-pruned</span></td><td class="m">Ollama-Arc-B65</td><td><span class="badge ok">200</span></td><td class="mono">386ms</td><td>是</td><td><span class="link" onclick="openDrawer()">详情</span></td></tr>
+                <tr><td class="mono">10:17:09</td><td>POST</td><td class="p">/v1/rerank<br><span class="mono" style="color:var(--text-dim)">qwen3-reranker:4b-rk</span></td><td class="m">Ollama-iGPU</td><td><span class="badge ok">200</span></td><td class="mono">74ms</td><td>否</td><td><span class="link" onclick="openDrawer()">详情</span></td></tr>
+                <tr><td class="mono">10:16:52</td><td>POST</td><td class="p">/v1/chat/completions<br><span class="mono" style="color:var(--text-dim)">qwen3.5:9b</span></td><td class="m">Ollama-Arc-B65</td><td><span class="badge ok">200</span></td><td class="mono">211ms</td><td>是</td><td><span class="link" onclick="openDrawer()">详情</span></td></tr>
+                <tr><td class="mono">10:16:40</td><td>POST</td><td class="p">/v1/embeddings<br><span class="mono" style="color:var(--text-dim)">bge-m3</span></td><td class="m">Ollama-Arc-B65</td><td><span class="badge err">502</span></td><td class="mono">1203ms</td><td>否</td><td><span class="link" onclick="openDrawer()">详情</span></td></tr>
+                <tr><td class="mono">10:16:33</td><td>POST</td><td class="p">/v1/chat/completions<br><span class="mono" style="color:var(--text-dim)">qwen3.6:35b-pruned</span></td><td class="m">Ollama-Arc-B65</td><td><span class="badge ok">200</span></td><td class="mono">402ms</td><td>是</td><td><span class="link" onclick="openDrawer()">详情</span></td></tr>
+                <tr><td class="mono">10:16:18</td><td>GET</td><td class="p">/api/ps<br><span class="mono" style="color:var(--text-dim)">—</span></td><td class="m">Ollama-iGPU</td><td><span class="badge ok">200</span></td><td class="mono">51ms</td><td>否</td><td><span class="link" onclick="openDrawer()">详情</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="pager">
+          <span>共 1,284 条 · 每页 15 条</span>
+          <div class="pg-btns">
+            <button disabled>上一页</button>
+            <button class="cur">1</button><button>2</button><button>3</button><button>…</button><button>86</button>
+            <button>下一页</button>
+          </div>
+        </div>
+        <div class="foot">llm-hub 管理台 · Requests（只读视图风格稿）</div>
+      </section>
+
+      <!-- ===================== SETTINGS (soon) ===================== -->
+      <section class="view" id="view-settings">
+        <div class="topbar">
+          <div><h1>Settings</h1><div class="sub">管理台设置</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="soon-box">
+          <div class="big">🚧</div>
+          <div class="t">此模块即将开放</div>
+          <div class="d">只读视图阶段不开放配置写入口。以下能力将在后续版本按需开放：</div>
+          <div class="soon-list">
+            <span class="chip s2">API Keys 管理</span>
+            <span class="chip s2">Rerank 配置</span>
+            <span class="chip s2">Security 规则</span>
+            <span class="chip s2">Playground 调试</span>
+            <span class="chip s2">上游增删改</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============= drawer (request detail) ============= -->
+  <div class="drawer-mask" id="drawerMask" onclick="closeDrawer()"></div>
+  <aside class="drawer" id="drawer">
+    <div class="dh"><h3>请求详情 <span class="tag">req-log</span></h3><button class="icon-btn" onclick="closeDrawer()">✕</button></div>
+    <div class="db">
+      <div class="kv" id="drKv">
+        <div class="k">到达时间</div><div class="v mono">10:17:21</div>
+        <div class="k">完成时间</div><div class="v mono">10:17:24</div>
+        <div class="k">方法</div><div class="v">POST</div>
+        <div class="k">路径</div><div class="v mono">/v1/chat/completions</div>
+        <div class="k">查询串</div><div class="v mono">(空)</div>
+        <div class="k">请求模型</div><div class="v mono">q36</div>
+        <div class="k">解析后</div><div class="v mono">qwen3.6:35b-pruned</div>
+        <div class="k">上游</div><div class="v">Ollama-Arc-B65</div>
+        <div class="k">状态</div><div class="v"><span class="badge ok">200</span></div>
+        <div class="k">耗时</div><div class="v mono">386 ms</div>
+        <div class="k">TTFB</div><div class="v mono">120 ms</div>
+        <div class="k">流式</div><div class="v">是</div>
+        <div class="k">客户端</div><div class="v mono">127.0.0.1</div>
+      </div>
+      <div>
+        <div class="card-h">请求体 <span class="tag">截断 8KB · 敏感头脱敏</span></div>
+        <div class="code">{
+  <span class="h">"model"</span>: "qwen3.6:35b-pruned",
+  <span class="h">"messages"</span>: [ { "role": "user", "content": "你好" } ],
+  <span class="h">"stream"</span>: true,
+  <span class="h">"temperature"</span>: 0.7
+}</div>
+      </div>
+      <div>
+        <div class="card-h">响应体 <span class="tag">首 8KB</span></div>
+        <div class="code">{
+  <span class="h">"id"</span>: "chatcmpl-9f2a",
+  <span class="h">"object"</span>: "chat.completion.chunk",
+  <span class="h">"model"</span>: "qwen3.6:35b-pruned",
+  <span class="h">"choices"</span>: [ { "delta": { "content": "你好！" } } ],
+  <span class="h">"usage"</span>: { "total_tokens": 1284 }
+}</div>
+      </div>
+    </div>
+  </aside>
+
+  <script src="echarts.min.js"></script>
+  <script>
+    function toggleTheme(){
+      var h = document.documentElement;
+      var next = h.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      h.setAttribute('data-theme', next);
+      var ico = next === 'dark' ? '☀' : '☾';
+      var txt = next === 'dark' ? '浅色' : '深色';
+      var i = document.getElementById('themeIco'), t = document.getElementById('themeTxt');
+      if(i) i.textContent = ico; if(t) t.textContent = txt;
+      document.querySelectorAll('[data-theme-btn]').forEach(function(b){
+        var ti = b.querySelector('.ti'), tt = b.querySelector('.tt');
+        if(ti) ti.textContent = ico; if(tt) tt.textContent = txt;
+      });
+      refreshEchartsTheme();
+    }
+    function toggleSidebar(){
+      document.querySelector('.app').classList.toggle('collapsed');
+    }
+    function navTo(view, el){
+      document.querySelectorAll('.view').forEach(function(v){ v.classList.remove('active'); });
+      var target = document.getElementById('view-' + view);
+      if(target) target.classList.add('active');
+      document.querySelectorAll('.nav-item').forEach(function(n){ n.classList.remove('active'); });
+      if(el) el.classList.add('active');
+      window.scrollTo(0, 0);
+    }
+    function toggleUp(id){
+      var r = document.getElementById(id);
+      if(r) r.style.display = (r.style.display === 'none' ? 'table-row' : 'none');
+    }
+    function openDrawer(){
+      document.getElementById('drawerMask').classList.add('show');
+      document.getElementById('drawer').classList.add('show');
+    }
+    function closeDrawer(){
+      document.getElementById('drawerMask').classList.remove('show');
+      document.getElementById('drawer').classList.remove('show');
+    }
+    function manualRefresh(){
+      var b = document.getElementById('refreshBtn');
+      if(b){ b.classList.remove('spin'); void b.offsetWidth; b.classList.add('spin'); }
+      var now = new Date();
+      var p = function(n){ return String(n).padStart(2,'0'); };
+      var ts = '最后更新 ' + p(now.getHours()) + ':' + p(now.getMinutes()) + ':' + p(now.getSeconds());
+      document.querySelectorAll('.refresh').forEach(function(el){ el.textContent = ts; });
+    }
+    function applyRange(){
+      var s = document.getElementById('startT').value;
+      var e = document.getElementById('endT').value;
+      if(!s || !e){ toast('请选择起止时间'); return; }
+      var fmt = function(v){ return v ? v.replace('T',' ').slice(5,16) : ''; };
+      document.getElementById('trendTitle').textContent = fmt(s) + ' → ' + fmt(e) + ' 请求趋势';
+      toast('已应用时间范围 ' + fmt(s) + ' → ' + fmt(e));
+    }
+    function goRequests(){ navTo('requests', document.querySelector('[data-view="requests"]')); }
+    function toast(msg){
+      var t = document.getElementById('toast');
+      t.textContent = msg; t.classList.add('show');
+      clearTimeout(t._t); t._t = setTimeout(function(){ t.classList.remove('show'); }, 1800);
+    }
+
+    /* ---------- ECharts：分布饼图 + 趋势图 ---------- */
+    var EC_PALETTE = ['#5470c6','#91cc75','#fac858','#ee6666','#73c0de','#3ba272','#fc8452','#9a60b4','#ea7ccc'];
+    var ecCharts = [], ecBuilders = [];
+    function ecVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+    function ecText(){ return ecVar('--text-dim') || '#8b95a5'; }
+    function ecMute(){ return ecVar('--text-mute') || '#5d6675'; }
+    function ecBorder(){ return ecVar('--border') || 'rgba(255,255,255,.08)'; }
+    function ecSurface2(){ return ecVar('--surface-2') || '#1e2430'; }
+
+    function buildTrend(){
+      var hrs = []; for(var i=0;i<24;i++) hrs.push(String(i).padStart(2,'0'));
+      var cnt = [38,42,30,46,52,40,28,36,44,32,48,30,42,52,44,36,40,28,46,34,42,38,44,40];
+      var p95 = [170,168,172,150,140,158,132,150,164,128,144,118,136,152,124,162,140,134,148,122,156,138,126,134];
+      return {
+        backgroundColor:'transparent',
+        grid:{left:44,right:42,top:26,bottom:26},
+        tooltip:{trigger:'axis'},
+        legend:{data:['请求数','P95(ms)'],textStyle:{color:ecText()},top:0,left:'center'},
+        xAxis:{type:'category',data:hrs,axisLine:{lineStyle:{color:ecBorder()}},axisLabel:{color:ecMute(),fontSize:10},axisTick:{show:false}},
+        yAxis:[{type:'value',axisLabel:{color:ecMute(),fontSize:10},splitLine:{lineStyle:{color:ecBorder()}}},
+               {type:'value',axisLabel:{color:ecMute(),fontSize:10},splitLine:{show:false}}],
+        series:[
+          {name:'请求数',type:'bar',data:cnt,itemStyle:{color:'rgba(79,140,255,.55)'},barWidth:'55%'},
+          {name:'P95(ms)',type:'line',yAxisIndex:1,data:p95,smooth:true,itemStyle:{color:'#d29922'},lineStyle:{width:2.5},symbol:'none'}
+        ]
+      };
+    }
+    function buildPie(data){
+      return {
+        backgroundColor:'transparent',
+        color: EC_PALETTE,
+        tooltip:{trigger:'item',formatter:'{b}: {c} ({d}%)'},
+        legend:{bottom:0,left:'center',textStyle:{color:ecText(),fontSize:10},itemWidth:9,itemHeight:9,itemGap:8},
+        series:[{
+          type:'pie', radius:'68%', center:['50%','42%'], avoidLabelOverlap:true, minAngle:2,
+          itemStyle:{borderColor:ecSurface2(),borderWidth:2},
+          label:{position:'inside',color:'#fff',fontSize:10.5,fontWeight:600,
+                 formatter:function(p){ return p.percent >= 5 ? p.percent.toFixed(1) + '%' : ''; }},
+          labelLine:{show:false},
+          data:data
+        }]
+      };
+    }
+    function refreshEchartsTheme(){
+      ecCharts.forEach(function(c,i){ if(c && ecBuilders[i]) c.setOption(ecBuilders[i]()); });
+    }
+    function initCharts(){
+      if(typeof echarts === 'undefined'){ return; }
+      var mk = function(id, builder){
+        var el = document.getElementById(id); if(!el) return;
+        var c = echarts.init(el); c.setOption(builder());
+        ecCharts.push(c); ecBuilders.push(builder);
+      };
+      mk('trendChart', buildTrend);
+      mk('pieUpstream', function(){ return buildPie([
+        {name:'Ollama-Arc-B65',value:642},{name:'Ollama-iGPU',value:380},{name:'LM-Studio-local',value:262}
+      ]); });
+      mk('pieModel', function(){ return buildPie([
+        {name:'qwen3.6:35b-pruned',value:410},{name:'qwen3.5:9b',value:320},{name:'qwen3-reranker:4b-rk',value:280},{name:'bge-m3',value:274}
+      ]); });
+      mk('pieStatus', function(){ return buildPie([
+        {name:'成功 2xx',value:1247,itemStyle:{color:'#3fb950'}},
+        {name:'失败 4xx/5xx',value:37,itemStyle:{color:'#f85149'}}
+      ]); });
+      window.addEventListener('resize', function(){ ecCharts.forEach(function(c){ c.resize(); }); });
+    }
+    initCharts();
+  </script>
+  <div class="toast" id="toast"></div>
+</body>
+</html>

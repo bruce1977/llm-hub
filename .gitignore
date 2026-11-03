@@ -7,6 +7,11 @@
 data/config.json
 config.json
 
+# Request log database (SQLite + WAL sidecar files)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
 # Python
 __pycache__/
 *.py[cod]

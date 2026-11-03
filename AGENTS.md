@@ -9,6 +9,7 @@ LLM Hub is a FastAPI-based unified gateway that aggregates multiple Ollama insta
 - Web search pass-through (OpenCode API Gateway upstream)
 - Model aliasing and parameter injection
 - Config hot reload
+- Read-only management API (`/v1/management`) with a SQLite request log for the web console
 
 ## Architecture
 
@@ -18,7 +19,10 @@ llm-hub/
 │   ├── main.py       # FastAPI application, lifespan, special endpoints
 │   ├── config.py     # Config models, loading, hot reload, alias resolution
 │   ├── auth.py       # API key authentication, security helpers
-│   ├── proxy.py      # Reverse proxy, streaming pass-through
+│   ├── admin_auth.py # ADMIN_PASSWORD session cookie + require_admin dependency
+│   ├── proxy.py      # Reverse proxy, streaming pass-through, request-log capture
+│   ├── request_log.py # SQLite request log (WAL, async batched writes, stats queries)
+│   ├── management.py # Read-only management API (/v1/management) for the web console
 │   ├── rerank.py     # Rerank API implementation (logprobs/embedding modes)
 │   ├── systemone.py  # System One decision API (proxied to laya-server or Ollama 0.40+)
 │   ├── websearch.py  # Web search API (proxied to an OpenCode API Gateway upstream)
@@ -29,6 +33,7 @@ llm-hub/
 ├── tests/
 │   ├── smoke_test.py        # Comprehensive mock tests (104)
 │   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (59)
+│   ├── test_management.py   # Management API + request log tests (142)
 │   ├── verify_security.py   # Security control tests (15)
 │   ├── test_api.py          # E2E tests against a live server (28)
 │   └── demo.py              # Demo script (requires real Ollama)
@@ -91,6 +96,9 @@ python tests/smoke_test.py
 # Gateway features: aggregation, systemone/websearch forwarding, /docs schema (no external deps)
 python tests/test_gateway_new.py
 
+# Management API + request log (spins up a local mock Ollama; no external deps)
+python tests/test_management.py
+
 # Security verification tests (no external dependencies)
 python tests/verify_security.py
 
@@ -112,6 +120,7 @@ python tests/demo.py
 ### Test Structure
 - `smoke_test.py` — 104 mock tests (auth, routing, aliases, streaming, rerank, security, `/` system info, upstream types), no external deps
 - `test_gateway_new.py` — 59 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input)
+- `test_management.py` — 142 tests for admin auth (session cookie only; password/header misuse → 401), upstream probes + device classification, masked config projections (LLM / rerank / systemone / tools-websearch), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string), filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
 - `test_api.py` — 28 E2E tests against a real running server + Ollama + web search provider
 - `demo.py` — interactive demo (requires real Ollama)
@@ -187,6 +196,7 @@ docker run -d --name llm-hub \
 - Regex path allowlist (`security.path_allowlist`, 403 for non-matching paths)
 - In-memory token-bucket rate limiter (`security.rate_limit`, 429 when over budget)
 - Defensive response headers on every response (nosniff, X-Frame-Options, CSP, etc.)
+- Admin/management console uses a separate `ADMIN_PASSWORD` (HMAC session cookie), not the gateway API keys
 
 ### Rerank Modes
 - **logprobs**: Generative scoring using token probabilities
@@ -241,6 +251,64 @@ docker run -d --name llm-hub \
   var logs a warning and forwards unsigned
 - Statuses: 404 when `systemone.enabled=false`, 502 on connect/HTTP errors, 504 on read
   timeout; backend status and body are passed through unchanged
+
+### Management API (`/v1/management`) + request log
+- `management.py` defines an `APIRouter(prefix="/v1/management")`; `main.py` registers it
+  **before** the catch-all, otherwise those paths would be proxied to an upstream
+- Auth is independent of `GATEWAY_API_KEYS`: the admin password is a **login credential
+  only**. `POST /v1/management/auth/login` validates it and mints the signed session cookie
+  (HMAC keyed by `ADMIN_PASSWORD`, 12h, HttpOnly, SameSite=Lax, Secure only on HTTPS);
+  `require_admin` accepts that cookie and nothing else, so the password sent as
+  `Bearer` / `X-API-Key` → **401** (those headers belong to the gateway API keys).
+  No `ADMIN_PASSWORD` → **503**; missing/invalid session → **401**. The legacy
+  `/admin/login|logout` routes delegate to the same functions
+- `/v1/management` is exempt from `security.path_allowlist` (like `/admin`) but still subject
+  to the method allowlist, client-IP allowlist and rate limit
+- All routes are read-only. Probes reuse `app.state.client` with a 5s timeout so one dead
+  upstream cannot stall a view; `overview` / `upstreams` use `asyncio.gather` over upstreams
+- Ollama device classification: `size_vram / size` → `gpu` (≥ 0.999) / `partial` / `cpu`;
+  non-Ollama and unreachable upstreams report `device: null` at the API level (no `running_models`)
+- `upstreams/{name}` detail returns **503** with `"unreachable": true` when the health probe
+  fails; unknown names are **404**
+- Credentials never leave the server: header-based upstream keys and the System One env key
+  are returned as the fixed mask `••••••`
+- `tools/websearch` projects the `websearch` block and derives `base_url` / `upstream_type` from
+  `Config.websearch_upstream_obj()` — the same resolver `WebSearchService` uses, so the console can
+  never show an address the forwarder would not use; `api_key` only reports whether the env var is set
+- `stats/distribution?group_by=upstream|model|status` feeds the Dashboard pies: `status` collapses to
+  `ok` (< 400) / `error` (≥ 400) and rows that never reached an upstream (blocked / oversized /
+  unrouted) bucket as `-`, so the items always sum to the log total. Any other `group_by` → **400**;
+  the column expression comes from `request_log._DISTRIBUTION_KEYS`, never from the caller
+- `UpstreamConfig.vram_total_gb` feeds the overview VRAM gauge; it is config-only because no
+  upstream API exposes the host total
+- `request_log.RequestLog` owns `llmhub.db` (default next to `config.json`, override with
+  `REQUEST_LOG_DB`), WAL + `synchronous=NORMAL`, 30-day retention (`REQUEST_LOG_RETENTION_DAYS`,
+  0 = forever, pruned hourly). Rows are queued (bounded 10 000, drops + warns when full) and
+  written by one background task in batches of 100 via `asyncio.to_thread`
+- One row per call, grouped as: timing (`ts`, `ts_end`, `duration_ms`, `ttfb_ms` — `ts`/`ts_end`
+  are second-precision ISO UTC, so `duration_ms` is the sub-second source), request
+  (`method`, `path`, `query`, `requested_model`, `model`, `request_body`, `req_size`, `stream`,
+  `client_ip`) and result (`status`, `upstream`, `response_body`, `res_size`, `tokens`, `error`),
+  plus the two `*_truncated` flags. `_init_db` diffs the live table against `PRAGMA table_info`
+  and `ALTER TABLE ADD COLUMN`s anything missing, so old databases upgrade in place
+- `config.json` -> `request_log.enabled` (default `true`) is the write switch and is evaluated
+  **per request** (`ProxyService._logging_on`), so hot reload turns recording on or off without a
+  restart; when off, bodies are not captured and nothing is queued. `/overview` and `/requests`
+  echo the state as `request_log: {enabled, db, retention_days, dropped}`. `ConfigManager` polls
+  the mtime **at most once per second**, so the switch lands within ~1s — live scripts must wait
+  out that window (or call `manager.reload()`) before asserting, otherwise the first request after
+  the edit still uses the previous config
+- `proxy.py` records every outcome: blocked (403) / oversized (413) / unrouted (404),
+  streaming (captures ≤ 8 KB of body in the generator, writes after `aclose`), non-streaming,
+  and connect/read/HTTP failures (502/504). `model` is the resolved target name; token usage
+  comes from `usage.total_tokens` or Ollama's `prompt_eval_count + eval_count`
+- Bodies are truncated to 8 KB; `sanitize_body` re-dumps JSON with `authorization`, `api_key`,
+  `token`, `password`, ... replaced by `***`
+- Query timestamps are normalized to naive UTC (strings compare correctly); ranges are
+  inclusive at both ends. Percentiles: `ORDER BY duration_ms LIMIT 1 OFFSET rank-1`;
+  per-bucket P95 uses window functions
+- `pyproject.toml` ignores `S608` for `request_log.py` only: SQL fragments are code-controlled
+  literals, every value is bound as a parameter
 
 ## Common Tasks
 

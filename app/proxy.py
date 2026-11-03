@@ -11,13 +11,19 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
+from auth import client_ip
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
+from request_log import extract_tokens, now_ts, sanitize_body
 
 logger = logging.getLogger("llm_hub")
+
+#: Response bytes retained for the request log (bodies and sizes beyond this are cut).
+LOG_BODY_BYTES = 8192
 
 # hop-by-hop / response headers that must not be forwarded
 EXCLUDED_RESPONSE_HEADERS = {
@@ -51,9 +57,49 @@ MODELLESS_ENDPOINTS = {
 
 
 class ProxyService:
-    def __init__(self, manager, client: httpx.AsyncClient):
+    def __init__(self, manager, client: httpx.AsyncClient, request_log=None):
         self.manager = manager
         self.client = client
+        self.request_log = request_log
+
+    # ------------------------------------------------------------------ logging ---
+    def _logging_on(self, cfg) -> bool:
+        """Per-request switch: ``config.json`` -> ``request_log.enabled`` (hot reload)."""
+        return self.request_log is not None and cfg.request_log.enabled
+
+    def _record(self, meta: dict[str, Any], *, status_code: int, duration_ms: int, **extra: Any) -> None:
+        """Queue one request-log row; never raises and never blocks the forwarding path."""
+        if not meta.get("logging"):
+            return
+        entry = {
+            "ts": meta["ts"],
+            "ts_end": now_ts(),
+            "method": meta["method"],
+            "path": meta["path"],
+            "query": meta.get("query"),
+            "requested_model": meta.get("requested_model"),
+            "model": meta.get("model"),
+            "upstream": meta.get("upstream"),
+            "status": status_code,
+            "duration_ms": duration_ms,
+            "ttfb_ms": extra.get("ttfb_ms"),
+            "stream": meta.get("stream", 0),
+            "tokens": extra.get("tokens"),
+            "req_size": meta.get("req_size"),
+            "res_size": extra.get("res_size"),
+            "client_ip": meta.get("client_ip"),
+            "error": extra.get("error"),
+            "request_body": meta.get("request_body"),
+            "response_body": extra.get("response_body"),
+            "request_body_truncated": meta.get("request_body_truncated", 0),
+            "response_body_truncated": extra.get("response_body_truncated", 0),
+        }
+        self.request_log.record(entry)
+
+    def _record_error(self, meta: dict[str, Any], status_code: int, error: str) -> None:
+        duration_ms = round((time.perf_counter() - meta["started"]) * 1000)
+        logger.debug("Request log: %s /%s -> %s (%d ms)", meta["method"], meta["path"].lstrip("/"), status_code, duration_ms)
+        self._record(meta, status_code=status_code, duration_ms=duration_ms, error=error)
 
     # ------------------------------------------------------------------ helpers ---
     @staticmethod
@@ -133,6 +179,7 @@ class ProxyService:
     async def forward(self, request: Request, path: str) -> Response:
         cfg = self.manager.config
         method = request.method.upper()
+        started = time.perf_counter()
 
         # read and parse the request body
         raw_body = await request.body()
@@ -146,17 +193,36 @@ class ProxyService:
                 body = None
 
         path_clean = path.strip("/")
+        logging_on = self._logging_on(cfg)
+        req_text, req_trunc = sanitize_body(raw_body) if logging_on else (None, False)
+        requested = (body or {}).get("model")
+        meta: dict[str, Any] = {
+            "ts": now_ts(),
+            "method": method,
+            "path": "/" + path_clean,
+            "query": request.url.query or None,
+            "model": None,
+            "requested_model": requested if isinstance(requested, str) else None,
+            "upstream": None,
+            "client_ip": client_ip(request),
+            "req_size": len(raw_body),
+            "request_body": req_text,
+            "request_body_truncated": 1 if req_trunc else 0,
+            "stream": 0,
+            "started": started,
+            "logging": logging_on,
+        }
 
         # security hardening: block admin/model-management endpoints on public gateways
         if cfg.security.is_path_blocked(path_clean):
             logger.warning("Blocked admin/management endpoint: %s /%s", method, path_clean)
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Endpoint '/{path_clean}' is disabled on this public gateway.",
-            )
+            detail = f"Endpoint '/{path_clean}' is disabled on this public gateway."
+            self._record_error(meta, status.HTTP_403_FORBIDDEN, detail)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
 
         # security hardening: reject oversized request bodies (DoS protection)
         if cfg.security.max_body_bytes and raw_body and len(raw_body) > cfg.security.max_body_bytes:
+            self._record_error(meta, status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large.")
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail="Request body too large.",
@@ -174,13 +240,15 @@ class ProxyService:
         upstream = resolved.upstream if resolved else None
         if upstream is None:
             model = (body or {}).get("model", "")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=(
-                    f"No upstream configured for model '{model}'. "
-                    "Add it to an upstream's 'models' list, or set 'default_upstream'."
-                ),
+            meta["model"] = model or None
+            detail = (
+                f"No upstream configured for model '{model}'. "
+                "Add it to an upstream's 'models' list, or set 'default_upstream'."
             )
+            self._record_error(meta, status.HTTP_404_NOT_FOUND, detail)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+        meta["upstream"] = upstream.name
+        meta["model"] = (resolved.target if resolved else None) or (body or {}).get("model") or None
 
         # alias handling: swap in the real model name + force-inject parameters
         forward_body: Any = body
@@ -248,9 +316,11 @@ class ProxyService:
         )
 
         headers = self._build_headers(request, upstream)
+        streaming = self._should_stream(path_clean, json_body)
+        meta["stream"] = 1 if streaming else 0
 
         try:
-            if self._should_stream(path_clean, json_body):
+            if streaming:
                 return await self._forward_stream(
                     method=method,
                     url=url,
@@ -259,6 +329,7 @@ class ProxyService:
                     content=content,
                     params=params,
                     timeout=timeout,
+                    meta=meta,
                 )
             return await self._forward_normal(
                 method=method,
@@ -268,25 +339,23 @@ class ProxyService:
                 content=content,
                 params=params,
                 timeout=timeout,
+                meta=meta,
             )
         except httpx.ConnectError as exc:
             logger.error("Cannot connect to upstream %s (%s): %s", upstream.name, url, exc)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Upstream '{upstream.name}' is unreachable: {exc}",
-            ) from exc
+            detail = f"Upstream '{upstream.name}' is unreachable: {exc}"
+            self._record_error(meta, status.HTTP_502_BAD_GATEWAY, detail)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
         except httpx.ReadTimeout as exc:
             logger.error("Upstream %s read timed out: %s", upstream.name, exc)
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail=f"Upstream '{upstream.name}' timed out after {timeout}s.",
-            ) from exc
+            detail = f"Upstream '{upstream.name}' timed out after {timeout}s."
+            self._record_error(meta, status.HTTP_504_GATEWAY_TIMEOUT, detail)
+            raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=detail) from exc
         except httpx.HTTPError as exc:
             logger.error("Upstream %s request failed: %s", upstream.name, exc)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Upstream '{upstream.name}' error: {exc}",
-            ) from exc
+            detail = f"Upstream '{upstream.name}' error: {exc}"
+            self._record_error(meta, status.HTTP_502_BAD_GATEWAY, detail)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
     # ------------------------------------------------------------ Forwarding implementations ---
     async def _forward_stream(
@@ -298,6 +367,7 @@ class ProxyService:
         content: bytes | None,
         params: dict[str, str],
         timeout: float,
+        meta: dict[str, Any],
     ) -> Response:
         request = self.client.build_request(
             method=method,
@@ -311,12 +381,36 @@ class ProxyService:
         resp = await self.client.send(request, stream=True)
 
         async def body_iterator():
+            captured = bytearray()
+            total = 0
+            first_chunk_at: float | None = None
             try:
                 async for chunk in resp.aiter_bytes():
                     if chunk:
+                        if first_chunk_at is None:
+                            first_chunk_at = time.perf_counter()
+                        total += len(chunk)
+                        if meta["logging"] and len(captured) < LOG_BODY_BYTES:
+                            captured.extend(chunk[: LOG_BODY_BYTES - len(captured)])
                         yield chunk
             finally:
                 await resp.aclose()
+                if meta["logging"]:
+                    duration_ms = round((time.perf_counter() - meta["started"]) * 1000)
+                    ttfb_ms = (
+                        round((first_chunk_at - meta["started"]) * 1000) if first_chunk_at is not None else None
+                    )
+                    resp_text, _ = sanitize_body(bytes(captured))
+                    self._record(
+                        meta,
+                        status_code=resp.status_code,
+                        duration_ms=duration_ms,
+                        ttfb_ms=ttfb_ms,
+                        res_size=total,
+                        response_body=resp_text,
+                        response_body_truncated=1 if total > len(captured) else 0,
+                        error=None if resp.status_code < 400 else f"HTTP {resp.status_code}",
+                    )
 
         media_type = resp.headers.get("content-type")
         return StreamingResponse(
@@ -335,6 +429,7 @@ class ProxyService:
         content: bytes | None,
         params: dict[str, str],
         timeout: float,
+        meta: dict[str, Any],
     ) -> Response:
         resp = await self.client.request(
             method=method,
@@ -345,6 +440,20 @@ class ProxyService:
             params=params or None,
             timeout=timeout,
         )
+        if meta["logging"]:
+            duration_ms = round((time.perf_counter() - meta["started"]) * 1000)
+            resp_text, resp_trunc = sanitize_body(resp.content)
+            self._record(
+                meta,
+                status_code=resp.status_code,
+                duration_ms=duration_ms,
+                ttfb_ms=duration_ms,
+                res_size=len(resp.content),
+                tokens=extract_tokens(resp.content),
+                response_body=resp_text,
+                response_body_truncated=1 if resp_trunc else 0,
+                error=None if resp.status_code < 400 else f"HTTP {resp.status_code}",
+            )
         return Response(
             content=resp.content,
             status_code=resp.status_code,

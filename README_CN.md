@@ -14,6 +14,7 @@
 | **统一模型列表** | `/v1/models` 聚合配置中所有实例与别名，而非代理到单个实例 |
 | **别名 + 参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并强制注入 `think: false` |
 | **流式透传** | NDJSON（`/api/chat`）与 SSE（`/v1/chat/completions`）原样转发 |
+| **管理 API** | `/v1/management/*` 只读接口：上游/显存总览、配置投影（LLM / Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点），由 `ADMIN_PASSWORD` 独立鉴权 |
 | **配置热重载** | 修改 `config.json` 约 1 秒内自动生效，无需重启容器 |
 | **Docker 外挂** | 配置文件通过 `/data` 卷挂载 |
 | **路由优先级** | 同名模型出现在多个上游时，按 `priority` 数值最小者优先 |
@@ -30,6 +31,8 @@ llm-hub/
 │   ├── auth.py       # API Key 鉴权
 │   ├── proxy.py      # 反向代理与流式透传
 │   ├── rerank.py     # Rerank API 实现
+│   ├── request_log.py # 请求明细 SQLite 埋点（异步批量写入）
+│   ├── management.py # Web 管理台只读 API（/v1/management）
 │   └── websearch.py  # 联网检索代理（OpenCode API Gateway 上游）
 └── data/
     └── config.json   # 配置文件（挂载到容器 /data）
@@ -193,7 +196,8 @@ docker push registry.example.com/llm-hub:1.0.0
     "models": ["qwen3:8b", "qwen3.5:4b", "bge-m3:latest"],
     "timeout": 600,
     "description": "本机主实例",
-    "headers": {}
+    "headers": {},
+    "vram_total_gb": 32.0
   }
 ]
 ```
@@ -214,6 +218,8 @@ docker push registry.example.com/llm-hub:1.0.0
 - `priority`：路由优先级（整数，**默认 `0`**）。当同一个模型名在多个上游中都被声明时，
   网关会选中 `priority` **数值最小**的那个上游；数值相同则按 `upstreams` 列表中的声明顺序优先。
   常用于把同一模型同时挂在 GPU 实例与 iGPU/CPU 实例上，让高优实例先承接、其余作兜底
+- `vram_total_gb`：可选，该上游所在主机的显存总量（GiB）。该值无法通过 API 探测，
+  仅用于 Web 管理台总览页的「已用 / 总量」进度条；不配置则总览中显示已用量、总量为空
 
 #### 同名模型命中多个上游时的路由规则
 
@@ -376,6 +382,72 @@ Dify / RAGFlow / WorkBuddy 等客户端看到的模型列表是整齐的短名�
 - 调用方用网关自身 API Key 鉴权；只接受 POST（否则 **405**），上游不可达 / 超时分别返回 **502** / **504**
 
 请求/响应字段与 curl 示例见 [API 文档](docs/API.md#web-searchopencode-网关代理)。
+
+### `request_log` —— 请求明细入库开关
+
+```json
+"request_log": {
+  "enabled": true
+}
+```
+
+管理台「请求明细」页的数据来源：每笔经过网关的请求写入 SQLite（`llmhub.db`，WAL）。
+
+- `enabled`：**逐请求读取**的写库开关，默认 `true`。改成 `false` 后代理不再采集请求/响应体，
+  也不再落任何一行明细；因为每次请求都重新读取配置，改完保存即生效（热加载，无需重启）。
+  配置的 mtime 每秒最多比对一次，所以开关在约 1 秒内生效（已用真实服务实测）
+- 关闭状态下 `/v1/management/overview` 与 `/requests` 会回报 `request_log.enabled: false`，
+  管理台据此提示「日志已停用」，避免空列表被误读成没有流量
+- 库路径与保留天数属于部署级配置，走环境变量：`REQUEST_LOG_DB`、`REQUEST_LOG_RETENTION_DAYS`
+- 记录字段：`ts` / `ts_end` / `duration_ms` / `ttfb_ms`（时间与耗时，`ts`/`ts_end` 精确到秒，
+  亚秒耗时看 `duration_ms`）、`method` / `path` /
+  `query` / `requested_model` / `model` / `request_body` / `req_size` / `stream` / `client_ip`
+  （请求参数）、`status` / `upstream` / `response_body` / `res_size` / `tokens` / `error`（响应结果）；
+  响应体各截断 8 KB，凭据字段写盘前替换为 `***`；旧库启动时自动 `ALTER TABLE` 补列
+
+## Web 管理台 API
+
+管理台前端通过 `/v1/management/*` 读取网关状态（本期只读，不提供写配置接口），
+用**独立的管理员密码**鉴权，与网关的 `GATEWAY_API_KEYS` 无关：
+
+```bash
+# 设置管理员密码（不设置时管理接口统一返回 503）
+ADMIN_PASSWORD=<至少 16 位随机串>
+
+# 登录换取 12 小时 HttpOnly 会话 Cookie
+curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
+  -H "Content-Type: application/json" -d '{"password": "'"$ADMIN_PASSWORD"'"}'
+
+# 之后（浏览器或 headless）都用该 Cookie 认证
+curl -b cookie.txt http://localhost:8888/v1/management/overview
+```
+
+`ADMIN_PASSWORD` 只是登录页凭据，不能当请求凭据用：`Bearer` / `X-API-Key` 属于网关
+API Key，传给管理接口一律 401。
+
+| 路径 | 说明 |
+|------|------|
+| `GET /v1/management/overview` | KPI、上游摘要、运行中模型（GPU 100% / 部分 / 纯 CPU 判定） |
+| `GET /v1/management/upstreams[/{name}]` | 实例健康、显存占用、`/api/ps` 运行中模型与 `/api/tags` 已装模型 |
+| `GET /v1/management/models/{llm,rerank,systemone}` | 配置只读投影（API Key 一律掩码为 `••••••`） |
+| `GET /v1/management/tools/websearch` | Web Search 配置投影，`base_url` 由 provider 上游派生 |
+| `GET /v1/management/requests[/{id}]` | 请求明细（按时间/上游/模型/状态/路径筛选、分页、详情抽屉） |
+| `GET /v1/management/stats/{timeseries,distribution,failures}` | 时序聚合（每小时/每天的请求数、P95、错误数）、分组占比（上游 / 模型 / 成功失败，驱动饼图）与失败明细统计 |
+
+**请求明细落库：** 每次转发（流式 / 非流式 / 上游失败）都会写入 SQLite（WAL），
+默认位于 `config.json` 同级目录的 `llmhub.db`（容器内 `/data/llmhub.db`）。把
+`config.json` 的 `request_log.enabled` 设为 `false` 即可完全停止入库——该开关逐请求读取，
+保存后无需重启，约 1 秒内停止写入。
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `ADMIN_PASSWORD` | 未设置（管理接口 503） | 管理台登录密码；仅用于换取会话 Cookie，不能作请求凭据 |
+| `REQUEST_LOG_DB` | `<config 目录>/llmhub.db` | 明细库路径 |
+| `REQUEST_LOG_RETENTION_DAYS` | `30` | 明细保留天数，`0` 表示永久保留 |
+
+写入通过有界内存队列异步批量完成，不阻塞转发；请求/响应体截断到 8 KB，
+`authorization` / `api_key` / `token` / `password` 等字段落库前替换为 `***`。
+上游显存总量无法通过 Ollama API 获取，可在该上游配置 `vram_total_gb` 供总览显示。
 
 ## API 使用
 

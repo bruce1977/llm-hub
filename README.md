@@ -16,6 +16,7 @@ thinking mode).
 | **Unified model list** | `/v1/models` aggregates models & aliases from all upstreams instead of proxying to one instance |
 | **Alias + param injection** | `qwen3.5:4b-nothink` → forwards `qwen3.5:4b` and force-injects `think: false` |
 | **Streaming pass-through** | NDJSON (`/api/chat`) and SSE (`/v1/chat/completions`) forwarded as-is |
+| **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview, config projections (LLM / Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite), gated by `ADMIN_PASSWORD` |
 | **Config hot reload** | `config.json` changes take effect within ~1s, no restart required |
 | **Docker volume mount** | Config file mounted via `/data` |
 | **Routing priority** | When the same model appears in multiple upstreams, the lowest `priority` wins |
@@ -32,6 +33,8 @@ llm-hub/
 │   ├── auth.py       # API key authentication
 │   ├── proxy.py      # Reverse proxy & streaming pass-through
 │   ├── rerank.py     # Rerank API implementation
+│   ├── request_log.py # Request log (SQLite, async batched writes)
+│   ├── management.py # Read-only web console API (/v1/management)
 │   └── websearch.py  # Web search proxy (OpenCode API Gateway upstream)
 └── data/
     └── config.json   # Config file (mounted into the container at /data)
@@ -209,7 +212,8 @@ docker push registry.example.com/llm-hub:1.0.0
     "models": ["qwen3:8b", "qwen3.5:4b", "bge-m3:latest"],
     "timeout": 600,
     "description": "Main local instance",
-    "headers": {}
+    "headers": {},
+    "vram_total_gb": 32.0
   }
 ]
 ```
@@ -232,6 +236,9 @@ docker push registry.example.com/llm-hub:1.0.0
   several upstreams, the gateway picks the one with the **smallest** `priority`; ties keep the
   declaration order in `upstreams`. Useful for mounting the same model on a GPU instance and an
   iGPU / CPU instance so the high-priority one serves first and the rest act as fallback
+- `vram_total_gb`: optional total VRAM (GiB) of the host running this upstream. It cannot be
+  discovered over the API and is only used by the management console's "used / total" gauge;
+  when omitted the console shows the used amount but no total
 
 #### Routing when the same model matches several upstreams
 
@@ -403,6 +410,78 @@ response as-is (`query`, `results[]`, concatenated `text`, `sources`, and `answe
   or slow
 
 Full request/response contract and curl examples: [API.md → Web Search](docs/API.md#web-searchopencode-网关代理).
+
+### `request_log` — request detail switch
+
+```json
+"request_log": {
+  "enabled": true
+}
+```
+
+Feeds the console's "Requests" view: every call through the gateway becomes one SQLite row
+(`llmhub.db`, WAL).
+
+- `enabled`: the write switch, read **per request**, default `true`. With `false` the proxy stops
+  capturing request/response bodies and writes no row at all; because the flag is re-read on every
+  request, saving `config.json` applies without a restart — hot reload polls the file mtime at most
+  once per second, so the switch takes effect within ~1s (verified against a live server)
+- While it is off, `/v1/management/overview` and `/requests` report `request_log.enabled: false`,
+  so the console can say "logging disabled" instead of showing an empty list that looks like no traffic
+- Database path and retention stay deployment-level environment variables: `REQUEST_LOG_DB`,
+  `REQUEST_LOG_RETENTION_DAYS`
+- Recorded columns: `ts` / `ts_end` / `duration_ms` / `ttfb_ms` (timing — `ts` and `ts_end` are
+  second precision, so read `duration_ms` for sub-second cost), `method` / `path` /
+  `query` / `requested_model` / `model` / `request_body` / `req_size` / `stream` / `client_ip`
+  (request parameters), `status` / `upstream` / `response_body` / `res_size` / `tokens` / `error`
+  (result). Bodies are capped at 8 KB, credentials are stored as `***`, and an older database is
+  upgraded with `ALTER TABLE` at startup
+
+## Management API (web console)
+
+The web console reads gateway state through `/v1/management/*` (read-only in this release;
+no configuration writes). It is gated by a **separate administrator password**, not by
+`GATEWAY_API_KEYS`:
+
+```bash
+# Set the administrator password (without it every management call returns 503)
+ADMIN_PASSWORD=<16+ random chars>
+
+# Log in for a 12h HttpOnly session cookie
+curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
+  -H "Content-Type: application/json" -d '{"password": "'"$ADMIN_PASSWORD"'"}'
+
+# Every later call (browser or headless) authenticates with that cookie
+curl -b cookie.txt http://localhost:8888/v1/management/overview
+```
+
+The password is a login-page credential only. `Bearer` / `X-API-Key` are the gateway API
+keys and are ignored by `/v1/management` (they answer 401 there).
+
+| Path | Purpose |
+|------|---------|
+| `GET /v1/management/overview` | KPIs, upstream summary, running models with GPU / partial / CPU classification |
+| `GET /v1/management/upstreams[/{name}]` | Instance health, VRAM usage, `/api/ps` running models and `/api/tags` installed models |
+| `GET /v1/management/models/{llm,rerank,systemone}` | Read-only config projections (API keys always masked as `••••••`) |
+| `GET /v1/management/tools/websearch` | Web search config projection, with `base_url` derived from the provider upstream |
+| `GET /v1/management/requests[/{id}]` | Request log with time/upstream/model/status/path filters, pagination and per-entry detail |
+| `GET /v1/management/stats/{timeseries,distribution,failures}` | Hourly/daily counts, P95 and error counts; grouped counts per upstream / model / ok-vs-error for the pies; failure breakdown by status and upstream |
+
+**Request log storage:** every forwarded call (streaming, non-streaming, upstream failure) is
+appended to SQLite in WAL mode, by default `llmhub.db` next to `config.json`
+(`/data/llmhub.db` in the container). Set `request_log.enabled: false` in `config.json` to stop
+writing altogether — the switch is read per request, so it applies without a restart.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `ADMIN_PASSWORD` | unset (management API → 503) | Console login password; exchanged for a session cookie, not a request credential |
+| `REQUEST_LOG_DB` | `<config dir>/llmhub.db` | Request log database path |
+| `REQUEST_LOG_RETENTION_DAYS` | `30` | Prune rows older than N days; `0` keeps everything |
+
+Writes go through a bounded in-memory queue and batched `executemany`, so forwarding never waits
+on disk. Bodies are truncated to 8 KB and `authorization` / `api_key` / `token` / `password`
+fields are replaced with `***` before storage. Total VRAM is not discoverable over the Ollama
+API — set `vram_total_gb` on an upstream to show it in the overview gauge.
 
 ## API usage
 

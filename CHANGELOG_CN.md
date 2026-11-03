@@ -7,6 +7,23 @@
 
 ## [未发布]
 
+### 新增（Web 管理台管理 API）
+
+- 新增只读管理 API `/v1/management`（实现在 `app/management.py`），由 `ADMIN_PASSWORD` + `require_admin` 保护：`auth/login|logout|ping`、`overview`、`upstreams[/{name}]`、`models/llm|rerank|systemone`、`tools/websearch`、`requests[/{id}]`、`stats/timeseries`、`stats/distribution`、`stats/failures`。登录沿用 12 小时 HMAC 会话 Cookie，`require_admin` 只认该 Cookie——密码是登录凭据，把它（或网关 API Key）放到 `Bearer` / `X-API-Key` 上一律 **401**；未配置 `ADMIN_PASSWORD` 时所有接口返回 **503**
+- `overview` / `upstreams` 并行探测各上游（5 秒超时，单个实例离线不会拖慢整页），并按 `size_vram / size` 把 Ollama 运行中模型标记为 GPU / 部分 / 纯 CPU；不可达上游返回 `status: offline`，详情接口返回 **503** 与 `"unreachable": true`
+- 配置投影只读且不回显凭据：上游 header 中的密钥、System One 环境变量密钥与 Web Search provider 密钥统一返回 `••••••`（只告知该环境变量是否已设置）；`models/llm` 含别名与 `num_ctx_overrides`，`models/rerank` 额外给出 `upstream_api`（上游协议）与 `on_error`（失败策略），`models/rerank` / `models/systemone` 附带请求/响应示例
+- `tools/websearch` 为管理台 Tools 页投影 `websearch` 配置段，并用 `Config.websearch_upstream_obj()` 派生 `base_url` / `upstream_type` / `provider_configured`——与 `WebSearchService` 用的是同一个解析函数，页面不会显示转发器不会调用的地址
+- 新增 `app/request_log.py`：SQLite 请求明细库（`llmhub.db`，WAL，`synchronous=NORMAL`），经有界内存队列（10000 条，满时丢弃并告警）由单个后台任务按 100 条批量 `asyncio.to_thread` 落盘，转发主链路不等待磁盘。默认保留 30 天（每小时清理），可用 `REQUEST_LOG_DB` / `REQUEST_LOG_RETENTION_DAYS`（0 = 永久保留）调整
+- `requests` 表逐行记录完整交互：时间（`ts` 到达、`ts_end` 完成——流式在流关闭时写入、`duration_ms`、`ttfb_ms`）、请求参数（`method`、`path`、`query`、`requested_model` 客户端写的原名、别名解析后的 `model`、`request_body`、`req_size`、`stream`、`client_ip`）与响应结果（`status`、`upstream`、`response_body`、`res_size`、`tokens`、`error`），外加两个 `*_truncated` 标记。`_init_db` 会用 `PRAGMA table_info(requests)` 与目标结构比对，缺列就 `ALTER TABLE ADD COLUMN`，旧库原地升级
+- 新增 `config.json` 配置段 `request_log`，其 `enabled`（默认 `true`）是入库总开关：`ProxyService._logging_on` **逐请求**判定，因此改完保存无需重启即可生效——配置 mtime 每秒最多比对一次，开关在约 1 秒内生效（已对本地 Ollama 实测：关闭期间零新增行，重新开启恰好一行）；关闭时不采集请求/响应体、也不产生任何行。`/v1/management/overview` 与 `/v1/management/requests` 会以 `request_log: {enabled, db, retention_days, dropped}` 回报状态，前端可据此提示「日志已停用」而不是显示空列表
+- `proxy.py` 覆盖所有出口埋点：被拦截（403）、请求体过大（413）、无可用上游（404）、流式、非流式，以及连接/读取/HTTP 失败（502/504）；记录方法、路径、解析后的真实模型名、上游、状态码、耗时、TTFB、流式标记、token 用量（`usage.total_tokens` 或 Ollama 的 `prompt_eval_count + eval_count`）、请求/响应字节数、客户端 IP 与截断后的请求/响应体
+- 请求/响应体落库前截断至 8 KB，`authorization` / `api_key` / `token` / `password` 等字段替换为 `***`；详情接口返回供前端抽屉展示
+- `GET /v1/management/requests` 支持 `start` / `end` / `upstream` / `model` / `status`（2xx\|3xx\|4xx\|5xx）/ `path` / `page` / `page_size`，返回 `stats`（数量、P50/P95/P99、错误率）、`rows` 与 `pagination`；`stats/timeseries` 按小时/天分桶统计数量、错误数与 P95；`stats/distribution?group_by=upstream|model|status` 返回驱动总览页三张饼图的分组计数（`status` 只分 `ok`（<400）与 `error`（≥400），未命中上游的行计入 `-`，因此各项相加恒等于明细总数；其他 `group_by` 取值返回 **400**）；`stats/failures` 给出按状态码、按上游的失败分布及最近样本
+- `UpstreamConfig.vram_total_gb`：可选，声明上游主机显存总量，供总览页「已用 / 总量」进度条使用（无法通过 API 探测）
+- `/v1/management` 在 catch-all 之前注册，并与 `/admin` 一样不受 `security.path_allowlist` 限制；旧的 `/admin/login|logout` 改为复用同一实现
+- 测试：新增 `tests/test_management.py`（142 项），使用本地 mock Ollama 覆盖鉴权（只认 Cookie；密码或网关 Key 走 Bearer / X-API-Key → 401；未配置 503）、探测与设备判定、掩码投影（含 `tools/websearch` 与 rerank 的 `upstream_api` / `on_error`）、流式/非流式/502 埋点、新增列（到达/完成时间、别名的 `requested_model` 与解析后 `model`、`query`）、筛选、分页、时序、分布（分桶约定、排序、总数与 `group_by` 校验）、`request_log.enabled` 关闭与重新开启，以及旧库 `ALTER TABLE` 升级
+- 文档与配置：`docs/API.md` 新增「管理 API（Web 管理台）」章节，含 `requests` 字段清单、`request_log.enabled` 开关说明与 `stats/distribution` / `tools/websearch` 响应示例；README / README_CN 补充特性行、目录、`request_log` 配置段、`ADMIN_PASSWORD` / `REQUEST_LOG_*` 环境变量与 `vram_total_gb` 说明；`docs/TESTCASES.md` 新增测试 34-40；同步更新 `.env.example`、`data/example.config.json`（附带 `request_log`）、`.gitignore`（`data/*.db*`）、`docs/DEPLOY.md` 与 AGENTS.md
+
 ### 新增（联网检索）
 
 - 新增端点 `POST /v1/tools/web-search`：由 OpenCode API Gateway 提供关键词网页检索，请求体与上游响应**原样透传**（`query`、`results[]`、拼接后的 `text`、`sources`，`synthesize: true` 时另有 `answer`）

@@ -143,6 +143,9 @@ class UpstreamConfig(BaseModel):
     description: str = ""
     # Extra headers attached when forwarding (optional, e.g. when the upstream has its own auth)
     headers: dict[str, str] = Field(default_factory=dict)
+    # Total VRAM of the host running this upstream, for the management console's
+    # "used / total" gauge. Not discoverable over the API, so it is declared here.
+    vram_total_gb: float | None = None
     # Scheduling priority used when the SAME model is declared by several upstreams.
     # The lowest value wins; ties keep the order in which upstreams are listed.
     priority: int = 0
@@ -332,6 +335,21 @@ class WebSearchConfig(BaseModel):
     timeout: float = 60.0
 
 
+class RequestLogConfig(BaseModel):
+    """SQLite request log behind the web console's "Requests" view.
+
+    `enabled` is the per-request write switch: with it off the gateway records nothing at
+    all -- request/response bodies are not even copied -- and the console shows an empty,
+    disabled log. It is read on every request, so flipping it in `config.json` takes
+    effect immediately (hot reload), without a restart.
+
+    Storage location and retention are deployment-level and stay in the environment:
+    `REQUEST_LOG_DB` and `REQUEST_LOG_RETENTION_DAYS`.
+    """
+
+    enabled: bool = True
+
+
 class RateLimitConfig(BaseModel):
     """In-memory token-bucket rate limiter (single-process only).
 
@@ -423,6 +441,7 @@ class Config(BaseModel):
     rerank: RerankConfig = Field(default_factory=RerankConfig)
     systemone: SystemOneConfig = Field(default_factory=SystemOneConfig)
     websearch: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    request_log: RequestLogConfig = Field(default_factory=RequestLogConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     @model_validator(mode="after")
@@ -670,6 +689,11 @@ def build_default_config() -> dict[str, Any]:
             "path": "v1/web-search",
             "api_key_env": "",
             "timeout": 60.0,
+        },
+        "request_log": {
+            # Writes every forwarded request into the SQLite log the web console reads.
+            # Turn it off to keep no request/answer history on disk at all.
+            "enabled": True,
         },
     }
 

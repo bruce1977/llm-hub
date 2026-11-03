@@ -90,6 +90,14 @@ scripts\docker-build.bat registry.example.com/team/llm-hub 1.3.0
 | `TZ` | ❌ | 时区，默认 `UTC` |
 | `SYSTEMONE_SERVER_API_KEY` | ❌ | System One 后端密钥，仅当 `systemone.api_key_env` 指向它时才需要；laya-server 必需，Ollama 0.40+ 后端会忽略该头 |
 | `OPENCODE_GATEWAY_API_KEY` | ❌ | 联网检索上游密钥，仅当 `websearch.api_key_env` 指向它时才需要（默认留空 = 不签名） |
+| `ADMIN_PASSWORD` | ❌ | Web 管理台登录密码，独立于 `GATEWAY_API_KEYS`；仅用于 `POST /v1/management/auth/login` 换取会话 Cookie，本身不能作为 `Bearer` / `X-API-Key` 请求凭据。未设置时 `/v1/management/*` 全部返回 503 |
+| `REQUEST_LOG_DB` | ❌ | 请求明细 SQLite 路径，默认 `CONFIG_PATH` 同目录的 `llmhub.db`（容器内为 `/data/llmhub.db`） |
+| `REQUEST_LOG_RETENTION_DAYS` | ❌ | 请求明细保留天数，默认 `30`；`0` 表示永久保留 |
+
+> 管理台会把请求明细写入 SQLite（WAL 模式），需要 `/data` 目录可写。若使用只读挂载，
+> 请把 `REQUEST_LOG_DB` 指到可写路径，或设为空目录下的默认位置。
+> 是否入库由 `config.json` 的 `request_log.enabled` 控制（默认 `true`）：该开关逐请求读取，
+> 改成 `false` 保存后无需重启容器；配置的 mtime 每秒最多比对一次，因此约 1 秒内停止写入。
 
 ---
 
