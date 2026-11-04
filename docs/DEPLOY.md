@@ -57,6 +57,10 @@ curl http://localhost:8888/health
 curl http://localhost:8888/v1/models -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
+管理台：浏览器打开 `http://localhost:8888/admin/`，用户名 `admin`、密码为 `.env` 里设置的
+`ADMIN_PASSWORD`。未设置该变量时页面显示「管理台未启用」，`/v1/management/*` 一律返回 503；
+把 `.env` 里的密码改掉后重启容器即可（旧会话同时失效）。
+
 ---
 
 ## 一键构建 / 发布脚本（Windows）
@@ -79,6 +83,54 @@ scripts\docker-build.bat registry.example.com/team/llm-hub 1.3.0
 - `docker-publish.bat` 先构建、成功后才依次推送 `latest` 与版本号标签；推送失败立即停止并提示 `docker login`
 - 脚本不含任何 git 操作：提交、打 tag 请在发布前自己完成
 
+### 本机启动脚本（不使用 Docker）
+
+想在宿主机上直接跑网关（调试上游、验证配置），用同一目录下的 `start-local.bat` / `start-local.ps1`：
+
+```bat
+:: 检查通过后启动（默认带 --reload）
+scripts\start-local.bat
+
+:: 只做启动前检查，不启动服务
+scripts\start-local.bat -CheckOnly
+
+:: 先装依赖，再换端口启动
+scripts\start-local.bat -Install -Port 8888
+```
+
+它做三件事：定位 python 与 `data\config.json`、按 `.env` 注入环境变量（shell 里已设置的变量优先），然后
+调用应用**自己的**模块跑一遍检查——缺依赖、Pydantic 拒绝配置、开了鉴权却没有 API Key、弱/占位 Key、端口被占用、
+`app\web` 未构建——全部通过才用 `--app-dir app` 在 `app/` 目录下启动 uvicorn，与镜像的 `WORKDIR /app` 一致，
+所以 `.env` 里的 `../data/config.json`、`../data/.keys` 在本地和容器里解析到同一份文件。其余参数见 README 的「启动脚本」一节。
+
+### 管理台前端与镜像
+
+管理台（`/admin`）的前端是**预先构建好再提交**的：`npm run build` 把产物写进 `app/web`，该目录
+属于版本库内容，`Dockerfile` 只做 `COPY app/web /app/web`，镜像里没有 node 工具链，构建容器时也不会执行 `npm`。
+产物与模块同级，因此本地 `app/web` 与镜像 `/app/web` 走同一个解析路径（和 `app/static` 一样）。
+前端源码全部为 TypeScript（`*.ts` 模块 + `<script setup lang="ts">` 单文件组件），`npm run build`
+会先执行 `vue-tsc --noEmit`，类型错误直接让构建失败；只做检查可用 `npm run typecheck`。
+
+因此改过 `web/src` 之后，必须在构建镜像**之前**重新生成产物并把 `app/web` 一起提交：
+
+```bat
+cd web
+npm install
+npm run typecheck
+npm run build
+cd ..
+scripts\docker-build.bat
+```
+
+只改后端或配置时不需要这一步；`npm run dev`（默认 `http://localhost:5173/admin/`，
+把 `/v1/management` 代理到本地 8000 的网关）只用于开发，不产生镜像内容。
+若 `app/web/index.html` 缺失，`/admin` 会返回 503 并提示运行 `npm run build`，
+其余网关功能不受影响。
+
+> **用 `-v ./app:/app` 覆盖模块目录时**（文档里的热补丁跑法）：挂载会把镜像里的 `/app` 整个换成宿主机的
+> `app/`，所以宿主机那份也必须先 `npm run build` 生成 `app/web`，否则 `/admin` 变成 503。
+> 只挂 `-v ./data:/data` 的常规跑法不受影响。
+
 ---
 
 ## 环境变量
@@ -90,7 +142,7 @@ scripts\docker-build.bat registry.example.com/team/llm-hub 1.3.0
 | `TZ` | ❌ | 时区，默认 `UTC` |
 | `SYSTEMONE_SERVER_API_KEY` | ❌ | System One 后端密钥，仅当 `systemone.api_key_env` 指向它时才需要；laya-server 必需，Ollama 0.40+ 后端会忽略该头 |
 | `OPENCODE_GATEWAY_API_KEY` | ❌ | 联网检索上游密钥，仅当 `websearch.api_key_env` 指向它时才需要（默认留空 = 不签名） |
-| `ADMIN_PASSWORD` | ❌ | Web 管理台登录密码，独立于 `GATEWAY_API_KEYS`；仅用于 `POST /v1/management/auth/login` 换取会话 Cookie，本身不能作为 `Bearer` / `X-API-Key` 请求凭据。未设置时 `/v1/management/*` 全部返回 503 |
+| `ADMIN_PASSWORD` | ❌ | Web 管理台登录密码（用户名固定 `admin`），与 `GATEWAY_API_KEYS` 是两套凭据：它只用于 `POST /v1/management/auth/login` 换取 12 小时会话 Cookie，本身当作 `Bearer` / `X-API-Key` 提交仍是 401。`/v1/management/*` 除该 Cookie 外也接受 `GATEWAY_API_KEYS` 里的网关 Key（供脚本复用）。未设置时 `/admin` 显示「管理台未启用」，`/v1/management/*` 全部返回 503 |
 | `REQUEST_LOG_DB` | ❌ | 请求明细 SQLite 路径，默认 `CONFIG_PATH` 同目录的 `llmhub.db`（容器内为 `/data/llmhub.db`） |
 | `REQUEST_LOG_RETENTION_DAYS` | ❌ | 请求明细保留天数，默认 `30`；`0` 表示永久保留 |
 

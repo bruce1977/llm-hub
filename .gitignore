@@ -24,7 +24,16 @@ venv/
 # Editors / OS
 .idea/
 .vscode/
+.ruff_cache/
 .DS_Store
+_*.*
+
+# Frontend toolchain: the built console (app/web) IS committed -- the image copies it
+# straight from the app package, so the container never runs node. The installed
+# packages and the Vite cache are not.
+web/node_modules/
+web/.vite/
+web/.vite-temp/
 
 # Logs
 *.log

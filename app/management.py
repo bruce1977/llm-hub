@@ -24,6 +24,7 @@ from typing import Any
 from admin_auth import (
     ADMIN_COOKIE_NAME,
     ADMIN_SESSION_TTL,
+    ADMIN_USERNAME,
     create_admin_token,
     get_admin_password,
     require_admin,
@@ -48,11 +49,14 @@ _STATUS_FILTERS = {"2xx", "3xx", "4xx", "5xx"}
 # Auth (login/logout are public; everything else requires an admin session)
 # --------------------------------------------------------------------------- #
 class AdminLogin(BaseModel):
+    # The console has one account; the username is still checked so a mistyped login
+    # page fails with 401 instead of silently accepting anything.
+    username: str = ADMIN_USERNAME
     password: str
 
 
 async def login(request: Request, body: AdminLogin) -> Response:
-    """Validate the admin password and mint a signed session cookie."""
+    """Validate the admin credentials and mint a signed session cookie."""
     key = get_admin_password()
     if not key:
         raise HTTPException(
@@ -60,9 +64,10 @@ async def login(request: Request, body: AdminLogin) -> Response:
             detail="Admin is not configured: set the ADMIN_PASSWORD environment variable.",
         )
     # Constant-time compare; a small delay blunts online brute-force.
-    if not hmac.compare_digest(body.password, key):
+    name_ok = hmac.compare_digest(body.username.strip().lower(), ADMIN_USERNAME)
+    if not name_ok or not hmac.compare_digest(body.password, key):
         await asyncio.sleep(0.1)
-        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Invalid admin password.")
+        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password.")
     resp = JSONResponse({"ok": True})
     resp.set_cookie(
         ADMIN_COOKIE_NAME,
@@ -263,6 +268,7 @@ async def overview(request: Request, _=Depends(require_admin)):
             "upstreams": [_public_upstream(i) for i in infos],
             "running_models": running,
             "generated_at": now_ts(),
+            "gateway_version": getattr(request.app.state, "gateway_version", None),
         }
     )
 

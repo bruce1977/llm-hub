@@ -1,0 +1,1 @@
+import{L as e}from"./index-CD1JwNEA.js";var t=e({version:null});export{t};

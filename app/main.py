@@ -37,7 +37,7 @@ from auth import (
 from config import CONFIG_PATH, ConfigManager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from management import AdminLogin
 from management import login as admin_login
 from management import logout as admin_logout
@@ -151,6 +151,10 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+# The console shows the gateway build in its sidebar; /overview reads it off the state
+# instead of importing main back into management (which would be circular).
+app.state.gateway_version = __version__
 
 
 # --------------------------------------------------------------------------- #
@@ -765,6 +769,112 @@ async def route_ps(request: Request, _auth=Depends(require_api_key)):
     return await ps_response(request)
 
 
+# Ollama-native text completion. Everything about it is the proxy's normal path
+# (model routing, alias + parameter injection, num_ctx clamping, NDJSON streaming,
+# request logging); this explicit route exists so the endpoint is described in
+# /openapi.json and so non-POST methods get a gateway 405 instead of being proxied.
+@app.post(
+    "/api/generate",
+    include_in_schema=True,
+    summary="Ollama-native text generation (routed by model, passed through)",
+    tags=["generation"],
+    openapi_extra={
+        "description": (
+            "Forwarded to the upstream that owns `model`, exactly like the catch-all "
+            "proxy. Unknown fields are preserved; `stream` may be omitted because "
+            "Ollama streams `/api/generate` by default."
+        ),
+        "requestBody": {
+            "required": True,
+            "description": (
+                "`model` is resolved through the gateway's aliases and routing before "
+                "forwarding, so the forwarded body can carry a different model name plus "
+                "alias-injected parameters. `raw: true` skips the model's chat template, "
+                "which is what a reranker/scoring prompt needs."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["model", "prompt"],
+                        "properties": {
+                            "model": {"type": "string", "description": "Model name or gateway alias."},
+                            "prompt": {"type": "string", "description": "Prompt to continue."},
+                            "system": {"type": "string", "description": "System prompt (template mode)."},
+                            "template": {"type": "string", "description": "Override the model's prompt template."},
+                            "context": {"type": "array", "items": {"type": "integer"}, "description": "Ollama context tokens from a previous call."},
+                            "raw": {"type": "boolean", "description": "Skip the chat template and continue `prompt` verbatim."},
+                            "images": {"type": "array", "items": {"type": "string"}, "description": "Base64 images for vision models."},
+                            "format": {
+                                "description": "\"json\" or a JSON schema for structured output.",
+                                "oneOf": [{"type": "string", "enum": ["json"]}, {"type": "object"}],
+                            },
+                            "stream": {"type": "boolean", "description": "Default true (NDJSON); false returns one JSON object."},
+                            "keep_alive": {"description": "How long the model stays loaded, e.g. \"3m\" or 0."},
+                            "logprobs": {"type": "boolean", "description": "Return per-token log probabilities."},
+                            "top_logprobs": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Alternatives per position (requires logprobs)."},
+                            "options": {
+                                "type": "object",
+                                "description": "Generation options; `num_ctx` may be clamped by the gateway's num_ctx_overrides.",
+                                "properties": {
+                                    "temperature": {"type": "number"},
+                                    "top_p": {"type": "number"},
+                                    "num_predict": {"type": "integer"},
+                                    "num_ctx": {"type": "integer"},
+                                    "seed": {"type": "integer"},
+                                    "stop": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "additionalProperties": True,
+                            },
+                        },
+                        "additionalProperties": True,
+                    },
+                    "example": {
+                        "model": "qwen3:8b",
+                        "prompt": "写一首关于编程的诗：",
+                        "raw": True,
+                        "stream": False,
+                        "keep_alive": "3m",
+                        "options": {"temperature": 0, "num_predict": 256},
+                    },
+                }
+            },
+        },
+        "responses": {
+            "200": {
+                "description": "Upstream response passed through unchanged (NDJSON when streaming, one JSON object otherwise).",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "model": "qwen3:8b",
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "response": "代码如诗行，逻辑似水流……",
+                            "done": True,
+                            "done_reason": "stop",
+                            "total_duration": 2345678901,
+                            "load_duration": 1200000000,
+                            "prompt_eval_count": 12,
+                            "prompt_eval_duration": 300000000,
+                            "eval_count": 50,
+                            "eval_duration": 700000000,
+                        }
+                    },
+                    "application/x-ndjson": {
+                        "example": '{"model":"qwen3:8b","response":"代码","done":false}\n'
+                        '{"model":"qwen3:8b","response":"如诗行","done":true,"done_reason":"stop","eval_count":8}\n'
+                    },
+                },
+            },
+            "404": {"description": "No upstream serves the requested model and routing is strict."},
+            "405": {"description": "`/api/generate` only accepts POST."},
+        },
+    },
+)
+async def route_generate(request: Request, _auth=Depends(require_api_key)):
+    proxy: ProxyService = request.app.state.proxy
+    return await proxy.forward(request, "api/generate")
+
+
 @app.post(
     "/v1/systemone",
     include_in_schema=True,
@@ -999,6 +1109,47 @@ async def route_admin_ping(_=Depends(require_admin)):
     return JSONResponse({"ok": True, "admin": True})
 
 
+# --------------------------------------------------------------------------- #
+# Web console: the Vue SPA built into app/web, served under /admin
+# --------------------------------------------------------------------------- #
+# Static assets carry no secrets, so they stay anonymous - the SPA itself is gated
+# by the login screen, and every /v1/management call it makes needs a session
+# cookie or a gateway API key. `npm run build` in web/ writes app/web, which is next
+# to the modules locally and lands in /app/web in the image (same flat layout as
+# app/static), so one path resolves in both.
+CONSOLE_DIST = Path(__file__).resolve().parent / "web"
+CONSOLE_MISSING_DETAIL = (
+    "Web console is not built: run `npm install && npm run build` in web/, "
+    "or use an image that ships app/web."
+)
+
+
+def _console_headers(asset_path: str) -> dict[str, str]:
+    # Vite content-hashes everything under assets/, so those files may be cached
+    # forever; index.html must always be revalidated or a rebuild never lands.
+    if asset_path.startswith("assets/"):
+        return {"Cache-Control": "public, max-age=31536000, immutable"}
+    return {"Cache-Control": "no-cache"}
+
+
+@app.get("/admin", include_in_schema=False, tags=["admin"])
+async def route_console_root():
+    """Canonical console entrypoint: /admin/ so relative routing has a base."""
+    return RedirectResponse(url="/admin/")
+
+
+@app.get("/admin/{asset_path:path}", include_in_schema=False, tags=["admin"])
+async def route_console(asset_path: str):
+    if not (CONSOLE_DIST / "index.html").is_file():
+        return JSONResponse({"detail": CONSOLE_MISSING_DETAIL}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    candidate = (CONSOLE_DIST / asset_path).resolve()
+    # resolve() + relative check: ../ segments can never escape the built directory
+    if candidate.is_file() and candidate.is_relative_to(CONSOLE_DIST):
+        return FileResponse(candidate, headers=_console_headers(asset_path))
+    # Unknown path: let the SPA router answer (deep links such as /admin/requests).
+    return FileResponse(CONSOLE_DIST / "index.html", headers={"Cache-Control": "no-cache"})
+
+
 # Management API for the web console: read-only dashboard, upstream probes,
 # config projections and request-log queries. Registered before the catch-all,
 # otherwise every /v1/management call would be proxied to an upstream.
@@ -1012,7 +1163,7 @@ app.include_router(management_router)
 # method, so without this guard a GET/PUT/DELETE to e.g. /v1/rerank would be
 # proxied to an upstream instead of being rejected with 405.
 POST_ONLY_PATHS = frozenset(
-    {"/v1/rerank", "/rerank", "/api/rerank", "/v1/systemone", "/v1/tools/web-search"}
+    {"/v1/rerank", "/rerank", "/api/rerank", "/v1/systemone", "/v1/tools/web-search", "/api/generate"}
 )
 
 

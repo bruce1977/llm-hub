@@ -179,6 +179,30 @@ def run() -> int:
         check("/openapi.json includes /", "/" in paths, str(sorted(paths)))
         check("/openapi.json dropped /healthz", "/healthz" not in paths, str(sorted(paths)))
 
+        # the Ollama-native completion endpoint is explicitly documented
+        gen_op = (spec.get("paths", {}).get("/api/generate", {}) or {}).get("post", {})
+        check("/openapi.json includes /api/generate", bool(gen_op), str(sorted(paths)))
+        gen_schema = ((gen_op.get("requestBody") or {}).get("content") or {}).get("application/json", {}).get(
+            "schema", {}
+        )
+        check(
+            "generate: request schema requires model + prompt",
+            gen_schema.get("required") == ["model", "prompt"],
+            str(gen_schema)[:160],
+        )
+        check(
+            "generate: request schema covers raw / logprobs / format / options / keep_alive",
+            {"raw", "logprobs", "top_logprobs", "format", "options", "keep_alive", "context"}
+            <= set(gen_schema.get("properties", {})),
+            str(sorted(gen_schema.get("properties", {}))),
+        )
+        gen_ok = ((gen_op.get("responses") or {}).get("200", {}) or {}).get("content", {})
+        check(
+            "generate: 200 documents both NDJSON and JSON bodies",
+            {"application/x-ndjson", "application/json"} <= set(gen_ok),
+            str(sorted(gen_ok)),
+        )
+
         # Swagger auth: shared Authorize schemes + an inline X-API-Key input
         # box inside every endpoint's request section (Parameters -> Try it out).
         schemes = spec.get("components", {}).get("securitySchemes", {})

@@ -13,8 +13,9 @@
 | **联网检索** | `POST /v1/tools/web-search`，把 OpenCode API Gateway 的关键词网页检索收敛到统一入口 |
 | **统一模型列表** | `/v1/models` 聚合配置中所有实例与别名，而非代理到单个实例 |
 | **别名 + 参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并强制注入 `think: false` |
-| **流式透传** | NDJSON（`/api/chat`）与 SSE（`/v1/chat/completions`）原样转发 |
-| **管理 API** | `/v1/management/*` 只读接口：上游/显存总览、配置投影（LLM / Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点），由 `ADMIN_PASSWORD` 独立鉴权 |
+| **流式透传** | NDJSON（`/api/chat`、`/api/generate`）与 SSE（`/v1/chat/completions`）原样转发 |
+| **管理 API** | `/v1/management/*` 只读接口：上游/显存总览、配置投影（LLM / Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点），凭据为管理台会话 Cookie 或网关 API Key |
+| **Web 管理台** | Vue 3 + TypeScript + Element Plus + ECharts 单页应用，构建后由网关在 `/admin` 直接提供（镜像内不含 node）：总览、上游、模型配置、请求明细与图表，本期全部只读 |
 | **配置热重载** | 修改 `config.json` 约 1 秒内自动生效，无需重启容器 |
 | **Docker 外挂** | 配置文件通过 `/data` 卷挂载 |
 | **路由优先级** | 同名模型出现在多个上游时，按 `priority` 数值最小者优先 |
@@ -33,7 +34,10 @@ llm-hub/
 │   ├── rerank.py     # Rerank API 实现
 │   ├── request_log.py # 请求明细 SQLite 埋点（异步批量写入）
 │   ├── management.py # Web 管理台只读 API（/v1/management）
-│   └── websearch.py  # 联网检索代理（OpenCode API Gateway 上游）
+│   ├── websearch.py  # 联网检索代理（OpenCode API Gateway 上游）
+│   └── web/          # 管理台构建产物（`npm run build` 的输出），网关在 /admin 提供服务
+├── web/
+│   └── src/          # 管理台前端源码（Vue 3 + TypeScript + Vite + Element Plus + ECharts）
 └── data/
     └── config.json   # 配置文件（挂载到容器 /data）
 ```
@@ -88,6 +92,11 @@ docker run -d --name llm-hub \
 # 4. 验证
 curl http://localhost:8888/health
 ```
+
+管理台：浏览器打开 `http://localhost:8888/admin/`，用户名 `admin`，密码即 `.env` 里设置的
+`ADMIN_PASSWORD`；不设置该变量时页面会显示「管理台未启用」，`/v1/management/*` 一律返回 503。
+管理台前端随镜像发布在 `app/web`（`npm run build` 的产物，与模块同级）；上面第 3 步把宿主机的
+`app` 目录挂到 `/app`，所以那份也必须是构建过的，否则 `/admin` 会返回 503。
 
 > **密钥通过 `.env` 提供**：`--env-file` 读取其中的 `GATEWAY_API_KEYS` 并注入容器，
 > `config.json` 里因此不需要写任何密钥。请妥善保管 `.env`，切勿提交到版本库；换密钥时只改这一处即可。
@@ -405,10 +414,29 @@ Dify / RAGFlow / WorkBuddy 等客户端看到的模型列表是整齐的短名�
   （请求参数）、`status` / `upstream` / `response_body` / `res_size` / `tokens` / `error`（响应结果）；
   响应体各截断 8 KB，凭据字段写盘前替换为 `***`；旧库启动时自动 `ALTER TABLE` 补列
 
-## Web 管理台 API
+## Web 管理台
 
-管理台前端通过 `/v1/management/*` 读取网关状态（本期只读，不提供写配置接口），
-用**独立的管理员密码**鉴权，与网关的 `GATEWAY_API_KEYS` 无关：
+管理台是 Vue 3 + TypeScript + Element Plus + ECharts 单页应用，源码在 `web/src`（`*.ts` 模块与
+`<script setup lang="ts">` 单文件组件，`strict` 模式），构建产物写入 **`app/web`**
+并随仓库提交，访问地址 **`http://localhost:8888/admin/`**（由网关自己以静态文件提供，容器内不需要 node；
+`app/web` 与模块同级，本地和镜像里的解析路径因此是同一个）。
+登录用户名固定为 `admin`，密码来自环境变量 `ADMIN_PASSWORD`，登录成功后签发 12 小时
+HttpOnly 会话 Cookie；页面包括 Dashboard、Upstreams、Models（LLM / Rerank / System One）、
+Tools（Web Search）、Requests 与 Settings，本期**全部只读**，不提供写配置接口。
+任何管理接口返回 401 时前端会自动登出并跳回登录页；503 不当作鉴权失败，它分别代表
+上游不可达、`ADMIN_PASSWORD` 未设置或前端尚未构建。
+
+```bash
+cd web
+npm install
+npm run typecheck # vue-tsc --noEmit：校验组件 props、接口载荷与 ECharts 配置
+npm run dev      # 开发服务器 http://localhost:5173/admin/，/v1/management 代理到本地网关 8000
+npm run build    # 先类型检查，再写入 app/web —— 该目录需要提交，镜像连同 app/ 一起 COPY
+```
+
+数据全部来自 `/v1/management/*`。这些接口接受**两种凭据**：管理台会话 Cookie，或网关
+API Key（`Bearer` / `X-API-Key`，供脚本与 curl 复用已有的 key）。`ADMIN_PASSWORD` 只是
+登录页凭据，把它当作请求头凭据提交一律 401；未设置 `ADMIN_PASSWORD` 时所有接口返回 503。
 
 ```bash
 # 设置管理员密码（不设置时管理接口统一返回 503）
@@ -418,12 +446,12 @@ ADMIN_PASSWORD=<至少 16 位随机串>
 curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
   -H "Content-Type: application/json" -d '{"password": "'"$ADMIN_PASSWORD"'"}'
 
-# 之后（浏览器或 headless）都用该 Cookie 认证
+# 之后用 Cookie 认证（浏览器就是这么做的）
 curl -b cookie.txt http://localhost:8888/v1/management/overview
-```
 
-`ADMIN_PASSWORD` 只是登录页凭据，不能当请求凭据用：`Bearer` / `X-API-Key` 属于网关
-API Key，传给管理接口一律 401。
+# 或者直接用网关 API Key（查询串里的 key 不被接受）
+curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overview
+```
 
 | 路径 | 说明 |
 |------|------|
@@ -517,6 +545,12 @@ curl http://localhost:8000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.6:35b-pruned","messages":[{"role":"user","content":"你好"}],"stream":false}'
 
+# Ollama 原生补全 —— 与 Ollama 一样：不写 stream 即流式（NDJSON），raw 跳过内嵌模板
+curl http://localhost:8000/api/generate \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:8b","prompt":"写一首关于编程的诗：","raw":true,"stream":false}'
+
 # OpenAI 兼容接口
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-gateway-example-key" \
@@ -529,6 +563,9 @@ curl http://localhost:8000/api/embed \
   -H "Content-Type: application/json" \
   -d '{"model":"bge-m3:latest","input":["你好世界"]}'
 ```
+
+> `/api/generate` 只对 **Ollama 上游**有意义：路径会原样拼到上游 `base_url` 后面，
+> LM Studio / OpenAI 兼容的后端并没有这个接口。要跨后端通用请用 `/v1/chat/completions`。
 
 ### 别名关闭思考模式
 
@@ -779,6 +816,30 @@ export GATEWAY_API_KEYS="sk-gateway-example-key,sk-gateway-example-two"
 - [ ] 不要暴露 11434/11435 等上游端口，只暴露网关 8000
 
 ## 本地开发（不依赖 Docker）
+
+### 启动脚本（Windows）
+
+`scripts\start-local.bat`（或直接 `scripts\start-local.ps1`）是最短路径：它定位 python、读取 `.env`、找到 `data\config.json`，然后调用应用**自己的**规则做启动前检查——缺少依赖、Pydantic 模型拒绝配置、开启鉴权却没有 API Key、弱/占位 Key、端口被占用、控制台未构建——网关启动后打印各入口地址。
+
+```powershell
+scripts\start-local.bat                      # 检查通过后启动 uvicorn（自动重载）
+scripts\start-local.bat -CheckOnly           # 只做检查，不启动
+scripts\start-local.bat -Install -Port 8888  # 先执行 pip install -r requirements.txt
+scripts\start-local.bat -NoReload            # 保存 .py 时不重启
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `-Port` / `-Bind` | 覆盖配置里的 `server.port` / `server.host` |
+| `-Config` | 指定 `config.json`（默认取 `.env` 的 `CONFIG_PATH`，按镜像的方式相对 `app/` 解析，解析不到则用 `data\config.json`） |
+| `-EnvFile` | 指定环境变量文件（默认 `<repo>\.env`；shell 中已设置的变量优先于文件） |
+| `-Python` | 指定解释器（默认 `python`，其次 `py -3`） |
+| `-LogLevel` | 覆盖 `server.log_level` |
+| `-NoReload` | 不带 `--reload` 启动 |
+| `-Install` | 先执行 `pip install -r requirements.txt` |
+| `-CheckOnly` | 打印检查结果后退出 |
+
+脚本在 `app/` 目录下以 `--app-dir app` 启动 uvicorn，工作目录与镜像的 `WORKDIR /app` 一致，因此 `.env` 中的相对路径（`../data/config.json`、`../data/.keys`）在本地和容器里解析结果相同。
 
 ### 快速开始
 

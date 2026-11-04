@@ -20,6 +20,11 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY app/*.py /app/
 COPY app/static /app/static
 
+# Web console: built beforehand with `npm run build` in web/, which writes app/web
+# (committed as plain static files), so the image needs no node toolchain.
+# It sits next to the modules exactly like app/static and is served at /admin.
+COPY app/web /app/web
+
 RUN mkdir -p /data
 
 # Runtime configuration directory (config.json); API keys come from the environment

@@ -14,6 +14,7 @@
 - [别名参数注入](#别名参数注入)
 - [安全测试](#安全测试)
 - [联网检索](#联网检索)
+- [管理 API（Web 管理台）](#管理-apiweb-管理台)
 
 ---
 
@@ -416,6 +417,9 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### 测试 12: Ollama 原生补全 API
 
+**说明:** `/api/generate` 是显式注册的文档化路由（`/docs` 里能看到它的请求/响应 schema），
+转发仍走通用代理：按 `model` 路由（含别名解析与参数注入）、缺省即流式、其他方法 **405**。
+
 **请求:**
 
 ```bash
@@ -425,6 +429,10 @@ curl http://localhost:8000/api/generate \
   -d '{
     "model": "qwen3:8b",
     "prompt": "写一首关于编程的诗：",
+    "raw": true,
+    "format": "json",
+    "keep_alive": "3m",
+    "options": {"temperature": 0, "num_predict": 256},
     "stream": false
   }'
 ```
@@ -436,10 +444,36 @@ curl http://localhost:8000/api/generate \
   "model": "qwen3:8b",
   "response": "代码如诗行，\n逻辑似水流...",
   "done": true,
+  "done_reason": "stop",
   "total_duration": 2345678901,
   "eval_count": 50
 }
 ```
+
+**流式（`stream` 省略或为 `true`）:** 返回 `application/x-ndjson`，每行一个片段，最后一行 `done: true`。
+
+```bash
+curl -N http://localhost:8000/api/generate \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:8b","prompt":"数到 5：","raw":true}'
+```
+
+**非 POST 方法被网关拒绝（不会打到上游）:**
+
+```bash
+curl -i http://localhost:8000/api/generate -H "Authorization: Bearer sk-gateway-example-key"
+# HTTP/1.1 405 Method Not Allowed
+# allow: POST
+# {"detail":"/api/generate only accepts POST."}
+```
+
+**别名同样生效:** `{"model":"qwen3.5:4b-nothink", ...}` 转发时模型名换成 `qwen3.5:4b` 并注入
+`think: false`；`num_ctx_overrides` 里声明的模型还会被强制改写 `options.num_ctx`。
+
+> 对应的 mock 断言在 `python tests/smoke_test.py` 的 `[18] Ollama-native text generation` 分组
+> （路由、字段透传、别名注入、显式/缺省流式、401、405），
+> `/docs` schema 断言在 `python tests/test_gateway_new.py` 的 `[3]` 分组。
 
 ---
 
@@ -1074,30 +1108,38 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ## 管理 API（Web 管理台）
 
-> 端点统一挂在 `/v1/management` 下（实现在 `app/management.py`），由 `ADMIN_PASSWORD` 单独鉴权，
-> 不占用 `GATEWAY_API_KEYS`。未设置 `ADMIN_PASSWORD` 时所有接口返回 **503**；凭据缺失或错误返回 **401**。
-> `/v1/management` 与 `/admin` 一样豁免 `security.path_allowlist`。
+> 端点统一挂在 `/v1/management` 下（实现在 `app/management.py`），由 `require_admin` 保护，
+> 接受**两种凭据之一**：登录换来的会话 Cookie，或 `auth.api_keys` 里的网关 API Key
+> （`Authorization: Bearer` / `X-API-Key`）。`ADMIN_PASSWORD` 只是登录凭据，当作请求头凭据提交
+> 仍返回 **401**。未设置 `ADMIN_PASSWORD` 时所有接口返回 **503**；凭据缺失或错误返回 **401**。
+> `/v1/management` 与 `/admin` 一样豁免 `security.path_allowlist`。管理台前端由网关在 `/admin`
+> 直接提供静态服务（构建产物在 `app/web`）。
 
 ### 测试 34: 登录、会话与鉴权方式
 
 ```bash
-# 登录：校验密码并下发 HttpOnly 会话 Cookie（12 小时）
+# 登录：校验用户名与密码并下发 HttpOnly 会话 Cookie（12 小时）
 curl -i -X POST http://localhost:8000/v1/management/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"password": "change-me"}'
+  -d '{"username": "admin", "password": "change-me"}'
 # HTTP/1.1 200 OK
 # Set-Cookie: llmhub_admin=<expiry>.<sig>; HttpOnly; SameSite=lax; Max-Age=43200
 # {"ok": true}
+# username 可省略，默认就是 admin
 
 # 会话心跳（管理台刷新页面时调用）
 curl http://localhost:8000/v1/management/auth/ping \
   -H "Cookie: llmhub_admin=<expiry>.<sig>"
 # {"ok": true, "admin": true}
 
-# headless / 脚本：同样先登录，用 Cookie jar 访问（密码不是请求凭据）
+# headless / 脚本方式一：登录 + Cookie jar
 curl -c cookie.txt -X POST http://localhost:8000/v1/management/auth/login \
   -H "Content-Type: application/json" -d '{"password": "change-me"}'
 curl -b cookie.txt http://localhost:8000/v1/management/overview
+
+# headless / 脚本方式二：直接带上网关 API Key（复用已有的 key，无需登录）
+curl -H "Authorization: Bearer sk-gateway-example-key" http://localhost:8000/v1/management/overview
+curl -H "X-API-Key: sk-gateway-example-key" http://localhost:8000/v1/management/overview
 
 # 登出：清除 Cookie
 curl -X POST http://localhost:8000/v1/management/auth/logout
@@ -1105,9 +1147,14 @@ curl -X POST http://localhost:8000/v1/management/auth/logout
 ```
 
 **断言:**
-- 密码错误 -> `401`，且响应带约 100 ms 延迟（钝化在线暴力破解）
-- 未带 Cookie，或会话 token 被篡改、过期 -> `401`
-- 把密码或网关 API Key 放到 `Authorization: Bearer` / `X-API-Key` -> `401`（只认 Cookie）
+- 密码错误 -> `401`，且响应带约 100 ms 延迟（钝化在线暴力破解）；用户名不是 `admin` 同样 `401`
+- 用户名比较会先 `strip()` 再转小写，所以 ` Admin ` 也能登录
+- 未带 Cookie 也未带网关 Key，或会话 token 被篡改、过期 -> `401`
+- 把 `ADMIN_PASSWORD` 放到 `Authorization: Bearer` / `X-API-Key` -> `401`（它只是登录凭据，
+  不在 `auth.api_keys` 里）；不在 `auth.api_keys` 中的随机 Key 同样 `401`
+- 网关 API Key 只接受请求头，放在查询串（`?api_key=...`）-> `401`，避免密钥落进访问日志
+- `auth.enabled: false` 或未配置任何网关 Key 时，Key 这条路径直接关闭，管理接口只认 Cookie
+  （绝不会因此变成匿名可访问）
 - 修改 `ADMIN_PASSWORD` 后旧会话立即失效（签名密钥即密码本身）
 - Cookie 为 HttpOnly + SameSite=Lax，仅在 HTTPS 下加 `Secure`
 - 未配置 `ADMIN_PASSWORD` -> 登录与所有受保护接口均为 `503`
@@ -1353,4 +1400,58 @@ curl -b cookie.txt http://localhost:8000/v1/management/tools/websearch
 - 点名了不存在的上游，或配置里根本没有 `opencode` 上游：`provider_configured: false`、
   `base_url` / `upstream_type` 为 `null`（前者 `upstream` 保留配置的名字），实际调用会返回 **503**
 - `enabled: false` 时投影照常返回配置（前端据此提示「联网检索已停用」），实际调用返回 **404**
-- 与其他 `/v1/management/*` 一样是只读 GET，只认管理台会话 Cookie
+- 与其他 `/v1/management/*` 一样是只读 GET，凭据同样是会话 Cookie 或网关 API Key
+
+### 测试 41: Web 管理台静态服务（`/admin`）
+
+前端在 `web/` 里开发，`npm run build` 把产物写进 **`app/web`**（该目录随仓库提交）。它与模块同级，
+所以本地 `app/web` 和镜像 `/app/web` 走同一个解析路径，网关把它当作静态文件挂在 `/admin`，
+镜像里不需要 node。
+
+```bash
+# 1. 无尾斜杠 -> 307 跳转到 /admin/
+curl -i http://localhost:8000/admin -X GET
+# HTTP/1.1 307 Temporary Redirect
+# location: /admin/
+
+# 2. 壳层（登录页要能匿名打开，所以静态资源本身不鉴权）
+curl -i http://localhost:8000/admin/
+# HTTP/1.1 200 OK
+# content-type: text/html; charset=utf-8
+# cache-control: no-cache
+# content-security-policy: ... frame-ancestors 'self' ...
+# 响应体含 <div id="app">
+
+# 3. SPA 深链：前端路由的路径没有对应文件，回退到同一个壳层
+curl -i http://localhost:8000/admin/requests
+
+# 4. 内容哈希命名的构建产物：可长期缓存
+curl -i http://localhost:8000/admin/assets/index-<hash>.js
+# cache-control: public, max-age=31536000, immutable
+
+# 5. 目录穿越：拿不到构建目录之外的文件，只会回退到壳层
+curl -i "http://localhost:8000/admin/%2e%2e%2f%2e%2e%2fapp%2fmain.py"
+
+# 6. 尚未构建（app/web/index.html 不存在）
+curl -i http://localhost:8000/admin/
+# HTTP/1.1 503 Service Unavailable
+# {"detail":"Web console is not built: run `npm install && npm run build` in web/, or use an image that ships app/web."}
+
+# 7. 壳层匿名，但页面内每一次数据请求仍然要求凭据
+curl -i http://localhost:8000/v1/management/overview
+# HTTP/1.1 401 Unauthorized
+```
+
+**断言:**
+- `/admin` 307 -> `/admin/`；`/admin/` 返回 `index.html`，`content-type` 为 `text/html`
+- 壳层带 `Cache-Control: no-cache`（改版后不会被旧 HTML 卡住），`assets/*` 带 `immutable`
+- 壳层沿用 `/admin` 作用域的 CSP（含 `frame-ancestors 'self'`，禁止被外站 iframe 嵌入）
+- 任何非文件路径（SPA 深链、编码后的 `../`）都回退到壳层，`resolve()` + `is_relative_to()`
+  保证 `..` 无法跳出 `app/web`，绝不会把同包里的 `app/main.py` 之类的源码发出去
+- `app/web` 缺失时是 **503** + 构建提示，而不是 404 或空白页——前端把 503 与「未配置
+  `ADMIN_PASSWORD`」区分处理
+- 静态壳层故意不鉴权（否则打不开登录页），`/v1/management/*` 每一次调用仍受 `require_admin` 保护
+- `/admin` 与 `/v1/management` 一样豁免 `security.path_allowlist`，但仍受方法白名单约束
+  （`DELETE /admin/` -> `405`）
+- 前端只在 **401** 时登出并跳回登录页；`503` 视为业务答复（上游不可达 / 密码未配置 / 未构建）
+

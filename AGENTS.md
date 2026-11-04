@@ -9,7 +9,8 @@ LLM Hub is a FastAPI-based unified gateway that aggregates multiple Ollama insta
 - Web search pass-through (OpenCode API Gateway upstream)
 - Model aliasing and parameter injection
 - Config hot reload
-- Read-only management API (`/v1/management`) with a SQLite request log for the web console
+- Read-only management API (`/v1/management`) with a SQLite request log
+- Vue 3 web console (`web/`, built into `app/web`, served at `/admin`) over that API
 
 ## Architecture
 
@@ -19,21 +20,28 @@ llm-hub/
 │   ├── main.py       # FastAPI application, lifespan, special endpoints
 │   ├── config.py     # Config models, loading, hot reload, alias resolution
 │   ├── auth.py       # API key authentication, security helpers
-│   ├── admin_auth.py # ADMIN_PASSWORD session cookie + require_admin dependency
+│   ├── admin_auth.py # ADMIN_PASSWORD login + require_admin (session cookie or gateway API key)
 │   ├── proxy.py      # Reverse proxy, streaming pass-through, request-log capture
 │   ├── request_log.py # SQLite request log (WAL, async batched writes, stats queries)
 │   ├── management.py # Read-only management API (/v1/management) for the web console
 │   ├── rerank.py     # Rerank API implementation (logprobs/embedding modes)
 │   ├── systemone.py  # System One decision API (proxied to laya-server or Ollama 0.40+)
 │   ├── websearch.py  # Web search API (proxied to an OpenCode API Gateway upstream)
-│   └── static/swagger/  # Vendored Swagger UI assets (offline /docs)
+│   ├── static/swagger/  # Vendored Swagger UI assets (offline /docs)
+│   └── web/             # Built console bundle (output of `npm run build`) - served at /admin
 ├── data/
 │   ├── config.json          # Runtime configuration (mounted into container)
 │   └── example.config.json  # Config template copied to config.json
+├── web/                  # Vue 3 + TypeScript management console sources
+│   ├── src/                  # Sources: *.ts modules (api/, stores/, router/, types/) + *.vue SFCs
+│   ├── index.html
+│   ├── package.json
+│   ├── tsconfig.json         # strict, moduleResolution "bundler", @/* -> src/*
+│   └── vite.config.ts        # build.outDir = ../app/web (the bundle is committed, node_modules are not)
 ├── tests/
-│   ├── smoke_test.py        # Comprehensive mock tests (104)
-│   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (59)
-│   ├── test_management.py   # Management API + request log tests (142)
+│   ├── smoke_test.py        # Comprehensive mock tests (123)
+│   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (63)
+│   ├── test_management.py   # Management API + request log + console serving tests (158)
 │   ├── verify_security.py   # Security control tests (15)
 │   ├── test_api.py          # E2E tests against a live server (28)
 │   └── demo.py              # Demo script (requires real Ollama)
@@ -42,8 +50,11 @@ llm-hub/
 │   ├── TESTCASES.md         # Test cases documentation with examples
 │   ├── DEPLOY.md            # Docker deployment guide
 │   ├── Ranker.md            # Reranker configuration guide
+│   ├── web-management/      # Console spec (web-management-implementation.md), mockups, screenshots
 │   └── workflow.md          # Development workflow with diagrams
 ├── scripts/
+│   ├── start-local.ps1      # Local launcher: preflight (deps/config/keys/port) then uvicorn
+│   ├── start-local.bat      # Wrapper for the ps1 above (powershell -ExecutionPolicy Bypass)
 │   ├── docker-build.bat     # Build the image (latest + version tag)
 │   └── docker-publish.bat   # Build then push both tags to Docker Hub
 ├── .vscode/
@@ -96,7 +107,7 @@ python tests/smoke_test.py
 # Gateway features: aggregation, systemone/websearch forwarding, /docs schema (no external deps)
 python tests/test_gateway_new.py
 
-# Management API + request log (spins up a local mock Ollama; no external deps)
+# Management API + request log + console static serving (spins up a local mock Ollama; no external deps)
 python tests/test_management.py
 
 # Security verification tests (no external dependencies)
@@ -118,9 +129,9 @@ python tests/demo.py
 **Important:** E2E tests always use `data/config.json` from the project root (set via `CONFIG_PATH=./data/config.json`). This config points to the local Ollama instance at `127.0.0.1:11434`. Never hardcode paths in test commands.
 
 ### Test Structure
-- `smoke_test.py` — 104 mock tests (auth, routing, aliases, streaming, rerank, security, `/` system info, upstream types), no external deps
-- `test_gateway_new.py` — 59 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input)
-- `test_management.py` — 142 tests for admin auth (session cookie only; password/header misuse → 401), upstream probes + device classification, masked config projections (LLM / rerank / systemone / tools-websearch), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string), filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade
+- `smoke_test.py` — 123 mock tests (auth, routing, aliases, streaming, `/api/generate` forwarding, rerank, security, `/` system info, upstream types), no external deps
+- `test_gateway_new.py` — 63 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input + the documented `/api/generate` request/response schema)
+- `test_management.py` — 158 tests for admin auth (session cookie **or** gateway API key → 200; the admin password as `Bearer` / `X-API-Key` and a key in the query string → 401; wrong username → 401; `ADMIN_PASSWORD` unset → 503), the `/admin` static console (`/admin` → `/admin/` redirect, SPA fallback, immutable caching for `assets/`, `../` cannot escape the build, 503 with a build hint when `app/web` is missing), upstream probes + device classification, masked config projections (LLM / rerank / systemone / tools-websearch), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string), filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
 - `test_api.py` — 28 E2E tests against a real running server + Ollama + web search provider
 - `demo.py` — interactive demo (requires real Ollama)
@@ -137,12 +148,41 @@ python tests/demo.py
 
 ### Local Development
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Easiest - the launcher preflights dependencies/config/keys/port, then runs uvicorn:
+powershell -ExecutionPolicy Bypass -File scripts/start-local.ps1   # or: scripts\start-local.bat
+#    flags: -Port 8888  -Bind 0.0.0.0  -Config <path>  -NoReload  -Install  -CheckOnly
 
-# Run with hot reload
-CONFIG_PATH=./data/config.json python -m uvicorn app.main:app --reload --port 8000
+# Or manually - the modules are flat inside app/, so run from app/ (same as WORKDIR /app)
+# and load .env there:
+pip install -r requirements.txt
+cd app && python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 ```
+Never `python -m uvicorn app.main:app` - the flat modules import each other by bare name
+(`import admin_auth`, `from config import ...`), so that form dies with
+`ModuleNotFoundError: No module named 'admin_auth'`. From the repository root instead use
+`--app-dir app` (or `PYTHONPATH=app`), which is what `scripts/start-local.ps1` does.
+
+### Console Development
+```bash
+# The console is a Vue 3 + TypeScript app in web/, served by the gateway at /admin.
+# Every module under src/ is .ts; every SFC uses <script setup lang="ts">.
+cd web
+npm install
+
+# Type-check only (vue-tsc, no emit) - the views' prop/fetch types come from types/api.ts
+npm run typecheck
+
+# Hot reload with the gateway running on :8000 (Vite proxies /v1/management and /health)
+npm run dev            # http://localhost:5173/admin/
+
+# Build into app/web - runs `vue-tsc --noEmit` first, so a type error fails the build.
+# That bundle IS committed, the Docker image copies it with the modules (no node in the image)
+npm run build
+```
+Rebuild and commit `app/web` whenever anything under `web/src` changes; the container
+never runs node. Because the bundle lives inside the app package (like `app/static`),
+`app/main.py` resolves it as `Path(__file__).parent / "web"` - the same path locally
+(`app/web`) and in the image (`/app/web`).
 
 ### Docker Development
 ```bash
@@ -182,9 +222,20 @@ docker run -d --name llm-hub \
 - Fallback to default upstream when `routing.strict=false`
 
 ### Streaming
-- NDJSON for Ollama native API (`/api/chat`)
+- NDJSON for Ollama native API (`/api/chat`, `/api/generate`)
 - SSE for OpenAI-compatible API (`/v1/chat/completions`)
 - Pass-through without modification
+- `proxy.STREAM_BY_DEFAULT` (`api/chat`, `api/generate`, `v1/chat/completions`, `v1/completions`)
+  decides the transport when the caller omits `stream`, matching Ollama's own defaults
+
+### Schema-visible proxy routes
+- `main.py` registers a documented `POST /api/generate` route **before** the catch-all. The handler
+  is a one-liner into `ProxyService.forward(request, "api/generate")`, so routing, alias + parameter
+  injection, `num_ctx_overrides` clamping, NDJSON streaming and request-log capture are unchanged;
+  the route exists only to (a) put the endpoint in `/openapi.json` and `/docs` with a real request
+  schema and both response media types, and (b) take part in `POST_ONLY_PATHS`, which makes any
+  non-POST method a gateway **405** with `Allow: POST` instead of proxying it upstream
+- `/api/chat`, `/v1/chat/completions` and `/v1/completions` remain catch-all-only (not in the schema)
 
 ### Security
 - Admin endpoints blocked by default (`api/delete`, `api/pull`, etc.)
@@ -196,7 +247,10 @@ docker run -d --name llm-hub \
 - Regex path allowlist (`security.path_allowlist`, 403 for non-matching paths)
 - In-memory token-bucket rate limiter (`security.rate_limit`, 429 when over budget)
 - Defensive response headers on every response (nosniff, X-Frame-Options, CSP, etc.)
-- Admin/management console uses a separate `ADMIN_PASSWORD` (HMAC session cookie), not the gateway API keys
+- Admin/management console (`/admin` + `/v1/management`) authenticates with the HMAC session cookie
+  minted by `POST /v1/management/auth/login` **or** a gateway API key from `auth.api_keys`;
+  `ADMIN_PASSWORD` is a login credential only (sending it as `Bearer` / `X-API-Key` is **401**)
+- Endpoints listed in `main.POST_ONLY_PATHS` answer **405** with `Allow: POST` on other methods
 
 ### Rerank Modes
 - **logprobs**: Generative scoring using token probabilities
@@ -255,13 +309,16 @@ docker run -d --name llm-hub \
 ### Management API (`/v1/management`) + request log
 - `management.py` defines an `APIRouter(prefix="/v1/management")`; `main.py` registers it
   **before** the catch-all, otherwise those paths would be proxied to an upstream
-- Auth is independent of `GATEWAY_API_KEYS`: the admin password is a **login credential
-  only**. `POST /v1/management/auth/login` validates it and mints the signed session cookie
-  (HMAC keyed by `ADMIN_PASSWORD`, 12h, HttpOnly, SameSite=Lax, Secure only on HTTPS);
-  `require_admin` accepts that cookie and nothing else, so the password sent as
-  `Bearer` / `X-API-Key` → **401** (those headers belong to the gateway API keys).
-  No `ADMIN_PASSWORD` → **503**; missing/invalid session → **401**. The legacy
-  `/admin/login|logout` routes delegate to the same functions
+- Auth accepts **two** credentials: the signed session cookie (12h, HttpOnly, SameSite=Lax,
+  Secure only on HTTPS, HMAC keyed by `ADMIN_PASSWORD`) **or** a valid gateway API key from
+  `auth.api_keys` — so scripts can call the management API with the key they already have.
+  The admin password stays a **login credential only**: `POST /v1/management/auth/login`
+  validates it (username `admin`, compared case- and whitespace-insensitively) and mints the
+  cookie; sending the password itself as `Bearer` / `X-API-Key` → **401**. The query-string
+  key transport is excluded on purpose (a key in a URL lands in access logs), and when
+  gateway auth is disabled there are no keys to accept, so the console can never become
+  anonymous. No `ADMIN_PASSWORD` → **503**; no valid credential → **401**. The legacy
+  `/admin/login|logout|ping` routes delegate to the same functions
 - `/v1/management` is exempt from `security.path_allowlist` (like `/admin`) but still subject
   to the method allowlist, client-IP allowlist and rate limit
 - All routes are read-only. Probes reuse `app.state.client` with a 5s timeout so one dead
@@ -310,13 +367,43 @@ docker run -d --name llm-hub \
 - `pyproject.toml` ignores `S608` for `request_log.py` only: SQL fragments are code-controlled
   literals, every value is bound as a parameter
 
+### Web console (`web/`, served at `/admin`)
+- Vue 3 + TypeScript + Vite + Element Plus + vue-router + axios + ECharts, sources under `web/src`
+  (`*.ts` modules plus `<script setup lang="ts">` SFCs, `strict` in `web/tsconfig.json`), and
+  `build.outDir` is `../app/web` so the bundle lands **inside the app package** (committed;
+  `web/node_modules` and the Vite cache are ignored). The image does `COPY app/web /app/web`
+  together with `COPY app/*.py /app/`, so node never appears in the deployment
+- Response shapes live in `web/src/types/api.ts` (taken from live payloads) and are wired to the
+  axios wrappers in `web/src/api/management.ts`, so a renamed backend field surfaces as a
+  `vue-tsc` error before it becomes a blank table; `npm run build` runs the type check first
+- `main.py` registers the static routes **after** `/admin/login|logout|ping` and **before** the
+  catch-all: `/admin` redirects to `/admin/`, the bundle is `Path(__file__).parent / "web"` -
+  one path for both layouts because the modules are flat in the image (`/app/web`) and in the
+  repo (`app/web`); `../` cannot escape the build directory (`resolve()` + `is_relative_to`),
+  and any unmatched path returns `index.html` so deep links such as `/admin/requests` work on a
+  hard refresh
+- Static files are anonymous on purpose (the login screen must be reachable) - protection lives in
+  the API: a missing `app/web` returns **503** with the build command instead of a broken page
+- `index.html` is served `no-cache`, `assets/*` (content-hashed by Vite) `immutable`, so a rebuild
+  lands on the next reload; ADMIN_CSP (`self` scripts/styles, `data:` images, `connect-src 'self'`)
+  applies to every `/admin` path
+- Charts read their colors from the same CSS custom properties as the theme store, so switching
+  between dark and light repaints them; the theme is persisted in `localStorage` and also toggles
+  `html.dark` for Element Plus' own dark variables
+- Only **401** sends the SPA back to the login gate. A 503 is a domain answer (`upstreams/{name}`
+  for an unreachable instance, `ADMIN_PASSWORD` unset) and must not expire the session
+- `request_log.enabled === false` is shown as a "logging disabled" strip on Dashboard/Requests
+  rather than an empty list; `overview.gateway_version` feeds the sidebar version
+
 ## Common Tasks
 
 ### Adding New Endpoint
 1. Add route handler in `main.py`
-2. Update `gateway()` catch-all if needed
-3. Add tests in `smoke_test.py`
-4. Update documentation
+2. Register it **before** `gateway()`'s catch-all (`@app.api_route("/{full_path:path}", ...)`) or the
+   path is silently proxied to an upstream instead of served locally
+3. If it is a documented pass-through route, add the path to `POST_ONLY_PATHS` so other methods get 405
+4. Add tests in `smoke_test.py`
+5. Update documentation
 
 ### Adding New Upstream Type
 1. Extend `UpstreamConfig` with new type
@@ -344,6 +431,9 @@ docker run -d --name llm-hub \
 - **Auth failures**: Verify `GATEWAY_API_KEYS` environment variable
 - **Upstream unreachable**: Check `host.docker.internal` resolution
 - **Rerank scores all 0**: Switch to `embedding` mode or check logprobs
+- **Local start refuses to boot**: `scripts\start-local.bat -CheckOnly` re-runs the app's own
+  rules (Pydantic config + `auth.find_weak_keys`) and names the cause - missing dependency,
+  invalid config, auth enabled without keys, weak keys, or a port already in use
 
 ## Dependencies
 

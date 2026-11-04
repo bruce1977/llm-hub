@@ -737,9 +737,26 @@ curl http://localhost:8888/api/chat \
 | 项目 | 值 |
 |------|-----|
 | 路径 | `/api/generate` |
-| 方法 | `POST` |
+| 方法 | `POST`（其他方法一律 **405**，响应头 `Allow: POST`） |
 | 认证 | ✅ 需要 |
-| 说明 | Ollama 原生生成接口 |
+| 说明 | Ollama 原生补全接口，按 `model` 路由后原样转发；在 `/docs` 中有完整 schema |
+
+**请求参数：**
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `model` | string | ✅ | 模型名或网关别名（别名会先解析成真实模型名再转发） |
+| `prompt` | string | ✅ | 待续写的提示词 |
+| `raw` | boolean | ❌ | `true` 跳过模型内嵌 chat template，直接续写 `prompt`（打分/重排类提示需要） |
+| `system` / `template` / `context` | string/string/array | ❌ | Ollama 原生字段，原样透传 |
+| `images` | array | ❌ | 视觉模型的 base64 图片列表 |
+| `format` | `"json"` / object | ❌ | 结构化输出：`json` 或直接给 JSON schema |
+| `stream` | boolean | ❌ | **缺省即流式**（与 Ollama 一致，返回 NDJSON）；`false` 返回单个 JSON 对象 |
+| `keep_alive` | string/number | ❌ | 模型驻留时长，如 `"3m"` |
+| `logprobs` / `top_logprobs` | boolean / int(1-20) | ❌ | 逐 token 对数概率及其候选数 |
+| `options` | object | ❌ | `temperature` / `top_p` / `num_predict` / `num_ctx` / `seed` / `stop` …；`num_ctx` 可能被 `num_ctx_overrides` 覆盖 |
+
+其余未知字段一律保留，网关不注入任何内容（别名声明的 `params` 除外）。
 
 **请求示例：**
 
@@ -750,6 +767,10 @@ curl http://localhost:8888/api/generate \
   -d '{
     "model": "qwen3:8b",
     "prompt": "写一首关于编程的诗：",
+    "raw": true,
+    "format": "json",
+    "keep_alive": "3m",
+    "options": {"temperature": 0, "num_predict": 256},
     "stream": false
   }'
 ```
@@ -761,10 +782,23 @@ curl http://localhost:8888/api/generate \
   "model": "qwen3:8b",
   "response": "代码如诗行，\n逻辑似水流...",
   "done": true,
+  "done_reason": "stop",
   "total_duration": 2345678901,
   "eval_count": 50
 }
 ```
+
+流式（`stream` 为 `true` 或缺省）时返回 `application/x-ndjson`，每行一个上述结构的片段，
+最后一行 `done: true`：
+
+```
+{"model":"qwen3:8b","response":"代码","done":false}
+{"model":"qwen3:8b","response":"如诗行","done":true,"done_reason":"stop","eval_count":8}
+```
+
+> 与聊天接口一样，`/api/generate` 只在 **Ollama 上游**可用；把模型路由到 LM Studio /
+> OpenAI 兼容上游时，该路径会原样打到对方 `base_url` 上（对方一般回 404）。
+> 需要跨后端通用请用 `/v1/chat/completions`。
 
 ---
 
@@ -838,23 +872,34 @@ curl http://localhost:8888/api/pull \
 ### 管理 API（Web 管理台）
 
 Web 管理台使用的只读接口，统一挂在 `/v1/management` 前缀下（实现在
-`app/management.py`，请求明细由 `app/request_log.py` 落库）。除登录/登出外，
-除登录/登出外全部接口都要求 **管理员会话**（由环境变量 `ADMIN_PASSWORD` 登录换取），
-与网关的 API Key 是两套独立认证。
+`app/management.py`，请求明细由 `app/request_log.py` 落库）。管理台前端本身
+由网关以静态文件提供服务，地址 **`/admin/`**（构建产物在 `app/web`，见 README 的
+「Web 管理台」一节）；静态壳层不鉴权——登录页要能打开——但页面内每一次数据请求
+都经过 `require_admin`。除登录外，全部接口需要以下**两种凭据之一**：
+
+- **管理台会话 Cookie**：`POST /v1/management/auth/login` 用 `ADMIN_PASSWORD` 换取
+  12 小时 HMAC 签名 HttpOnly Cookie（浏览器走这条路）；
+- **网关 API Key**：`auth.api_keys` 中的任一 Key，经 `Authorization: Bearer` 或
+  `X-API-Key` 提交，便于脚本与 curl 复用已有凭据。
 
 **认证方式：**
 
 ```bash
-# 登录换取 12 小时 HttpOnly 会话 Cookie，之后所有请求靠 Cookie 认证
+# 登录换取 12 小时 HttpOnly 会话 Cookie
 curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
   -H "Content-Type: application/json" -d '{"password": "your-admin-password"}'
 
+# 之后用 Cookie 认证
 curl -b cookie.txt http://localhost:8888/v1/management/overview
+
+# 或直接带上网关 API Key
+curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overview
 ```
 
-`ADMIN_PASSWORD` 只用于登录页换取会话，不是请求凭据：`Authorization: Bearer` /
-`X-API-Key` 属于网关 API Key，传给管理接口一律 **401**。headless 调用同样先登录、
-再用 Cookie jar（如上面的 `-c` / `-b`）。
+`ADMIN_PASSWORD` 本身只是登录页凭据，不是请求凭据：把它当作 `Bearer` / `X-API-Key`
+提交一律 **401**；查询串里的 key 也不接受（避免落进访问日志与浏览器历史）。
+网关鉴权关闭（`auth.enabled: false` 或没有配置 key）时没有可接受的 API Key，
+管理接口退回 Cookie-only，绝不会变成匿名可访问。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -880,9 +925,9 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
 |----|------|
 | `200` | 正常 |
 | `400` | 时间格式非法、`start > end`、`page`/`page_size`/`status`/`bucket`/`group_by` 取值非法 |
-| `401` | 未携带有效会话 Cookie，或登录密码错误 |
+| `401` | 既无有效会话 Cookie 也无网关 API Key；或登录密码、用户名错误；或把 `ADMIN_PASSWORD` 当成请求头凭据 |
 | `404` | `upstream` 名称或请求记录 `id` 不存在 |
-| `503` | 未配置 `ADMIN_PASSWORD`；或探测的上游不可达（`upstreams/{name}`） |
+| `503` | 未配置 `ADMIN_PASSWORD`；探测的上游不可达（`upstreams/{name}`）；`/admin` 的前端尚未构建（`app/web` 缺失） |
 
 **分布与配置投影示例：**
 
@@ -986,6 +1031,9 @@ curl http://localhost:8888/api/chat \
 {"model":"qwen3:8b","done":true,"done_reason":"stop"}
 ```
 
+`/api/generate`（`response` 字段）与 `/api/chat`、`/v1/chat/completions`、`/v1/completions`
+一样属于**缺省即流式**的端点：请求体不写 `stream` 时按流式转发，与 Ollama 行为一致。
+
 ---
 
 ## 错误响应
@@ -1006,7 +1054,7 @@ curl http://localhost:8888/api/chat \
 | `401` | Unauthorized | 缺少 API 密钥 |
 | `403` | Forbidden | API 密钥无效、IP 不在白名单或端点被阻止 |
 | `404` | Not Found | 未知端点或模型未找到 |
-| `405` | Method Not Allowed | 不支持的 HTTP 方法 |
+| `405` | Method Not Allowed | 不支持的 HTTP 方法（由 `security.allowed_http_methods` 决定，默认仅 GET/POST）；`/api/generate`、`/v1/rerank`、`/v1/systemone`、`/v1/tools/web-search` 这类只接受 POST 的端点还会带上 `Allow: POST` |
 | `413` | Request Entity Too Large | 请求体超过大小限制 (默认 32MB) |
 | `422` | Unprocessable Entity | 请求体验证失败 |
 | `502` | Bad Gateway | 上游不可达或返回错误 |

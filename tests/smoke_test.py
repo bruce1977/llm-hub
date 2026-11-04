@@ -100,8 +100,41 @@ def make_handler(store: list[dict[str, Any]], generate_mode: str = "ok"):
             store.append({"method": "POST", "path": self.path, "body": body})
             model = body.get("model", "")
 
+            # --- generate: plain completion (nothing asks for logprobs) ---
+            # Emulates Ollama: NDJSON when `stream` is true or omitted, one JSON object
+            # when it is explicitly false. Echoes the caller's fields so the test can
+            # assert the gateway forwarded the body unchanged.
+            if self.path.endswith("/api/generate") and not body.get("logprobs"):
+                echo = {
+                    "echo_raw": body.get("raw"),
+                    "echo_format": body.get("format"),
+                    "echo_keep_alive": body.get("keep_alive"),
+                    "echo_options": body.get("options"),
+                }
+                final = {
+                    "model": model,
+                    "response": "",
+                    "done": True,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 5,
+                    "eval_count": 2,
+                    **echo,
+                }
+                if body.get("stream") is False:
+                    final["response"] = "Hello"
+                    self._send(final)
+                else:
+                    self._send(
+                        [
+                            {"model": model, "response": "Hel", "done": False},
+                            {"model": model, "response": "lo", "done": False},
+                            final,
+                        ],
+                        streaming=True,
+                    )
+
             # --- rerank: logprobs mode ---
-            if self.path.endswith("/api/generate"):
+            elif self.path.endswith("/api/generate"):
                 prompt = body.get("prompt", "")
                 # return different yes/no probabilities per document so ordering can be verified
                 if "highly relevant" in prompt:
@@ -977,6 +1010,103 @@ def main() -> int:
             "websearch" in build_default_config(),
             str(sorted(build_default_config())),
         )
+
+        # ------------------------- Ollama-native text generation (/api/generate) ---
+        print("[18] Ollama-native text generation (/api/generate)")
+        store_a.clear()
+        store_b.clear()
+        r = client.post(
+            "/api/generate",
+            headers=good,
+            json={
+                "model": "qwen3.5:4b",
+                "prompt": "Say hello in one word:",
+                "raw": True,
+                "format": "json",
+                "keep_alive": "3m",
+                "options": {"temperature": 0, "num_predict": 8},
+                "stream": False,
+            },
+        )
+        check("POST /api/generate returns 200", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
+        payload = r.json() if r.status_code == 200 else {}
+        check(
+            "non-stream answer is a single JSON object",
+            payload.get("done") is True and isinstance(payload.get("response"), str),
+            r.text[:160],
+        )
+        sent = store_a[-1] if store_a else {}
+        check("upstream received /api/generate", str(sent.get("path", "")).endswith("/api/generate"), str(sent.get("path")))
+        check(
+            "model is routed to its own upstream",
+            len(store_a) == 1 and sent.get("body", {}).get("model") == "qwen3.5:4b",
+            f"a={len(store_a)} b={len(store_b)}",
+        )
+        check(
+            "prompt/raw/format/keep_alive pass through unchanged",
+            sent.get("body", {}).get("prompt") == "Say hello in one word:"
+            and sent["body"].get("raw") is True
+            and sent["body"].get("format") == "json"
+            and sent["body"].get("keep_alive") == "3m",
+            str(sent.get("body")),
+        )
+        check(
+            "options are forwarded",
+            (sent.get("body", {}).get("options") or {}).get("num_predict") == 8,
+            str(sent.get("body", {}).get("options")),
+        )
+        check(
+            "upstream fields reach the caller",
+            payload.get("echo_raw") is True and payload.get("echo_format") == "json",
+            str(payload)[:160],
+        )
+
+        # alias resolution + forced parameter injection share the chat pipeline
+        store_a.clear()
+        store_b.clear()
+        r = client.post(
+            "/api/generate",
+            headers=good,
+            json={"model": "big-nothink", "prompt": "hi", "stream": False, "think": True},
+        )
+        check("alias request still answers 200", r.status_code == 200, f"got {r.status_code}: {r.text[:120]}")
+        check(
+            "alias pins the upstream named in the alias",
+            len(store_b) == 1 and not store_a,
+            f"a={len(store_a)} b={len(store_b)}",
+        )
+        bsent = store_b[-1]["body"] if store_b else {}
+        check("alias model is replaced by the real name", bsent.get("model") == "big-model:72b", str(bsent.get("model")))
+        check(
+            "alias parameters are injected over the client's",
+            bsent.get("think") is False and bsent.get("num_ctx") == 8192,
+            f"think={bsent.get('think')} num_ctx={bsent.get('num_ctx')}",
+        )
+
+        # streaming: explicit and Ollama's default (stream omitted)
+        r = client.post(
+            "/api/generate", headers=good, json={"model": "qwen3.5:4b", "prompt": "count", "stream": True}
+        )
+        lines = [ln for ln in r.text.splitlines() if ln.strip()]
+        check("stream=true returns NDJSON", r.headers.get("content-type", "").startswith("application/x-ndjson"), str(r.headers.get("content-type")))
+        check("stream=true yields 3 chunks", len(lines) == 3, f"lines={len(lines)}")
+        check("every streamed line is valid JSON", all(json.loads(ln) for ln in lines), r.text[:120])
+        check("last streamed chunk is done", json.loads(lines[-1]).get("done") is True, r.text[-120:])
+
+        r = client.post("/api/generate", headers=good, json={"model": "qwen3.5:4b", "prompt": "count"})
+        lines = [ln for ln in r.text.splitlines() if ln.strip()]
+        check(
+            "streaming is the default when 'stream' is omitted",
+            len(lines) == 3 and r.headers.get("content-type", "").startswith("application/x-ndjson"),
+            f"lines={len(lines)} ct={r.headers.get('content-type')}",
+        )
+
+        # auth and method guards
+        r = client.post("/api/generate", json={"model": "qwen3.5:4b", "prompt": "hi", "stream": False})
+        check("POST /api/generate without a key is rejected", r.status_code == 401, f"got {r.status_code}")
+        r = client.get("/api/generate", headers=good)
+        check("GET /api/generate gets 405 instead of being proxied", r.status_code == 405, f"got {r.status_code}: {r.text[:120]}")
+        check("the 405 advertises Allow: POST", r.headers.get("allow") == "POST", str(dict(r.headers)))
 
         # ---------------------------------------------------- Real E2E ---
         if os.getenv("E2E") == "1":

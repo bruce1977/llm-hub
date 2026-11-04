@@ -3,8 +3,10 @@
 Tests for the web-console management API (``/v1/management``) and the request log.
 
 Runs entirely against a local mock Ollama upstream: no live models, no external
-services. Covers admin auth (cookie only; password-as-header rejected; 503 when unset),
-upstream probing and
+services. Covers admin auth (session cookie or gateway API key; the admin password
+sent as a header is rejected; 503 when
+ADMIN_PASSWORD is unset), the static console served at ``/admin`` (SPA fallback,
+immutable asset caching, traversal guard, 503 before a build), upstream probing and
 device classification, read-only config projections (credentials masked), request-log
 capture (stream + non-stream + upstream failure), stats, filters, pagination and the
 path-allowlist exemption.
@@ -23,6 +25,7 @@ import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # --- configuration must exist before importing the app ---------------------------------
 GIB = 1024**3
@@ -249,7 +252,17 @@ def run() -> int:
         r = client.get("/v1/management/auth/ping", headers={"Authorization": "Bearer admin-secret-pw"})
         check("ping with the password as Bearer -> 401", r.status_code == 401, f"got {r.status_code}")
         r = client.get("/v1/management/auth/ping", headers=GW)
-        check("ping with a gateway API key -> 401", r.status_code == 401, f"got {r.status_code}")
+        check("ping with a gateway API key -> 200", r.status_code == 200, f"got {r.status_code}")
+        r = client.get("/v1/management/overview", headers={"X-API-Key": API_KEY})
+        check("overview with X-API-Key -> 200", r.status_code == 200, f"got {r.status_code}")
+        r = client.get("/v1/management/overview", headers={"Authorization": "Bearer sk-not-a-real-key"})
+        check("overview with an unknown key -> 401", r.status_code == 401, f"got {r.status_code}")
+        r = client.get("/v1/management/overview", params={"api_key": API_KEY})
+        check("a key in the query string is not accepted -> 401", r.status_code == 401, f"got {r.status_code}")
+        r = client.post("/v1/management/auth/login", json={"username": "root", "password": "admin-secret-pw"})
+        check("login with the wrong username -> 401", r.status_code == 401, f"got {r.status_code}")
+        r = client.post("/v1/management/auth/login", json={"username": " Admin ", "password": "admin-secret-pw"})
+        check("login trims and lowercases the username -> 200", r.status_code == 200, f"got {r.status_code}")
         r = client.post("/admin/login", json={"password": "admin-secret-pw"})
         check("legacy /admin/login reuses the same flow -> 200", r.status_code == 200, f"got {r.status_code}")
 
@@ -644,6 +657,49 @@ def run() -> int:
     check("old columns kept", old_rows == 1, str(old_rows))
     for column in ("ts_end", "requested_model", "query"):
         check(f"column added on upgrade: {column}", column in columns, str(sorted(columns)))
+
+    # ------------------------------------------------ console static surface ---
+    print("[12] web console static serving")
+    dist = main.CONSOLE_DIST
+    if (dist / "index.html").is_file():
+        r = client.get("/admin", follow_redirects=False)
+        check("/admin redirects to the trailing-slash entrypoint -> 307",
+              r.status_code == 307 and r.headers.get("location") == "/admin/",
+              f"got {r.status_code} {r.headers.get('location')}")
+        r = client.get("/admin/")
+        check("console shell is served without credentials -> 200",
+              r.status_code == 200 and "text/html" in r.headers.get("content-type", ""),
+              f"got {r.status_code} {r.headers.get('content-type')}")
+        check("shell mounts the SPA root", '<div id="app">' in r.text, r.text[:120])
+        check("console keeps the scoped admin CSP",
+              "frame-ancestors 'self'" in r.headers.get("content-security-policy", ""),
+              r.headers.get("content-security-policy"))
+        check("index.html is never cached blindly",
+              "no-cache" in r.headers.get("cache-control", ""), r.headers.get("cache-control"))
+        r = client.get("/admin/requests")
+        check("deep link falls back to the SPA shell -> 200",
+              r.status_code == 200 and '<div id="app">' in r.text, f"got {r.status_code}")
+        hashed = sorted((dist / "assets").glob("*.js"))
+        r = client.get(f"/admin/assets/{hashed[0].name}")
+        check("hashed asset served -> 200", r.status_code == 200, f"got {r.status_code}")
+        check("hashed asset is cached immutably",
+              "immutable" in r.headers.get("cache-control", ""), r.headers.get("cache-control"))
+        r = client.get("/admin/%2e%2e%2f%2e%2e%2fapp%2fmain.py")
+        check("a ../ path cannot escape the built directory",
+              r.status_code == 200 and '<div id="app">' in r.text, f"got {r.status_code}: {r.text[:120]}")
+    else:
+        check("console shell needs a build first", False, f"no {dist / 'index.html'}: run npm run build in web/")
+
+    empty_dist = Path(_TMP_DIR) / "no-dist"
+    empty_dist.mkdir(parents=True, exist_ok=True)
+    original_dist = main.CONSOLE_DIST
+    main.CONSOLE_DIST = empty_dist
+    try:
+        r = client.get("/admin/")
+        check("unbuilt console -> 503", r.status_code == 503, f"got {r.status_code}")
+        check("503 explains how to build", "npm run build" in r.json().get("detail", ""), r.text[:160])
+    finally:
+        main.CONSOLE_DIST = original_dist
 
     print(f"\n{'=' * 60}\nPASSED: {PASSED}  FAILED: {FAILED}\n{'=' * 60}")
     return 0 if FAILED == 0 else 1

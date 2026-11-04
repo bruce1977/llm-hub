@@ -15,8 +15,9 @@ thinking mode).
 | **Web search** | `POST /v1/tools/web-search` proxies keyword search to an OpenCode API Gateway upstream and returns the retrieved passages |
 | **Unified model list** | `/v1/models` aggregates models & aliases from all upstreams instead of proxying to one instance |
 | **Alias + param injection** | `qwen3.5:4b-nothink` → forwards `qwen3.5:4b` and force-injects `think: false` |
-| **Streaming pass-through** | NDJSON (`/api/chat`) and SSE (`/v1/chat/completions`) forwarded as-is |
-| **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview, config projections (LLM / Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite), gated by `ADMIN_PASSWORD` |
+| **Streaming pass-through** | NDJSON (`/api/chat`, `/api/generate`) and SSE (`/v1/chat/completions`) forwarded as-is |
+| **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview, config projections (LLM / Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite); authenticated with the console session cookie or a gateway API key |
+| **Web console** | Vue 3 + TypeScript + Element Plus + ECharts single-page app served by the gateway itself at `/admin` (no node in the image): overview, upstreams, model config, request details and charts, read-only in this release |
 | **Config hot reload** | `config.json` changes take effect within ~1s, no restart required |
 | **Docker volume mount** | Config file mounted via `/data` |
 | **Routing priority** | When the same model appears in multiple upstreams, the lowest `priority` wins |
@@ -35,7 +36,10 @@ llm-hub/
 │   ├── rerank.py     # Rerank API implementation
 │   ├── request_log.py # Request log (SQLite, async batched writes)
 │   ├── management.py # Read-only web console API (/v1/management)
-│   └── websearch.py  # Web search proxy (OpenCode API Gateway upstream)
+│   ├── websearch.py  # Web search proxy (OpenCode API Gateway upstream)
+│   └── web/          # Built console bundle (output of `npm run build`), served at /admin
+├── web/
+│   └── src/          # Console frontend sources (Vue 3 + TypeScript + Vite + Element Plus + ECharts)
 └── data/
     └── config.json   # Config file (mounted into the container at /data)
 ```
@@ -90,6 +94,12 @@ docker run -d --name llm-hub \
 # 4. Verify
 curl http://localhost:8888/health
 ```
+
+Web console: open `http://localhost:8888/admin/` and sign in as `admin` with the `ADMIN_PASSWORD`
+set in `.env`. Without that variable the page reports the console as disabled and every
+`/v1/management/*` call returns 503. The console itself ships inside the image at `app/web`
+(the output of `npm run build`, next to the modules), so step 3 above - which mounts the host
+`app` directory over `/app` - needs that copy to be built too, otherwise `/admin` answers 503.
 
 > **Secrets come from `.env`**: `--env-file` reads `GATEWAY_API_KEYS` and injects it into the
 > container, so `config.json` never needs to hold any key. Keep `.env` private and out of version
@@ -437,11 +447,32 @@ Feeds the console's "Requests" view: every call through the gateway becomes one 
   (result). Bodies are capped at 8 KB, credentials are stored as `***`, and an older database is
   upgraded with `ALTER TABLE` at startup
 
-## Management API (web console)
+## Web console
 
-The web console reads gateway state through `/v1/management/*` (read-only in this release;
-no configuration writes). It is gated by a **separate administrator password**, not by
-`GATEWAY_API_KEYS`:
+The console is a Vue 3 + TypeScript + Element Plus + ECharts single-page app. Sources live in
+`web/src` (`*.ts` modules and `<script setup lang="ts">` SFCs, `strict`); `npm run build` writes
+the bundle into **`app/web`**, which is committed and served by the
+gateway itself at **`http://localhost:8888/admin/`**, so the image needs no node toolchain
+(the bundle sits next to the modules, so `app/main.py` resolves one and the same path locally
+and inside the container). Sign in as `admin`
+with the `ADMIN_PASSWORD` from `.env`; a successful login mints a 12h HttpOnly session cookie.
+The views — Dashboard, Upstreams, Models (LLM / Rerank / System One), Tools (Web Search),
+Requests and Settings — are **read-only** in this release, and a 401 from any management call
+signs the user out and returns to the login page. A 503 is never treated as an auth failure:
+it means an unreachable upstream, `ADMIN_PASSWORD` unset, or the frontend not built yet.
+
+```bash
+cd web
+npm install
+npm run typecheck # vue-tsc --noEmit: view props, fetch payloads and ECharts options
+npm run dev      # dev server at http://localhost:5173/admin/, /v1/management proxied to :8000
+npm run build    # type-checks, then writes app/web - commit it, the image copies it with the modules
+```
+
+All data comes from `/v1/management/*`, which accepts **two credentials**: the console session
+cookie, or a gateway API key via `Bearer` / `X-API-Key` so scripts can reuse the key they already
+have. `ADMIN_PASSWORD` itself is a login credential only — sending it as a request header answers
+401, and a key in the query string is rejected. Without `ADMIN_PASSWORD` every route answers 503.
 
 ```bash
 # Set the administrator password (without it every management call returns 503)
@@ -451,12 +482,12 @@ ADMIN_PASSWORD=<16+ random chars>
 curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
   -H "Content-Type: application/json" -d '{"password": "'"$ADMIN_PASSWORD"'"}'
 
-# Every later call (browser or headless) authenticates with that cookie
+# Later calls authenticate either with that cookie ...
 curl -b cookie.txt http://localhost:8888/v1/management/overview
-```
 
-The password is a login-page credential only. `Bearer` / `X-API-Key` are the gateway API
-keys and are ignored by `/v1/management` (they answer 401 there).
+# ... or with a gateway API key
+curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overview
+```
 
 | Path | Purpose |
 |------|---------|
@@ -551,6 +582,13 @@ curl http://localhost:8000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.6:35b-pruned","messages":[{"role":"user","content":"hello"}],"stream":false}'
 
+# Ollama-native completion - like Ollama itself it streams NDJSON unless stream=false,
+# and raw=true skips the model's chat template
+curl http://localhost:8000/api/generate \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:8b","prompt":"Write a poem about programming:","raw":true,"stream":false}'
+
 # OpenAI-compatible endpoint
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-gateway-example-key" \
@@ -563,6 +601,10 @@ curl http://localhost:8000/api/embed \
   -H "Content-Type: application/json" \
   -d '{"model":"bge-m3:latest","input":["hello world"]}'
 ```
+
+> `/api/generate` only makes sense against **Ollama upstreams**: the path is appended to the routed
+> upstream's `base_url` unchanged, and OpenAI-compatible backends (LM Studio, vLLM, ...) do not
+> serve it. Use `/v1/chat/completions` for something that works across every backend type.
 
 ### Alias to disable thinking
 
@@ -790,6 +832,36 @@ or omit it entirely.
 - [ ] Don't expose upstream ports like 11434 / 11435 — only expose the gateway's 8000
 
 ## Local development (no Docker)
+
+### Launcher (Windows)
+
+`scripts\start-local.bat` (or `scripts\start-local.ps1`) is the shortest path: it locates
+python, reads `.env`, finds `data\config.json`, then runs the app's **own** checks before
+launching — missing dependencies, a config rejected by the Pydantic models, auth enabled with
+no API key, weak/placeholder keys, a port already in use, an unbuilt console — and prints the
+URLs once the gateway is up.
+
+```powershell
+scripts\start-local.bat                      # preflight, then uvicorn with auto-reload
+scripts\start-local.bat -CheckOnly           # only run the checks, start nothing
+scripts\start-local.bat -Install -Port 8888  # pip install -r requirements.txt first
+scripts\start-local.bat -NoReload            # do not restart on every saved .py
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `-Port` / `-Bind` | Override `server.port` / `server.host` from the config |
+| `-Config` | Alternate `config.json` (default: `CONFIG_PATH` from `.env`, resolved from `app/` like in the image, else `data\config.json`) |
+| `-EnvFile` | Alternate env file (default `<repo>\.env`; variables already set in the shell win) |
+| `-Python` | Alternate interpreter (default `python`, then the `py -3` launcher) |
+| `-LogLevel` | Override `server.log_level` |
+| `-NoReload` | Serve without `--reload` |
+| `-Install` | `pip install -r requirements.txt` first |
+| `-CheckOnly` | Print the verdict and exit |
+
+The gateway is started with `--app-dir app` from `app/`, i.e. the same working directory as the
+image's `WORKDIR /app`, so the relative paths in `.env` (`../data/config.json`,
+`../data/.keys`) resolve exactly as they do in the container.
 
 ### Quick start
 

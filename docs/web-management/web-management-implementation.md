@@ -1,8 +1,9 @@
 # llm-hub Web 管理台 · 实现文档（只读阶段）
 
-> 版本：v1.0（只读视图设计阶段）
+> 版本：v1.1（已落地：后端 API + `web/` 前端，挂在 `/admin`）
 > 日期：2026-11-03
 > 范围：本文档覆盖 Web 管理台的**页面功能点分析**、**API 设计（统一前缀 `/v1/management`）**、**数据模型**与**UI 截图索引**。
+> 实现状态：只读阶段全部完成——`app/management.py` + `app/request_log.py` 提供接口与明细库，`web/src` 构建为 `app/web` 后由网关在 `/admin` 提供服务；回归测试见 `tests/test_management.py`（158 项）与 `docs/TESTCASES.md` 测试 34-41，落地细节与设计差异见第 5 节。
 > 关联文件：`dashboard-mockup.html`（全页面风格稿）、`dashboard-login-mockup.html`（登录门禁页风格稿）、`images/*.png`（各页面 UI 截图）。
 
 ---
@@ -16,18 +17,24 @@
 - 查看 HUB 当前已配置的模型拓扑（LLM / Rerank / SystemOne），本期仅查看、后续再开放配置写入口。
 
 ### 1.2 技术约束
-- **前端**：纯静态资源（`app/static/admin/` 下的 `index.html` + `app.css` + `app.js`），原生 HTML/CSS/JS，**零第三方 CDN 依赖**；趋势图与饼图用 ECharts 渲染，`echarts.min.js` 随静态资源一起内置发布（见 `docs/web-management/echarts.min.js`），不引用外网地址。
-- **后端**：在现有 FastAPI 应用中新增只读接口，统一挂在 `/v1/management` 前缀下；复用已落地的 `ADMIN_PASSWORD` 环境变量鉴权（HMAC 会话 Cookie；密码仅用于登录，不是请求凭据）。
-- **样式**：固定宽度容器（1180px，四周留白不撑满）、深/浅主题切换，整页使用 CSS 变量，侧边栏可折叠（见 UI 截图）。
+- **前端**：Vue 3 单页应用，源码在 `web/src`（Vite + Element Plus + axios + ECharts，全部本地依赖，无第三方 CDN）。`npm run build` 把产物写进 **`app/web`** 并随仓库提交，由网关自己以静态文件形式挂在 **`/admin`**（见 `app/main.py` 的 `route_console`）——产物与模块同级，本地 `app/web` 与镜像 `/app/web` 是同一个解析路径，`Dockerfile` 只做 `COPY app/web /app/web`，不含 node 工具链。趋势图与饼图用 ECharts 渲染，颜色取自 CSS 变量，因此主题切换时图表同步换色。
+- **后端**：在现有 FastAPI 应用中新增只读接口，统一挂在 `/v1/management` 前缀下；复用 `ADMIN_PASSWORD` 环境变量鉴权（HMAC 会话 Cookie；密码仅用于登录，不是请求凭据）。
+- **样式**：内容区固定宽度 1180px（四周留白不撑满）、深/浅主题切换并持久化在 `localStorage`，整页使用 CSS 变量，侧边栏可折叠（见 UI 截图）。
 - **埋点**：请求明细写入 SQLite（`data/llmhub.db`，WAL 模式），异步批量落盘，不阻塞转发主链路。
 
 ### 1.3 鉴权
-所有 `/v1/management/*` 接口均受 `require_admin` 保护（与现有 `app/admin_auth.py` 一致）：
-- 通过 `POST /v1/management/auth/login` 提交 `ADMIN_PASSWORD` 换取 12h HttpOnly Session Cookie；
-- `require_admin` 只接受该 Cookie：`Authorization: Bearer` / `X-API-Key` 属于网关 API Key，
-  把 `ADMIN_PASSWORD` 或网关 Key 放到这些头上一律返回 `401`；
-- headless 调用同样先登录，再用 Cookie jar 访问；
+所有 `/v1/management/*` 接口均受 `require_admin` 保护（实现在 `app/admin_auth.py`），接受**两种凭据之一**：
+- 通过 `POST /v1/management/auth/login` 提交 `ADMIN_PASSWORD`（用户名固定 `admin`）换取 12h HttpOnly Session Cookie；
+- 或网关 API Key（`auth.api_keys`，即 `GATEWAY_API_KEYS`），经 `Authorization: Bearer` / `X-API-Key`
+  提交，便于脚本与 curl 复用已有凭据；
+- `ADMIN_PASSWORD` 本身**不是**请求凭据：把它放进 `Bearer` / `X-API-Key` 仍然返回 `401`；
+  查询串里的 key 一律不接受（避免密钥进入访问日志与浏览器历史）；
+- 网关鉴权关闭（`auth.enabled: false` 或未配置任何 key）时没有可接受的 API Key，管理接口退回
+  Cookie-only，绝不会变成匿名访问；
 - 未配置 `ADMIN_PASSWORD` 时接口返回 `503 Service Unavailable`。
+- `/admin` 的静态壳层（`index.html` / `assets/*`）**故意不鉴权**，否则登录页打不开；页面内每一次
+  数据请求仍受上述保护。SPA 深链与编码后的 `../` 都回退到壳层，路径经 `resolve()` +
+  `is_relative_to()` 校验，无法跳出构建目录。
 
 ---
 
@@ -135,14 +142,14 @@
 
 ## 3. API 设计（`/v1/management`）
 
-> 统一前缀 `/v1/management`；全部 `GET`（除登录/登出）；均受 `require_admin` 保护；错误码沿用 HTTP 标准（`400` 参数错误、`401` 未认证、`403` 禁止、`404` 资源不存在、`503` 未配置密码 / 上游不可达）。
+> 统一前缀 `/v1/management`；全部 `GET`（除登录/登出）；均受 `require_admin` 保护（会话 Cookie **或**网关 API Key）；错误码沿用 HTTP 标准（`400` 参数错误、`401` 未认证、`403` 禁止、`404` 资源不存在、`503` 未配置密码 / 上游不可达 / 前端未构建）。
 
 ### 3.1 鉴权
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/v1/management/auth/login` | Body `{ "password": "..." }`，成功返回 `200` 并在响应上 `set_cookie`（HttpOnly+SameSite=Lax，HTTPS 自动 Secure）；失败 `401` |
+| POST | `/v1/management/auth/login` | Body `{ "username": "admin", "password": "..." }`（`username` 可省略，默认 `admin`，比较时忽略大小写与首尾空格）；成功返回 `200` 并在响应上 `set_cookie`（HttpOnly+SameSite=Lax，HTTPS 自动 Secure）；失败 `401`（附约 100 ms 延迟） |
 | POST | `/v1/management/auth/logout` | 清除会话 Cookie |
-| GET  | `/v1/management/auth/ping`  | 受保护心跳，返回 `200 { "ok": true }`；未登录 `401` |
+| GET  | `/v1/management/auth/ping`  | 受保护心跳，返回 `200 { "ok": true, "admin": true }`；未登录 `401`；未配置 `ADMIN_PASSWORD` `503` |
 
 ### 3.2 总览与上游
 | 方法 | 路径 | 查询参数 | 说明 |
@@ -299,13 +306,33 @@
 
 ---
 
-## 5. 实施建议（落地顺序）
+## 5. 实施记录（已落地）
 1. `app/request_log.py`：SQLite 建表 + 异步批量写入队列 + 统计查询接口（timeseries/distribution/分页）。
 2. `app/proxy.py`：在转发出口埋点（覆盖流式/非流式/异常），`config.py` 给 `UpstreamConfig` 增加 `vram_total_gb`。
-3. `app/management.py`：`/v1/management/*` 只读接口，复用 `require_admin`。
-4. `app/main.py`：注册 management 路由与静态资源（置于 catch-all 之前）。
-5. `app/static/admin/`：前端页面（依 `dashboard-mockup.html` 风格稿实现，含 8 视图、抽屉、主题、折叠、**ECharts** 图表、5s 轮询）。
-6. 文档同步：`.env.example`、`example.config.json`、`README`、`CHANGELOG`。
+3. `app/management.py`：`/v1/management/*` 只读接口，复用 `require_admin`（会话 Cookie 或网关 API Key）。
+4. `app/main.py`：先注册 management 路由，再注册 `/admin` 静态路由，最后才是 catch-all 代理。
+5. `web/src/`：前端页面（依 `dashboard-mockup.html` 风格稿与 `images/*.png` 实现，8 视图 + 详情抽屉 +
+   深/浅主题 + 侧栏折叠 + **ECharts** 图表 + 关键字/时间筛选 + 分页）。
+6. 文档同步：`.env.example`、`example.config.json`、`README`、`CHANGELOG`、`docs/API.md`、
+   `docs/TESTCASES.md`、`docs/DEPLOY.md`、`AGENTS.md`。
+
+与设计稿的实现差异（均为有意选择）：
+- **前端位置**：代码是 Vue 3 + TypeScript 单文件组件（Vite + Element Plus + axios + ECharts），
+  `*.ts` 模块承载接口类型（`src/types/api.ts`）与状态，SFC 统一 `<script setup lang="ts">`，源码保持在需求指定的
+  `web/src`，不在 `app/static/admin/`；ECharts 通过 npm 依赖 tree-shaking 打进 `app/web/assets`，
+  无需再 vendored `echarts.min.js`。
+- **产物目录**：构建输出从最初的 `web/dist` 调整为 **`app/web`**（`vite.config.ts` 里
+  `build.outDir = '../app/web'`）。产物与模块同包同层，`app/main.py` 只需一个解析路径
+  `Path(__file__).parent / "web"` 就同时适配本地（`app/web`）与镜像（`/app/web`，与 `app/static`
+  一样的平铺布局），`Dockerfile` 的 `COPY app/web /app/web` 也跟 `COPY app/*.py` 并列在同一层。
+  代价是宿主机以 `-v ./app:/app` 覆盖模块目录时必须先构建，否则 `/admin` 返回 503。
+- **挂载点**：静态资源挂在 `/admin`（`vite.config.ts` 里 `base: '/admin/'`、路由
+  `createWebHistory('/admin/')`），与既有的 `/admin/login|logout|ping`、CSP 作用域和
+  `path_allowlist` 豁免共用同一前缀；开发时 `npm run dev` 走 `http://localhost:5173/admin/`，
+  `/v1/management` 代理到本地 8000 网关，保证 Cookie 同源。
+- **刷新方式**：Dashboard 每 5 秒、Upstreams 每 10 秒自动刷新（`onMounted` 起定时器、
+  `onBeforeUnmount` 清理，离开页面即停止探测）；其余页面进入时加载一次，靠顶栏「刷新」按钮手动刷新。
+- 401 一律登出并跳回登录页（保留 `redirect`），503 视为业务答复而非鉴权失败。
 
 ---
 
