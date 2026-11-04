@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { errorDetail, statusOf } from '@/api/client'
 import { api } from '@/api/management'
@@ -10,9 +11,15 @@ import type { ModelsRerank } from '@/types/api'
 import type { ApiParam, ConfigRow } from '@/types/ui'
 import { fmtClock } from '@/utils/format'
 
+type Tab = 'models' | 'api'
+
+const { t } = useI18n()
+
 const cfg = ref<ModelsRerank | null>(null)
+const tab = ref<Tab>('models')
 const lastUpdated = ref('')
 const loadError = ref('')
+const refreshing = ref(false)
 
 const rows = computed<ConfigRow[]>(() => {
   const c = cfg.value
@@ -21,33 +28,44 @@ const rows = computed<ConfigRow[]>(() => {
     { label: 'Endpoint', value: c.endpoint, mono: true },
     {
       label: 'Enabled',
-      badge: c.enabled ? { cls: 'ok', text: '● 开启' } : { cls: 'idle', text: '● 关闭' },
+      badge: c.enabled ? { cls: 'ok', text: t('modelsRerank.enabled') } : { cls: 'idle', text: t('modelsRerank.disabled') },
     },
-    { label: '打分方式 (mode)', value: c.mode, mono: true },
-    { label: '上游协议 (upstream_api)', value: c.upstream_api, mono: true, note: 'auto = 按上游类型选择' },
-    { label: '失败策略 (on_error)', value: c.on_error, mono: true },
-    { label: 'keep_alive', value: c.scoring?.keep_alive, mono: true, note: '空闲后卸载' },
+    { label: t('modelsRerank.rows.mode'), value: c.mode, mono: true },
+    {
+      label: t('modelsRerank.rows.upstreamApi'),
+      value: c.upstream_api,
+      mono: true,
+      note: t('modelsRerank.rows.upstreamApiNote'),
+    },
+    { label: t('modelsRerank.rows.onError'), value: c.on_error, mono: true },
+    { label: 'keep_alive', value: c.scoring?.keep_alive, mono: true, note: t('modelsRerank.rows.keepAliveNote') },
     { label: 'top_logprobs', value: c.scoring?.top_logprobs, mono: true },
     { label: 'temperature', value: c.scoring?.temperature, mono: true },
     { label: 'max_tokens', value: c.scoring?.max_tokens, mono: true },
-    { label: '并发上限', value: c.limits?.max_concurrency, mono: true },
-    { label: '文档数上限', value: c.limits?.max_documents || '不限', mono: true },
-    { label: '单文档字符上限', value: c.limits?.max_document_chars || '不限', mono: true },
+    { label: t('modelsRerank.rows.concurrency'), value: c.limits?.max_concurrency, mono: true },
+    { label: t('modelsRerank.rows.maxDocuments'), value: c.limits?.max_documents || t('modelsRerank.rows.unlimited'), mono: true },
+    {
+      label: t('modelsRerank.rows.maxDocumentChars'),
+      value: c.limits?.max_document_chars || t('modelsRerank.rows.unlimited'),
+      mono: true,
+    },
   ]
 })
 
 const modelRows = computed<string[]>(() => (cfg.value?.models ?? []).map((m) => m.model))
 
-const params: ApiParam[] = [
-  { name: 'model', type: 'string', required: true, desc: 'Rerank 模型名，取值见上方 Models（命中其一即可）' },
-  { name: 'query', type: 'string', required: true, desc: '用于检索排序的查询文本' },
-  { name: 'documents', type: 'string[]', required: true, desc: '待排序的候选文档数组' },
-  { name: 'top_n', type: 'integer', required: false, desc: '返回前 N 条，默认全部' },
-  { name: 'return_documents', type: 'boolean', required: false, desc: '是否在结果中回带原文' },
-  { name: 'options', type: 'object', required: false, desc: '本次覆盖上游推理选项（合并到 rerank.options）' },
-]
+const params = computed<ApiParam[]>(() => [
+  { name: 'model', type: 'string', required: true, desc: t('modelsRerank.params.model') },
+  { name: 'query', type: 'string', required: true, desc: t('modelsRerank.params.query') },
+  { name: 'documents', type: 'string[]', required: true, desc: t('modelsRerank.params.documents') },
+  { name: 'top_n', type: 'integer', required: false, desc: t('modelsRerank.params.topN') },
+  { name: 'return_documents', type: 'boolean', required: false, desc: t('modelsRerank.params.returnDocuments') },
+  { name: 'options', type: 'object', required: false, desc: t('modelsRerank.params.options') },
+])
 
 async function load() {
+  if (refreshing.value) return
+  refreshing.value = true
   try {
     const { data } = await api.modelsRerank()
     cfg.value = data
@@ -55,6 +73,8 @@ async function load() {
     loadError.value = ''
   } catch (error) {
     if (statusOf(error) !== 401) loadError.value = errorDetail(error)
+  } finally {
+    refreshing.value = false
   }
 }
 
@@ -62,64 +82,113 @@ onMounted(load)
 </script>
 
 <template>
-  <TopBar title="Models · Rerank" sub="Rerank 配置（只读）" refreshable :last-updated="lastUpdated" @refresh="load" />
+  <TopBar
+    :title="t('nav.modelsRerank')"
+    :sub="t('modelsRerank.sub')"
+    refreshable
+    :loading="refreshing"
+    :last-updated="lastUpdated"
+    @refresh="load"
+  />
 
   <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
 
+  <div class="tabs" role="tablist">
+    <button
+      class="tab"
+      :class="{ on: tab === 'models' }"
+      role="tab"
+      :aria-selected="tab === 'models'"
+      @click="tab = 'models'"
+    >
+      {{ t('modelsRerank.tabs.models') }}
+      <span class="count">{{ cfg ? cfg.models.length : '—' }}</span>
+    </button>
+    <button
+      class="tab"
+      :class="{ on: tab === 'api' }"
+      role="tab"
+      :aria-selected="tab === 'api'"
+      @click="tab = 'api'"
+    >
+      {{ t('modelsRerank.tabs.api') }}
+      <span class="count">1</span>
+    </button>
+  </div>
+
   <template v-if="cfg">
-    <ConfigCard title="Rerank 配置" tag="rerank" :rows="rows" />
-
-    <div class="card">
-      <div class="card-h">可用模型 <span class="tag">models</span></div>
-      <table>
-        <thead>
-          <tr>
-            <th>模型</th>
-            <th>上游</th>
-            <th>类型</th>
-            <th>Base URL</th>
-            <th>凭据</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="m in cfg.models" :key="m.model">
-            <td class="mono">{{ m.model }}</td>
-            <td>{{ m.upstream || '—' }}</td>
-            <td><span class="chip">{{ m.type || '—' }}</span></td>
-            <td class="mono">{{ m.base_url || '—' }}</td>
-            <td class="mono">{{ m.api_key || '未配置' }}</td>
-          </tr>
-          <tr v-if="!cfg.models.length">
-            <td colspan="5" class="empty">未配置 rerank 模型</td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-if="modelRows.length" class="api-note">
-        网关按 <code>mode</code> 选择打分实现；<code>model_modes</code> 可为单个模型覆盖打分方式。
+    <template v-if="tab === 'models'">
+      <div class="card">
+        <div class="card-h">{{ t('modelsRerank.introTitle') }} <span class="tag">rerank</span></div>
+        <i18n-t keypath="modelsRerank.intro" scope="global" tag="div" class="feature-intro">
+          <template #endpoint><code>POST /v1/rerank</code></template>
+          <template #query><code>query</code></template>
+          <template #documents><code>documents</code></template>
+          <template #score><code>results[].relevance_score</code></template>
+          <template #topN><code>top_n</code></template>
+          <template #returnDocuments><code>return_documents</code></template>
+        </i18n-t>
       </div>
-    </div>
 
-    <ApiDoc
-      tag="/v1/rerank"
-      :params="params"
-      :request="{
-        method: 'POST',
-        path: cfg.endpoint,
-        headers: [['Authorization', 'Bearer <API_KEY>'], ['Content-Type', 'application/json']],
-        body: cfg.request_example,
-      }"
-      :response="{
-        status: '200',
-        contentType: 'application/json',
-        note: 'results[] 每项含 index / relevance_score',
-        body: cfg.response_example,
-      }"
-      note="rerank 由上游模型打分（logprobs 或 embedding），网关负责协议转换与结果归一化；失败请求可在 Requests 页按状态筛选查看。"
-    />
+      <ConfigCard :title="t('modelsRerank.config.title')" tag="rerank" :rows="rows" />
+
+      <div class="card">
+        <div class="card-h">{{ t('modelsRerank.available.title') }} <span class="tag">models</span></div>
+        <table>
+          <thead>
+            <tr>
+              <th>{{ t('modelsRerank.available.model') }}</th>
+              <th>{{ t('modelsRerank.available.upstream') }}</th>
+              <th>{{ t('modelsRerank.available.type') }}</th>
+              <th>{{ t('modelsRerank.available.baseUrl') }}</th>
+              <th>{{ t('modelsRerank.available.credentials') }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="m in cfg.models" :key="m.model">
+              <td class="mono">{{ m.model }}</td>
+              <td>{{ m.upstream || '—' }}</td>
+              <td><span class="chip">{{ m.type || '—' }}</span></td>
+              <td class="mono">{{ m.base_url || '—' }}</td>
+              <td class="mono">{{ m.api_key || t('modelsRerank.notConfigured') }}</td>
+            </tr>
+            <tr v-if="!cfg.models.length">
+              <td colspan="5" class="empty">{{ t('modelsRerank.emptyModels') }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="modelRows.length" class="api-note">
+          <i18n-t keypath="modelsRerank.modeNote" scope="global">
+            <template #mode><code>mode</code></template>
+            <template #modelModes><code>model_modes</code></template>
+          </i18n-t>
+        </div>
+      </div>
+    </template>
+
+    <template v-else>
+      <ApiDoc
+        tag="/v1/rerank"
+        :params="params"
+        :request="{
+          method: 'POST',
+          path: cfg.endpoint,
+          headers: [['Authorization', 'Bearer <API_KEY>'], ['Content-Type', 'application/json']],
+          body: cfg.request_example,
+        }"
+        :response="{
+          status: '200',
+          contentType: 'application/json',
+          note: t('modelsRerank.docs.responseNote'),
+          body: cfg.response_example,
+        }"
+        :note="t('modelsRerank.docs.note')"
+      />
+    </template>
   </template>
-  <div v-else class="card empty">加载中…</div>
+  <div v-else class="card empty">{{ t('common.loading') }}</div>
 
-  <div class="foot">llm-hub 管理台 · Models · Rerank（只读视图）</div>
+  <div class="foot">{{ t('common.footReadOnly', { page: t('nav.modelsRerank') }) }}</div>
 </template>
 
 <style scoped>

@@ -1,7 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-
-import { theme, toggleTheme } from '@/stores/theme'
+import { useI18n } from 'vue-i18n'
 
 withDefaults(
   defineProps<{
@@ -9,18 +7,15 @@ withDefaults(
     sub?: string
     lastUpdated?: string
     refreshable?: boolean
+    /** The view's own in-flight flag: the header then shows the live refresh state. */
+    loading?: boolean
   }>(),
-  { sub: '', lastUpdated: '', refreshable: false },
+  { sub: '', lastUpdated: '', refreshable: false, loading: false },
 )
 
 const emit = defineEmits<{ refresh: [] }>()
-const spinning = ref(false)
 
-function refresh() {
-  spinning.value = true
-  setTimeout(() => (spinning.value = false), 600)
-  emit('refresh')
-}
+const { t } = useI18n()
 </script>
 
 <template>
@@ -29,18 +24,26 @@ function refresh() {
       <h1>{{ title }}</h1>
       <div class="sub">
         {{ sub }}
-        <button v-if="refreshable" class="icon-btn" :class="{ spin: spinning }" title="立即刷新" @click="refresh">
+        <!-- Refresh meta sits next to the refresh button so refresh-related controls stay grouped. -->
+        <span v-if="lastUpdated || loading" class="refresh" :class="{ busy: loading }">
+          {{ loading ? t('topbar.refreshing') : t('topbar.lastUpdated', { time: lastUpdated }) }}
+        </span>
+        <button
+          v-if="refreshable"
+          class="icon-btn"
+          :class="{ spin: loading }"
+          :disabled="loading"
+          :title="loading ? t('topbar.refreshingTitle') : t('topbar.refreshNow')"
+          @click="emit('refresh')"
+        >
           ↻
         </button>
+        <span v-if="loading" class="spinner" aria-hidden="true"></span>
       </div>
     </div>
     <div class="actions">
       <slot name="actions" />
-      <span v-if="lastUpdated" class="refresh">最后更新 {{ lastUpdated }}</span>
-      <button class="toggle" @click="toggleTheme">
-        <span>{{ theme.mode === 'dark' ? '☀' : '☾' }}</span>
-        <span>{{ theme.mode === 'dark' ? '浅色' : '深色' }}</span>
-      </button>
     </div>
+    <div v-if="loading" class="progress"><i></i></div>
   </div>
 </template>

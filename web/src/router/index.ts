@@ -19,6 +19,7 @@ const routes: RouteRecordRaw[] = [
       { path: '', name: 'dashboard', component: () => import('@/views/DashboardView.vue') },
       { path: 'upstreams', name: 'upstreams', component: () => import('@/views/UpstreamsView.vue') },
       { path: 'models/llm', name: 'models-llm', component: () => import('@/views/ModelsLlmView.vue') },
+      { path: 'models/embed', name: 'models-embed', component: () => import('@/views/ModelsEmbedView.vue') },
       { path: 'models/rerank', name: 'models-rerank', component: () => import('@/views/ModelsRerankView.vue') },
       {
         path: 'models/systemone',
@@ -28,6 +29,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'tools/websearch', name: 'tools-websearch', component: () => import('@/views/ToolsWebSearchView.vue') },
       { path: 'requests', name: 'requests', component: () => import('@/views/RequestsView.vue') },
       { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
+      { path: 'about', name: 'about', component: () => import('@/views/AboutView.vue') },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: { name: 'dashboard' } },

@@ -3,17 +3,18 @@ import 'element-plus/theme-chalk/dark/css-vars.css'
 import '@/styles/theme.css'
 
 import ElementPlus from 'element-plus'
-import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import { createApp } from 'vue'
 
 import App from './App.vue'
 import { setUnauthorizedHandler } from '@/api/client'
+import { i18n } from '@/i18n'
 import { router } from '@/router'
 import { expire } from '@/stores/session'
 
 const app = createApp(App)
 
-app.use(ElementPlus, { locale: zhCn })
+app.use(ElementPlus)
+app.use(i18n)
 app.use(router)
 
 // Any protected call that comes back 401 means the cookie is gone: drop straight back to

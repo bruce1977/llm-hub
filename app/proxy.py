@@ -18,7 +18,7 @@ import httpx
 from auth import client_ip
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
-from request_log import extract_tokens, now_ts, sanitize_body
+from request_log import extract_token_usage, now_ts, sanitize_body
 
 logger = logging.getLogger("llm_hub")
 
@@ -64,7 +64,7 @@ class ProxyService:
 
     # ------------------------------------------------------------------ logging ---
     def _logging_on(self, cfg) -> bool:
-        """Per-request switch: ``config.json`` -> ``request_log.enabled`` (hot reload)."""
+        """Per-request switch: ``config.yaml`` -> ``request_log.enabled`` (hot reload)."""
         return self.request_log is not None and cfg.request_log.enabled
 
     def _record(self, meta: dict[str, Any], *, status_code: int, duration_ms: int, **extra: Any) -> None:
@@ -84,6 +84,8 @@ class ProxyService:
             "duration_ms": duration_ms,
             "ttfb_ms": extra.get("ttfb_ms"),
             "stream": meta.get("stream", 0),
+            "tokens_in": extra.get("tokens_in"),
+            "tokens_out": extra.get("tokens_out"),
             "tokens": extra.get("tokens"),
             "req_size": meta.get("req_size"),
             "res_size": extra.get("res_size"),
@@ -443,13 +445,16 @@ class ProxyService:
         if meta["logging"]:
             duration_ms = round((time.perf_counter() - meta["started"]) * 1000)
             resp_text, resp_trunc = sanitize_body(resp.content)
+            tokens_in, tokens_out, tokens_total = extract_token_usage(resp.content)
             self._record(
                 meta,
                 status_code=resp.status_code,
                 duration_ms=duration_ms,
                 ttfb_ms=duration_ms,
                 res_size=len(resp.content),
-                tokens=extract_tokens(resp.content),
+                tokens=tokens_total,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
                 response_body=resp_text,
                 response_body_truncated=1 if resp_trunc else 0,
                 error=None if resp.status_code < 400 else f"HTTP {resp.status_code}",

@@ -6,7 +6,11 @@ Supported key transports:
   - X-API-Key: <key>
   - ?api_key=<key>  (only when security.allow_query_api_key is enabled; disabled by default)
 
-Multiple keys are supported and compared in constant time to avoid timing side channels.
+Multiple keys are supported and compared in constant time to avoid timing side channels. The
+keys themselves come from the environment only (GATEWAY_API_KEYS / GATEWAY_API_KEYS_FILE).
+
+`auth.allow_access_ip_whitelist` holds regexes for client addresses that are exempt from the
+key check and may open /docs. It is matched against the TCP peer, never X-Forwarded-For.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import logging
+import re
 from collections.abc import Iterable
 
 from fastapi import HTTPException, Request, status
@@ -22,7 +27,7 @@ logger = logging.getLogger("llm_hub")
 
 # Routes always anonymous when auth.allow_anonymous_health is true.
 PUBLIC_PATHS = {"/", "/health"}
-# OpenAPI docs routes (hidden on a public gateway unless security.allow_docs).
+# OpenAPI docs routes: served only to auth.allow_access_ip_whitelist addresses.
 # Served locally (vendored assets) so they work without any public CDN.
 DOCS_PATHS = {"/docs", "/openapi.json"}
 
@@ -113,6 +118,17 @@ def client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+def peer_ip(request: Request) -> str | None:
+    """The ASGI client address, used by `auth.allow_access_ip_whitelist`.
+
+    Our code never reads X-Forwarded-For for this decision, because a caller can put any
+    address in that header. Note that uvicorn's ProxyHeadersMiddleware may already have
+    rewritten `request.client` from forwarded headers when the peer is a trusted proxy
+    (`--forwarded-allow-ips`, default 127.0.0.1); a direct connection is always the TCP peer.
+    """
+    return request.client.host if request.client else None
+
+
 def ip_allowed(ip: str | None, allowed: Iterable[str]) -> bool:
     """Check a client IP against an allowlist (supports CIDR, e.g. 10.0.0.0/8)."""
     if not allowed:
@@ -133,6 +149,24 @@ def ip_allowed(ip: str | None, allowed: Iterable[str]) -> bool:
     return False
 
 
+def ip_pattern_allowed(ip: str | None, patterns: Iterable[str]) -> bool:
+    """True when the address fully matches one of the regexes (empty list = nobody)."""
+    if not patterns or not ip:
+        return False
+    for pattern in patterns:
+        try:
+            if re.fullmatch(pattern, ip):
+                return True
+        except re.error as exc:
+            logger.warning("Ignoring malformed auth.allow_access_ip_whitelist pattern %r: %s", pattern, exc)
+    return False
+
+
+def docs_allowed(request: Request, cfg) -> bool:
+    """`/docs` and `/openapi.json` are served only to whitelisted addresses."""
+    return cfg is not None and ip_pattern_allowed(peer_ip(request), cfg.auth.allow_access_ip_whitelist)
+
+
 async def _authorize(request: Request, cfg) -> str | None:
     """Core authorization: health paths may be anonymous; everything else needs a valid key.
 
@@ -149,6 +183,11 @@ async def _authorize(request: Request, cfg) -> str | None:
         )
 
     if cfg.auth.allow_anonymous_health and path in PUBLIC_PATHS:
+        return None
+
+    # A whitelisted address is trusted to be on the network already, so it is exempt from
+    # the key check (and gets /docs). An empty whitelist means nobody is exempt.
+    if ip_pattern_allowed(peer_ip(request), cfg.auth.allow_access_ip_whitelist):
         return None
 
     key = extract_api_key(request, allow_query=cfg.security.allow_query_api_key)

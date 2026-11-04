@@ -9,11 +9,12 @@ The ``requests`` table holds the full detail of a call -- when it arrived (``ts`
 finished (``ts_end``), how long it took (``duration_ms`` / ``ttfb_ms``), the request
 parameters (``method`` / ``path`` / ``query`` / ``request_body``, plus ``requested_model``
 as the caller wrote it and ``model`` after alias resolution), and the result (``status``
-/ ``response_body`` / ``error`` / ``tokens`` / ``req_size`` / ``res_size`` / ``client_ip``).
-Writing is switched on and off by ``config.json`` -> ``request_log.enabled``; the flag is
+/ ``response_body`` / ``error`` / ``tokens_in`` / ``tokens_out`` / ``tokens`` / ``req_size``
+/ ``res_size`` / ``client_ip``).
+Writing is switched on and off by ``config.yaml`` -> ``request_log.enabled``; the flag is
 read per request, so hot reload turns recording on or off without a restart.
 
-Storage defaults to ``llmhub.db`` next to the active ``config.json`` (so the Docker
+Storage defaults to ``llmhub.db`` next to the active ``config.yaml`` (so the Docker
 layout puts it at ``/data/llmhub.db``); override with ``REQUEST_LOG_DB``. Rows older
 than ``REQUEST_LOG_RETENTION_DAYS`` (default 30, 0 = keep forever) are pruned hourly.
 
@@ -77,6 +78,8 @@ CREATE TABLE IF NOT EXISTS requests (
     duration_ms INTEGER NOT NULL,
     ttfb_ms INTEGER,
     stream INTEGER NOT NULL DEFAULT 0,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
     tokens INTEGER,
     req_size INTEGER,
     res_size INTEGER,
@@ -98,12 +101,18 @@ CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
 
 _COLUMNS = (
     "ts, method, path, model, upstream, status, duration_ms, ttfb_ms, stream, "
-    "tokens, req_size, res_size, client_ip, error, request_body, response_body, "
+    "tokens_in, tokens_out, tokens, req_size, res_size, client_ip, error, request_body, response_body, "
     "request_body_truncated, response_body_truncated, ts_end, requested_model, query"
 )
 
 # Columns appended after the first release; added with ALTER TABLE on older databases.
-_ADDED_COLUMNS = ("ts_end", "requested_model", "query")
+_ADDED_COLUMNS = (
+    ("ts_end", "TEXT"),
+    ("requested_model", "TEXT"),
+    ("query", "TEXT"),
+    ("tokens_in", "INTEGER"),
+    ("tokens_out", "INTEGER"),
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,26 +162,46 @@ def sanitize_body(raw: bytes | None) -> tuple[str | None, bool]:
     return text, truncated
 
 
-def extract_tokens(raw: bytes | None) -> int | None:
-    """Best-effort token usage from an OpenAI-compatible or Ollama response body."""
-    if not raw:
+def _as_int(value: Any) -> int | None:
+    """Token counts arrive as integers, but some providers send numeric strings."""
+    if value is None or isinstance(value, bool):
         return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_token_usage(raw: bytes | None) -> tuple[int | None, int | None, int | None]:
+    """Return (input, output, total) token usage from an OpenAI-compatible or Ollama body.
+
+    ``None`` in either direction means the response never reported it, which is
+    deliberately different from a real ``0``; ``total`` prefers the provider's own
+    figure, because it can exceed input + output when it counts reasoning tokens."""
+    if not raw:
+        return None, None, None
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        return None, None, None
     if not isinstance(data, dict):
-        return None
+        return None, None, None
+
     usage = data.get("usage")
     if isinstance(usage, dict):
-        total = usage.get("total_tokens")
-        if total is None and ("prompt_tokens" in usage or "completion_tokens" in usage):
-            total = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
-        if isinstance(total, int):
-            return total
-    if "prompt_eval_count" in data or "eval_count" in data:
-        return int(data.get("prompt_eval_count") or 0) + int(data.get("eval_count") or 0)
-    return None
+        prompt = _as_int(usage.get("prompt_tokens"))
+        completion = _as_int(usage.get("completion_tokens"))
+        if prompt is not None or completion is not None:
+            total = _as_int(usage.get("total_tokens"))
+            if total is None:
+                total = (prompt or 0) + (completion or 0)
+            return prompt, completion, total
+
+    prompt = _as_int(data.get("prompt_eval_count"))
+    completion = _as_int(data.get("eval_count"))
+    if prompt is not None or completion is not None:
+        return prompt, completion, (prompt or 0) + (completion or 0)
+    return None, None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -308,9 +337,9 @@ class RequestLog:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(SCHEMA)
             present = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
-            for column in _ADDED_COLUMNS:
+            for column, column_type in _ADDED_COLUMNS:
                 if column not in present:
-                    conn.execute(f"ALTER TABLE requests ADD COLUMN {column} TEXT")
+                    conn.execute(f"ALTER TABLE requests ADD COLUMN {column} {column_type}")
 
     def _insert_many(self, batch: list[dict[str, Any]]) -> None:
         rows = [tuple(entry.get(col) for col in _COLUMNS.split(", ")) for entry in batch]
@@ -421,7 +450,7 @@ class RequestLog:
             offset = (page - 1) * page_size
             rows = conn.execute(
                 f"SELECT id, ts, ts_end, method, path, query, requested_model, model, upstream, "
-                f"status, duration_ms, ttfb_ms, stream, tokens "
+                f"status, duration_ms, ttfb_ms, stream, tokens_in, tokens_out, tokens "
                 f"FROM requests{where} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
                 (*params, page_size, offset),
             ).fetchall()
@@ -547,14 +576,20 @@ class RequestLog:
     def _today_summary_sync(self, start: str, end: str) -> dict[str, Any]:
         where, params = self._where(start, end, None, None, None, None)
         error_clause = " AND " if where else " WHERE "
+        # Streaming rows carry no usage yet, so fall back to the split when the total is absent.
+        token_sum = (
+            "COALESCE(SUM(COALESCE(tokens, COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0))), 0)"
+        )
         with self._db() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM requests{where}", params).fetchone()[0]
             errors = conn.execute(
                 f"SELECT COUNT(*) FROM requests{where}{error_clause}status >= 400", params
             ).fetchone()[0]
             p95 = self._percentile(conn, where, params, total, 95)
+            row = conn.execute(f"SELECT {token_sum} FROM requests{where}", params).fetchone()
         return {
             "requests_today": total,
+            "tokens_today": int(row[0] or 0),
             "p95_ms": p95,
             "error_rate": round(errors / total, 6) if total else 0.0,
         }

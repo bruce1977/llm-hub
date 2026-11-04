@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { errorDetail, statusOf } from '@/api/client'
 import { api } from '@/api/management'
@@ -15,6 +16,8 @@ const props = withDefaults(
 )
 
 const open = defineModel<boolean>({ default: false })
+
+const { t } = useI18n()
 
 const detail = ref<RequestDetail | null>(null)
 const loadError = ref('')
@@ -46,69 +49,78 @@ function body(value: string | null | undefined): string | null {
 <template>
   <el-drawer v-model="open" size="620px" :with-header="false" class="req-drawer">
     <div class="dh">
-      <h3>请求详情 <span class="tag">req-log</span></h3>
-      <button class="icon-btn" title="关闭" @click="open = false">✕</button>
+      <h3>{{ t('requests.drawer.title') }} <span class="tag">req-log</span></h3>
+      <button class="icon-btn" :title="t('common.close')" @click="open = false">✕</button>
     </div>
 
     <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
-    <div v-else-if="!detail" class="empty">加载中…</div>
+    <div v-else-if="!detail" class="empty">{{ t('common.loading') }}</div>
 
     <div v-else class="db">
       <div class="kv">
-        <div class="k">到达时间</div>
-        <div class="v mono">{{ fmtClock(detail.ts) }}<span class="dim">（{{ fmtDateTime(detail.ts) }} UTC）</span></div>
-        <div class="k">完成时间</div>
+        <div class="k">{{ t('requests.drawer.arrived') }}</div>
+        <div class="v mono">
+          {{ fmtClock(detail.ts) }}<span class="dim">{{ t('requests.drawer.utc', { time: fmtDateTime(detail.ts) }) }}</span>
+        </div>
+        <div class="k">{{ t('requests.drawer.finished') }}</div>
         <div class="v mono">{{ fmtClock(detail.ts_end) }}</div>
-        <div class="k">编号</div>
+        <div class="k">{{ t('requests.drawer.id') }}</div>
         <div class="v mono">#{{ detail.id }}</div>
-        <div class="k">方法</div>
+        <div class="k">{{ t('requests.drawer.method') }}</div>
         <div class="v">{{ detail.method }}</div>
-        <div class="k">路径</div>
+        <div class="k">{{ t('requests.drawer.path') }}</div>
         <div class="v mono">{{ detail.path }}</div>
-        <div class="k">查询串</div>
-        <div class="v mono">{{ detail.query || '(空)' }}</div>
-        <div class="k">请求模型</div>
+        <div class="k">{{ t('requests.drawer.query') }}</div>
+        <div class="v mono">{{ detail.query || t('requests.drawer.emptyQuery') }}</div>
+        <div class="k">{{ t('requests.drawer.requestedModel') }}</div>
         <div class="v mono">{{ detail.requested_model || '—' }}</div>
-        <div class="k">解析后</div>
+        <div class="k">{{ t('requests.drawer.resolvedModel') }}</div>
         <div class="v mono">{{ detail.model || '—' }}</div>
-        <div class="k">上游</div>
+        <div class="k">{{ t('requests.drawer.upstream') }}</div>
         <div class="v">{{ detail.upstream || '—' }}</div>
-        <div class="k">状态</div>
+        <div class="k">{{ t('requests.drawer.status') }}</div>
         <div class="v">
           <span class="badge" :class="statusBadge(detail.status).cls">{{ statusBadge(detail.status).text }}</span>
         </div>
-        <div class="k">耗时</div>
+        <div class="k">{{ t('requests.drawer.duration') }}</div>
         <div class="v mono">{{ fmtMs(detail.duration_ms) }}</div>
         <div class="k">TTFB</div>
         <div class="v mono">{{ fmtMs(detail.ttfb_ms) }}</div>
-        <div class="k">流式</div>
-        <div class="v">{{ detail.stream ? '是' : '否' }}</div>
-        <div class="k">Token</div>
-        <div class="v mono">{{ fmtInt(detail.tokens) }}</div>
-        <div class="k">请求 / 响应大小</div>
+        <div class="k">{{ t('requests.drawer.stream') }}</div>
+        <div class="v">{{ detail.stream ? t('common.yes') : t('common.no') }}</div>
+        <div class="k">{{ t('requests.drawer.tokens') }}</div>
+        <div class="v mono">
+          {{ fmtInt(detail.tokens_in) }} / {{ fmtInt(detail.tokens_out) }}<span class="dim">{{
+            t('requests.drawer.totalTokens', { n: fmtInt(detail.tokens) })
+          }}</span>
+        </div>
+        <div class="k">{{ t('requests.drawer.size') }}</div>
         <div class="v mono">{{ fmtBytes(detail.req_size) }} / {{ fmtBytes(detail.res_size) }}</div>
-        <div class="k">客户端</div>
+        <div class="k">{{ t('requests.drawer.client') }}</div>
         <div class="v mono">{{ detail.client_ip || '—' }}</div>
-        <div v-if="detail.error" class="k">错误</div>
+        <div v-if="detail.error" class="k">{{ t('requests.drawer.error') }}</div>
         <div v-if="detail.error" class="v">{{ detail.error }}</div>
       </div>
 
       <div>
         <div class="card-h">
-          请求体
-          <span class="tag">{{ detail.request_body_truncated ? '已截断 8KB' : '完整' }} · 敏感字段脱敏</span>
+          {{ t('requests.drawer.requestBody') }}
+          <span class="tag"
+            >{{ t(detail.request_body_truncated ? 'requests.drawer.truncated8kb' : 'requests.drawer.full')
+            }}{{ t('requests.drawer.redacted') }}</span
+          >
         </div>
-        <JsonPane v-if="body(detail.request_body)" :code="body(detail.request_body) ?? ''" max-height="320px" />
-        <div v-else class="empty">未记录请求体</div>
+        <JsonPane v-if="body(detail.request_body)" :code="body(detail.request_body) ?? ''" height="320px" wrap />
+        <div v-else class="empty">{{ t('requests.drawer.noRequestBody') }}</div>
       </div>
 
       <div>
         <div class="card-h">
-          响应体
-          <span class="tag">{{ detail.response_body_truncated ? '首 8KB' : '完整' }}</span>
+          {{ t('requests.drawer.responseBody') }}
+          <span class="tag">{{ t(detail.response_body_truncated ? 'requests.drawer.first8kb' : 'requests.drawer.full') }}</span>
         </div>
-        <JsonPane v-if="body(detail.response_body)" :code="body(detail.response_body) ?? ''" max-height="320px" />
-        <div v-else class="empty">未记录响应体</div>
+        <JsonPane v-if="body(detail.response_body)" :code="body(detail.response_body) ?? ''" height="320px" wrap />
+        <div v-else class="empty">{{ t('requests.drawer.noResponseBody') }}</div>
       </div>
     </div>
   </el-drawer>

@@ -1,13 +1,15 @@
 """
 Configuration loading module.
 
-Reads the gateway configuration from /data/config.json and provides model routing and alias resolution.
-Supports hot reload (checks the file mtime at most once per second).
+Reads the gateway configuration from /data/config.yaml and provides model routing and alias
+resolution. Supports hot reload (checks the file mtime at most once per second).
+
+The file is YAML; because YAML 1.2 is a superset of JSON, a `CONFIG_PATH` that still points at
+a `.json` file parses exactly the same way.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -18,28 +20,62 @@ from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+import yaml
 from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger("llm_hub")
 
-CONFIG_PATH = os.getenv("CONFIG_PATH", "/data/config.json")
+CONFIG_PATH = os.getenv("CONFIG_PATH", "/data/config.yaml")
+
+#: A deployment that still only has the pre-YAML `config.json` next to the new default path
+#: keeps working: it is loaded (with a warning) instead of being replaced by a fresh template.
+LEGACY_CONFIG_NAME = "config.json"
 
 
-#: Environment variables that provide API keys without writing them into config.json
+#: Environment variables that provide API keys without writing them into config.yaml
 ENV_API_KEYS = "GATEWAY_API_KEYS"
 ENV_API_KEYS_FILE = "GATEWAY_API_KEYS_FILE"
 
 #: Environment variable to disable authentication entirely (e.g. GATEWAY_AUTH_DISABLED=true)
 ENV_AUTH_DISABLED = "GATEWAY_AUTH_DISABLED"
 
+#: API keys are configured by the environment only: inline `GATEWAY_API_KEYS`, or
+#: `GATEWAY_API_KEYS_FILE` pointing at a mounted secret file (`data/.keys`). They live in this
+#: module-level store instead of on `AuthConfig`, so config.yaml - which gets committed, pasted
+#: into issues and read by the console - can neither carry nor revive a credential.
+_runtime_api_keys: list[str] = []
+
+
+def set_api_keys(keys: list[str]) -> None:
+    """Replace the runtime key list; called once per config load."""
+    global _runtime_api_keys
+    _runtime_api_keys = list(keys)
+
+
+def get_api_keys() -> list[str]:
+    """The keys collected from the environment by the last config load."""
+    return _runtime_api_keys
+
+
+def default_keys_file() -> Path:
+    """The implicit key file: `.keys` next to config.yaml (e.g. /config/.keys, /data/.keys).
+
+    Resolved from the *current* CONFIG_PATH environment value rather than the module
+    constant, so a test or launcher that repoints CONFIG_PATH also repoints the secret.
+    """
+    return Path(os.getenv("CONFIG_PATH", CONFIG_PATH)).parent / ".keys"
+
 
 def collect_env_api_keys() -> list[str]:
     """Collect API keys from the environment.
 
-    Two sources are supported (they may be combined):
+    Three sources are supported (they may be combined):
       - GATEWAY_API_KEYS      inline value, comma/newline/space separated
       - GATEWAY_API_KEYS_FILE path to a file holding the keys (Docker/Kubernetes secrets
                               are mounted as files, which keeps them out of `docker inspect`)
+      - `.keys` beside config.yaml, read automatically when GATEWAY_API_KEYS_FILE is unset,
+        so a deployment only has to mount `/config/.keys` (or `/data/.keys`) - no extra
+        environment variable. An explicitly set GATEWAY_API_KEYS_FILE always wins.
     """
     collected: list[str] = []
 
@@ -48,6 +84,10 @@ def collect_env_api_keys() -> list[str]:
         collected.extend(p.strip() for p in re.split(r"[\s,]+", inline) if p.strip())
 
     key_file = os.getenv(ENV_API_KEYS_FILE, "").strip()
+    if not key_file:
+        implicit = default_keys_file()
+        if implicit.is_file():
+            key_file = str(implicit)
     if key_file:
         try:
             content = Path(key_file).read_text(encoding="utf-8")
@@ -57,22 +97,6 @@ def collect_env_api_keys() -> list[str]:
             logger.error("Failed to read %s=%s: %s", ENV_API_KEYS_FILE, key_file, exc)
 
     return collected
-
-
-def merge_env_api_keys(keys: list[str]) -> list[str]:
-    """Merge API keys coming from the environment into the configured keys, preserving order."""
-    extras = collect_env_api_keys()
-    if not extras:
-        return keys
-    merged = list(keys)
-    added = 0
-    for k in extras:
-        if k not in merged:
-            merged.append(k)
-            added += 1
-    if added:
-        logger.info("Loaded %d API key(s) from the environment", added)
-    return merged
 
 
 # Qwen3-Reranker official prompt template (yes/no binary scoring)
@@ -112,9 +136,47 @@ class ServerConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
+    """Caller authentication. Keys are never configured here - see ENV_API_KEYS above."""
+
     enabled: bool = True
-    api_keys: list[str] = Field(default_factory=list)
     allow_anonymous_health: bool = True
+    # Regexes for client addresses that may open /docs and are exempt from the API-key check.
+    # Matched against the TCP peer, deliberately not X-Forwarded-For: any client can put an
+    # arbitrary address in that header, and honouring it here would be a key bypass.
+    allow_access_ip_whitelist: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_api_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "api_keys" in data:
+            logger.warning(
+                "auth.api_keys no longer exists - %d key(s) in config.yaml are ignored; "
+                "supply keys through %s / %s (the .keys file) instead",
+                len(data["api_keys"] or []),
+                ENV_API_KEYS,
+                ENV_API_KEYS_FILE,
+            )
+            data = {k: v for k, v in data.items() if k != "api_keys"}
+
+        if isinstance(data, dict):
+            # Pydantic ignores unknown fields by default, so the common misspelling
+            # "whilelist" would silently leave the whitelist empty (/docs 404, no key
+            # bypass) without any error. Accept it, warn, and normalise to the real name.
+            for typo in ("allow_access_ip_whilelist", "allow_ip_whitelist"):
+                if typo in data:
+                    value = data.pop(typo)
+                    logger.warning(
+                        "auth.%s is not a field - read as auth.allow_access_ip_whitelist; "
+                        "please rename it in config.yaml",
+                        typo,
+                    )
+                    data.setdefault("allow_access_ip_whitelist", value)
+        return data
+
+    @property
+    def api_keys(self) -> list[str]:
+        """Keys collected from the environment by the last load; unreadable from config.yaml."""
+        return _runtime_api_keys
 
 
 class RoutingConfig(BaseModel):
@@ -285,7 +347,7 @@ class SystemOneConfig(BaseModel):
     (cfg.auth.api_keys, sourced from `.env` / GATEWAY_API_KEYS - the `.keys` config), then
     forwards to `backend` and signs that call with the key read from the environment
     variable named by `api_key_env` (default SYSTEMONE_SERVER_API_KEY), so the backend key
-    never has to live in config.json. A backend that needs no credential just ignores it.
+    never has to live in config.yaml. A backend that needs no credential just ignores it.
 
     `model` is the default model name injected into the forwarded body. "local" is a
     sentinel meaning "do not inject" - the caller then has to set `model` itself. laya-server
@@ -340,7 +402,7 @@ class RequestLogConfig(BaseModel):
 
     `enabled` is the per-request write switch: with it off the gateway records nothing at
     all -- request/response bodies are not even copied -- and the console shows an empty,
-    disabled log. It is read on every request, so flipping it in `config.json` takes
+    disabled log. It is read on every request, so flipping it in `config.yaml` takes
     effect immediately (hot reload), without a restart.
 
     Storage location and retention are deployment-level and stay in the environment:
@@ -388,10 +450,10 @@ class SecurityConfig(BaseModel):
 
     admin_endpoints: Literal["deny", "readonly", "allow"] = "deny"
     blocked_paths: list[str] = Field(default_factory=list)
-    allow_docs: bool = False
     cors_origins: list[str] = Field(default_factory=list)
     max_body_bytes: int = 32 * 1024 * 1024
     allow_query_api_key: bool = False
+    # Legacy: /health answers {"ok": true} only, so nothing reads this any more.
     expose_health_details: bool = False
     fail_on_weak_keys: bool = True
     allowed_client_ips: list[str] = Field(default_factory=list)
@@ -611,11 +673,12 @@ def build_default_config() -> dict[str, Any]:
             "max_concurrency": 64,
         },
         "auth": {
-            # Deliberately empty: provide keys through the GATEWAY_API_KEYS env var
-            # (or GATEWAY_API_KEYS_FILE) so secrets are never written to config.json.
+            # Keys are not configurable here: provide them through the GATEWAY_API_KEYS env var
+            # or GATEWAY_API_KEYS_FILE (data/.keys), so secrets never live in config.yaml.
             "enabled": True,
-            "api_keys": [],
             "allow_anonymous_health": True,
+            # Regexes for addresses that may open /docs and skip the API-key check.
+            "allow_access_ip_whitelist": [],
         },
         "routing": {"strict": False},
         "upstreams": [
@@ -699,6 +762,18 @@ def build_default_config() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Serialization
+# --------------------------------------------------------------------------- #
+def _dump_yaml(data: dict[str, Any]) -> str:
+    """Render the config mapping as YAML: readable, order-preserving, non-ASCII kept literal."""
+    header = (
+        "# llm-hub gateway configuration.\n"
+        "# Secrets do not belong here: API keys come from GATEWAY_API_KEYS / GATEWAY_API_KEYS_FILE.\n"
+    )
+    return header + yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+
+# --------------------------------------------------------------------------- #
 # Configuration manager (hot reload)
 # --------------------------------------------------------------------------- #
 class ConfigManager:
@@ -713,27 +788,45 @@ class ConfigManager:
         self._reload_if_needed(force=True)
 
     # ------------------------------------------------------------------ loading ---
+    def _active_path(self) -> Path:
+        """The file to read: the configured path, or the legacy `config.json` beside it."""
+        if self.path.exists():
+            return self.path
+        legacy = self.path.parent / LEGACY_CONFIG_NAME
+        if legacy.is_file() and legacy != self.path:
+            logger.warning(
+                "%s not found, falling back to the legacy %s - rename it to %s",
+                self.path,
+                legacy,
+                self.path.name,
+            )
+            return legacy
+        return self.path
+
     def _load(self) -> Config:
-        if not self.path.exists():
-            logger.warning("Config file %s not found, generating a default template", self.path)
+        path = self._active_path()
+        if not path.exists():
+            logger.warning("Config file %s not found, generating a default template", path)
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self.path.write_text(
-                    json.dumps(build_default_config(), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                logger.info("Default config written to %s (edit api_keys and upstreams as needed)", self.path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(_dump_yaml(build_default_config()), encoding="utf-8")
+                logger.info("Default config written to %s (edit upstreams and aliases as needed)", path)
             except Exception as exc:  # pragma: no cover
                 logger.error("Failed to write the default config: %s", exc)
             return Config(**build_default_config())
 
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            logger.error("Failed to parse config %s: %s, keeping the previous config", self.path, exc)
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.error("Failed to parse config %s: %s, keeping the previous config", path, exc)
             return self._config
-        except Exception as exc:  # pragma: no cover
-            logger.error("Failed to read the config: %s", exc)
+
+        if not isinstance(raw, dict):
+            logger.error(
+                "Config %s is %s, expected a mapping, keeping the previous config",
+                path,
+                type(raw).__name__,
+            )
             return self._config
 
         try:
@@ -742,8 +835,8 @@ class ConfigManager:
             logger.error("Config validation failed: %s, keeping the previous config", exc)
             return self._config
 
-        # Merge keys from the environment so secrets do not have to live in config.json
-        cfg.auth.api_keys = merge_env_api_keys(cfg.auth.api_keys)
+        # Keys come from the environment only, so config.yaml never has to hold a secret.
+        set_api_keys(collect_env_api_keys())
 
         # Allow disabling auth via environment variable (takes precedence over config file)
         if os.getenv(ENV_AUTH_DISABLED, "").lower() in ("true", "1", "yes"):
@@ -752,7 +845,7 @@ class ConfigManager:
 
         logger.info(
             "Config loaded: %s | upstreams=%d | aliases=%d | api_keys=%d",
-            self.path,
+            path,
             len(cfg.upstreams),
             len(cfg.aliases),
             len(cfg.auth.api_keys),
@@ -766,7 +859,7 @@ class ConfigManager:
                 return
             self._last_check = now
             try:
-                mtime = self.path.stat().st_mtime
+                mtime = self._active_path().stat().st_mtime
             except OSError:
                 mtime = 0.0
             if force or mtime != self._mtime:
@@ -783,7 +876,7 @@ class ConfigManager:
         with self._lock:
             self._config = self._load()
             try:
-                self._mtime = self.path.stat().st_mtime
+                self._mtime = self._active_path().stat().st_mtime
             except OSError:
                 self._mtime = 0.0
             return self._config

@@ -29,6 +29,7 @@ from admin_auth import require_admin
 from auth import (
     DOCS_PATHS,
     client_ip,
+    docs_allowed,
     extract_api_key,
     find_weak_keys,
     ip_allowed,
@@ -43,6 +44,7 @@ from management import login as admin_login
 from management import logout as admin_logout
 from management import router as management_router
 from proxy import ProxyService
+from bench_store import BenchStore
 from request_log import RequestLog
 from rerank import RerankService
 from systemone import SystemOneService
@@ -99,17 +101,29 @@ async def lifespan(app: FastAPI):
     app.state.rerank = RerankService(manager, client)
     app.state.systemone = SystemOneService(manager, client)
     app.state.websearch = WebSearchService(manager, client)
+    app.state.bench_store = BenchStore()
+    await app.state.bench_store.start()
     app.state.started_at = time.time()
 
-    # Security self-check: never serve an authenticated gateway without any key.
-    # Keys are meant to arrive from the environment so config.json holds no secrets.
+    # Security self-check: never serve an authenticated gateway without any key - unless an
+    # IP whitelist is configured, which is an explicit "trusted network" deployment: those
+    # addresses skip the key check anyway (see auth._authorize), so refusing to start would
+    # make a keys-free / docs-only setup impossible.
     if cfg.auth.enabled and not cfg.auth.api_keys:
-        raise RuntimeError(
-            "Refusing to start: auth.enabled is true but no API key is configured. "
-            "Supply keys through the GATEWAY_API_KEYS environment variable (comma separated) "
-            "or GATEWAY_API_KEYS_FILE (path to a secret file), add them to auth.api_keys in the "
-            "config file, or turn auth off with auth.enabled=false."
-        )
+        if cfg.auth.allow_access_ip_whitelist:
+            logger.warning(
+                "auth.enabled with no API key: running in trusted-network mode, only "
+                "auth.allow_access_ip_whitelist addresses (%d pattern(s)) may call the API; "
+                "every other client gets 401",
+                len(cfg.auth.allow_access_ip_whitelist),
+            )
+        else:
+            raise RuntimeError(
+                "Refusing to start: auth.enabled is true but no API key is configured. "
+                "Supply keys through the GATEWAY_API_KEYS environment variable (comma separated) "
+                "or GATEWAY_API_KEYS_FILE (path to a secret file such as data/.keys), "
+                "or turn auth off with auth.enabled=false."
+            )
 
     # Security self-check: refuse to start with weak/placeholder keys on a public gateway.
     weak = find_weak_keys(cfg.auth.api_keys)
@@ -134,6 +148,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await app.state.request_log.stop()
+        if getattr(app.state, "bench_store", None) is not None:
+            await app.state.bench_store.stop()
         await client.aclose()
         logger.info("LLM Hub stopped")
 
@@ -363,7 +379,8 @@ async def gateway_security_middleware(request: Request, call_next):
     6. CORS only for explicitly listed origins                -> 204 / header
     """
     manager = getattr(request.app.state, "manager", None)
-    sec = manager.config.security if manager is not None else None
+    cfg = manager.config if manager is not None else None
+    sec = cfg.security if cfg is not None else None
     path = request.url.path
 
     # 1. HTTP method allowlist -------------------------------------------------
@@ -379,7 +396,7 @@ async def gateway_security_middleware(request: Request, call_next):
         # 2. path regex allowlist (perimeter control) --------------------------
         # The admin console authenticates with its own password, so the perimeter
         # allowlist must never lock it out -- exempt /admin and the management API
-        # (and the docs, which have their own allow_docs gate).
+        # (and the docs, which are gated on auth.allow_access_ip_whitelist instead).
         management_api = path.startswith("/v1/management")
         if (
             not path.startswith("/admin")
@@ -390,8 +407,8 @@ async def gateway_security_middleware(request: Request, call_next):
             logger.warning("Path not in allowlist: %s %s", method, path)
             return _deny(status.HTTP_403_FORBIDDEN, "Path not allowed.")
 
-        # 3. hide API docs on a public gateway ---------------------------------
-        if path.rstrip("/") in DOCS_PATHS and not sec.allow_docs:
+        # 3. API docs go to whitelisted addresses only -------------------------
+        if path.rstrip("/") in DOCS_PATHS and not docs_allowed(request, cfg):
             return _deny(status.HTTP_404_NOT_FOUND, "Not found.")
 
         # /redoc was intentionally removed (superseded by /docs); return a clean
@@ -718,7 +735,8 @@ async def rerank_response(request: Request) -> JSONResponse:
 
 # --------------------------------------------------------------------------- #
 # Documented routes (explicit + schema-visible; registered before the catch-all
-# so they take precedence and appear in /docs when security.allow_docs is true)
+# so they take precedence and appear in /docs, which is served to the addresses
+# matched by auth.allow_access_ip_whitelist)
 # --------------------------------------------------------------------------- #
 @app.get(
     "/health",
@@ -1048,8 +1066,9 @@ async def route_websearch(request: Request, _auth=Depends(require_api_key)):
 
 # --------------------------------------------------------------------------- #
 # API docs (explicit, key-free, and registered BEFORE the catch-all so the
-# catch-all never intercepts these paths). Visibility is still gated by
-# security.allow_docs in the middleware above (False -> 404, True -> served).
+# catch-all never intercepts these paths). Visibility is gated by
+# auth.allow_access_ip_whitelist in the middleware above: an address that does not
+# match one of those regexes gets a 404, a matching one is served the docs.
 # --------------------------------------------------------------------------- #
 # Local vendored Swagger UI assets (no public CDN dependency -> works offline).
 SWAGGER_STATIC_DIR = Path(__file__).parent / "static" / "swagger"

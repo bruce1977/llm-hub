@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { errorDetail, statusOf } from '@/api/client'
 import { api } from '@/api/management'
@@ -24,6 +25,7 @@ import {
   fmtBucket,
   fmtClock,
   fmtInt,
+  fmtKiloTokens,
   fmtMs,
   fmtPct,
   fromInputValue,
@@ -31,8 +33,9 @@ import {
   nowInputValue,
 } from '@/utils/format'
 
-const POLL_MS = 5000
+const POLL_MS = 60000
 
+const { t } = useI18n()
 const chartTheme = useChartTheme()
 const overview = ref<Overview | null>(null)
 const points = ref<TimeseriesPoint[]>([])
@@ -45,8 +48,11 @@ const bucket = ref<Bucket>('hour')
 const range = reactive({ start: hoursAgoInput(24), end: nowInputValue() })
 const lastUpdated = ref('')
 const loadError = ref('')
+// `refreshing` drives the header ring and the chart veil; `loaded` separates "never had
+// data" (skeletons) from "showing the previous frame while the next one arrives".
+const refreshing = ref(false)
+const loaded = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
-let busy = false
 
 const kpi = computed<Partial<Kpi>>(() => overview.value?.kpi ?? {})
 const upstreams = computed<ProbeResult[]>(() => overview.value?.upstreams ?? [])
@@ -94,72 +100,80 @@ async function loadStats() {
 }
 
 async function refresh() {
-  if (busy) return
-  busy = true
+  if (refreshing.value) return
+  refreshing.value = true
   try {
     await Promise.all([loadOverview(), loadStats()])
+    loaded.value = true
     loadError.value = ''
   } catch (error) {
     // A 401 is handled by the axios interceptor (back to the gate); everything else is
     // shown inline so one dead probe cannot blank the page.
     if (statusOf(error) !== 401) loadError.value = errorDetail(error)
   } finally {
-    busy = false
+    refreshing.value = false
   }
 }
 
 const trendOption = computed<ChartOption>(() => {
-  const t = chartTheme.value
+  const ct = chartTheme.value
   const rows = points.value
   return {
     tooltip: {
       trigger: 'axis',
-      backgroundColor: t.surface,
-      borderColor: t.border,
-      textStyle: { color: t.text, fontSize: 11 },
+      backgroundColor: ct.surface,
+      borderColor: ct.border,
+      textStyle: { color: ct.text, fontSize: 11 },
       axisPointer: { type: 'shadow' },
     },
-    legend: { data: ['请求数', 'P95', '错误'], right: 0, top: 0, textStyle: { color: t.dim, fontSize: 11 }, itemWidth: 12, itemHeight: 8 },
+    legend: {
+      data: [t('dashboard.chart.requests'), 'P95', t('dashboard.chart.errors')],
+      right: 0,
+      top: 0,
+      textStyle: { color: ct.dim, fontSize: 11 },
+      itemWidth: 12,
+      itemHeight: 8,
+    },
     grid: { left: 44, right: 48, top: 32, bottom: 26 },
     xAxis: {
       type: 'category',
       data: rows.map((p) => fmtBucket(p.ts, bucket.value)),
-      axisLine: { lineStyle: { color: t.grid } },
+      axisLine: { lineStyle: { color: ct.grid } },
       axisTick: { show: false },
-      axisLabel: { color: t.mute, fontSize: 10, interval: 'auto', hideOverlap: true },
+      axisLabel: { color: ct.mute, fontSize: 10, interval: 'auto', hideOverlap: true },
     },
     yAxis: [
       {
         type: 'value',
-        name: '请求数',
-        nameTextStyle: { color: t.mute, fontSize: 10 },
-        splitLine: { lineStyle: { color: t.grid } },
-        axisLabel: { color: t.mute, fontSize: 10 },
+        name: t('dashboard.chart.requests'),
+        nameTextStyle: { color: ct.mute, fontSize: 10 },
+        splitLine: { lineStyle: { color: ct.grid } },
+        axisLabel: { color: ct.mute, fontSize: 10 },
       },
       {
         type: 'value',
         name: 'P95 ms',
-        nameTextStyle: { color: t.mute, fontSize: 10 },
+        nameTextStyle: { color: ct.mute, fontSize: 10 },
         splitLine: { show: false },
-        axisLabel: { color: t.mute, fontSize: 10 },
+        axisLabel: { color: ct.mute, fontSize: 10 },
       },
     ],
     series: [
       {
-        name: '请求数',
+        name: t('dashboard.chart.requests'),
         type: 'bar',
         data: rows.map((p) => p.count),
         barMaxWidth: 18,
-        itemStyle: { color: t.accent, borderRadius: [3, 3, 0, 0] },
+        itemStyle: { color: ct.accent, borderRadius: [3, 3, 0, 0] },
       },
       {
-        name: '错误',
+        name: t('dashboard.chart.errors'),
         type: 'bar',
         stack: 'err',
         data: rows.map((p) => p.errors),
         barMaxWidth: 18,
         barGap: '-100%',
-        itemStyle: { color: t.red, borderRadius: [3, 3, 0, 0] },
+        itemStyle: { color: ct.red, borderRadius: [3, 3, 0, 0] },
       },
       {
         name: 'P95',
@@ -169,43 +183,56 @@ const trendOption = computed<ChartOption>(() => {
         smooth: true,
         symbol: 'circle',
         symbolSize: 5,
-        lineStyle: { color: t.amber, width: 2 },
-        itemStyle: { color: t.amber },
+        lineStyle: { color: ct.amber, width: 2 },
+        itemStyle: { color: ct.amber },
       },
     ],
   }
 })
 
 function pieOption(items: DistributionItem[], colorFor?: (key: string) => string): ChartOption {
-  const t = chartTheme.value
+  const ct = chartTheme.value
+  const counts = new Map(items.map((item) => [item.key, item.count]))
+  // Long model ids would paint over the disc, so the pie carries no labels at all: name +
+  // count live in the one-per-line legend list under the chart.
+  const legendLabel = (name: string): string => {
+    const short = name.length > 16 ? `${name.slice(0, 15)}…` : name
+    return `${short}  ${fmtInt(counts.get(name) ?? 0)}`
+  }
   return {
-    color: t.palette,
+    color: ct.palette,
     tooltip: {
       trigger: 'item',
-      backgroundColor: t.surface,
-      borderColor: t.border,
-      textStyle: { color: t.text, fontSize: 11 },
+      backgroundColor: ct.surface,
+      borderColor: ct.border,
+      textStyle: { color: ct.text, fontSize: 11 },
       formatter: '{b}: {c} ({d}%)',
     },
     legend: {
+      // One entry per line under the disc: a horizontal row fits only two names per card and
+      // silently pages them away.
       type: 'scroll',
       orient: 'vertical',
-      right: 0,
-      top: 'middle',
-      itemWidth: 9,
-      itemHeight: 9,
-      textStyle: { color: t.dim, fontSize: 10.5 },
+      left: 'center',
+      top: '57%',
+      itemWidth: 8,
+      itemHeight: 8,
+      itemGap: 3,
+      textStyle: { color: ct.dim, fontSize: 9.5, lineHeight: 10.5 },
+      formatter: legendLabel,
     },
     series: [
       {
         type: 'pie',
-        radius: ['0%', '68%'],
-        center: ['36%', '50%'],
+        // A solid disc (radius is measured against min(width, height) / 2), pushed up so the
+        // legend rows below it never touch the slices.
+        radius: '46%',
+        center: ['50%', '31%'],
         avoidLabelOverlap: true,
         label: { show: false },
         emphasis: { label: { show: false }, scaleSize: 4 },
         labelLine: { show: false },
-        itemStyle: { borderColor: t.surface, borderWidth: 1 },
+        itemStyle: { borderColor: ct.surface, borderWidth: 2 },
         data: items.map((item) => ({
           name: item.key,
           value: item.count,
@@ -220,8 +247,8 @@ const upstreamPie = computed(() => pieOption(pies.value.upstream))
 const modelPie = computed(() => pieOption(pies.value.model))
 const statusPie = computed(() =>
   pieOption(pies.value.status, (key) => {
-    const t = chartTheme.value
-    return key === 'ok' ? t.green : t.red
+    const ct = chartTheme.value
+    return key === 'ok' ? ct.green : ct.red
   }),
 )
 
@@ -238,9 +265,10 @@ onBeforeUnmount(() => {
 
 <template>
   <TopBar
-    title="Dashboard"
-    sub="聚合视图 · 数据每 5s 自动刷新"
+    :title="t('nav.dashboard')"
+    :sub="t('dashboard.sub')"
     refreshable
+    :loading="refreshing"
     :last-updated="lastUpdated"
     @refresh="refresh()"
   >
@@ -249,54 +277,66 @@ onBeforeUnmount(() => {
         <input v-model="range.start" type="datetime-local" class="dt" />
         <span class="arrow">→</span>
         <input v-model="range.end" type="datetime-local" class="dt" />
-        <button class="apply" @click="refresh()">应用</button>
+        <button class="apply" @click="refresh()">{{ t('common.apply') }}</button>
       </div>
     </template>
   </TopBar>
 
   <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
   <div v-if="logState && logState.enabled === false" class="warn-strip">
-    ⚠ 请求明细已停用（<code>request_log.enabled = false</code>），统计与 Requests 页不会有新数据。
+    ⚠
+    <i18n-t keypath="dashboard.logDisabled" scope="global">
+      <template #code><code>request_log.enabled = false</code></template>
+    </i18n-t>
   </div>
 
-  <div class="kpis">
+  <div class="kpis" :class="{ refreshing: refreshing && loaded }">
     <div class="card kpi">
-      <div class="label"><span class="dot" :class="{ bad: kpi.upstreams_online === 0 }"></span> 上游在线</div>
-      <div class="val">{{ fmtInt(kpi.upstreams_online) }}<small> / {{ fmtInt(kpi.upstreams_total) }}</small></div>
-      <div class="meta">{{ onlineNames || '无在线上游' }}</div>
+      <div class="label"><span class="dot" :class="{ bad: kpi.upstreams_online === 0 }"></span> {{ t('dashboard.kpi.upstreamsOnline') }}</div>
+      <div v-if="overview" class="val">
+        {{ fmtInt(kpi.upstreams_online) }}<small> / {{ fmtInt(kpi.upstreams_total) }}</small>
+      </div>
+      <div v-else class="val"><span class="skeleton"></span></div>
+      <div class="meta">{{ onlineNames || t('dashboard.kpi.noOnlineUpstreams') }}</div>
     </div>
     <div class="card kpi">
-      <div class="label">运行中模型</div>
-      <div class="val">{{ fmtInt(kpi.running_models) }}</div>
-      <div class="meta">跨 {{ runningUpstreams }} 个上游实例</div>
+      <div class="label">{{ t('dashboard.kpi.runningModels') }}</div>
+      <div v-if="overview" class="val">{{ fmtInt(kpi.running_models) }}</div>
+      <div v-else class="val"><span class="skeleton"></span></div>
+      <div class="meta">{{ t('dashboard.kpi.acrossUpstreams', { n: runningUpstreams }) }}</div>
     </div>
     <div class="card kpi">
-      <div class="label">显存占用</div>
-      <div class="val">
+      <div class="label">{{ t('dashboard.kpi.vram') }}</div>
+      <div v-if="overview" class="val">
         {{ kpi.vram_used_gib === undefined ? '—' : Number(kpi.vram_used_gib).toFixed(1)
         }}<small v-if="kpi.vram_total_gib"> / {{ Number(kpi.vram_total_gib).toFixed(1) }} GiB</small>
       </div>
+      <div v-else class="val"><span class="skeleton"></span></div>
       <div class="bar"><i :style="{ width: `${vramPct}%` }"></i></div>
     </div>
     <div class="card kpi">
-      <div class="label">今日请求</div>
-      <div class="val">{{ fmtInt(kpi.requests_today) }}</div>
-      <div class="meta">P95 {{ fmtMs(kpi.p95_ms) }} · 错误 {{ fmtPct(kpi.error_rate) }}</div>
+      <div class="label">{{ t('dashboard.kpi.requestsTokens') }}</div>
+      <div v-if="overview" class="val pair">
+        <span>{{ fmtInt(kpi.requests_today) }}<small>{{ t('dashboard.kpi.requestsUnit') }}</small></span>
+        <span>{{ fmtKiloTokens(kpi.tokens_today) }}<small>{{ t('dashboard.kpi.tokensUnit') }}</small></span>
+      </div>
+      <div v-else class="val"><span class="skeleton"></span></div>
+      <div class="meta">{{ t('dashboard.kpi.p95Errors', { p95: fmtMs(kpi.p95_ms), rate: fmtPct(kpi.error_rate) }) }}</div>
     </div>
   </div>
 
   <div>
-    <div class="section-title">上游实例 <span class="tag">live</span></div>
+    <div class="section-title">{{ t('dashboard.upstreams.title') }} <span class="tag">live</span></div>
     <div class="card tight">
       <table>
         <thead>
           <tr>
-            <th>名称</th>
-            <th>类型</th>
-            <th>状态</th>
-            <th>已加载模型</th>
-            <th>显存占用</th>
-            <th>探测延迟</th>
+            <th>{{ t('dashboard.upstreams.name') }}</th>
+            <th>{{ t('dashboard.upstreams.type') }}</th>
+            <th>{{ t('dashboard.upstreams.status') }}</th>
+            <th>{{ t('dashboard.upstreams.loaded') }}</th>
+            <th>{{ t('dashboard.upstreams.vram') }}</th>
+            <th>{{ t('dashboard.upstreams.probe') }}</th>
           </tr>
         </thead>
         <tbody>
@@ -305,7 +345,7 @@ onBeforeUnmount(() => {
             <td><span class="chip">{{ u.type }}</span></td>
             <td>
               <span class="badge" :class="u.reachable ? 'ok' : 'err'">
-                ● {{ u.reachable ? '在线' : '离线' }}
+                ● {{ u.reachable ? t('common.online') : t('common.offline') }}
               </span>
             </td>
             <td>{{ fmtInt(u.loaded) }}</td>
@@ -313,10 +353,10 @@ onBeforeUnmount(() => {
               {{ u.vram_used_gib === null || u.vram_used_gib === undefined ? '—' : Number(u.vram_used_gib).toFixed(1) }}
               <template v-if="u.vram_total_gib"> / {{ Number(u.vram_total_gib).toFixed(1) }} GiB</template>
             </td>
-            <td class="mono">{{ u.reachable ? `${u.probe_ms} ms` : '超时' }}</td>
+            <td class="mono">{{ u.reachable ? `${u.probe_ms} ms` : t('common.timeout') }}</td>
           </tr>
           <tr v-if="!upstreams.length">
-            <td colspan="6" class="empty">加载中…</td>
+            <td colspan="6" class="empty">{{ t('common.loading') }}</td>
           </tr>
         </tbody>
       </table>
@@ -324,26 +364,29 @@ onBeforeUnmount(() => {
   </div>
 
   <div>
-    <div class="section-title">运行中模型 <span class="tag">device</span></div>
+    <div class="section-title">{{ t('dashboard.running.title') }} <span class="tag">device</span></div>
     <div class="card tight">
       <table>
         <thead>
           <tr>
-            <th>模型</th>
-            <th>上游</th>
-            <th>设备</th>
-            <th>上下文</th>
+            <th>{{ t('dashboard.running.model') }}</th>
+            <th>{{ t('dashboard.running.upstream') }}</th>
+            <th>{{ t('dashboard.running.device') }}</th>
+            <th>{{ t('dashboard.running.context') }}</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="m in running" :key="`${m.upstream}/${m.model}`">
-            <td class="mono">{{ m.model }}</td>
+            <td class="mono" :title="m.alias ? t('common.realModel', { model: m.model }) : undefined">
+              {{ m.display }}
+              <span v-if="m.alias" class="chip s2" :title="t('common.aliasTip')">alias</span>
+            </td>
             <td>{{ m.upstream }}</td>
             <td><span class="badge" :class="deviceBadge(m.device, m.device_ratio).cls">{{ deviceBadge(m.device, m.device_ratio).text }}</span></td>
             <td class="mono">{{ fmtInt(m.num_ctx) }}</td>
           </tr>
           <tr v-if="!running.length">
-            <td colspan="4" class="empty">当前没有驻留的模型</td>
+            <td colspan="4" class="empty">{{ t('dashboard.running.empty') }}</td>
           </tr>
         </tbody>
       </table>
@@ -352,33 +395,70 @@ onBeforeUnmount(() => {
 
   <div>
     <div class="section-title">
-      <span>{{ bucket === 'day' ? '按天请求趋势' : '24h 请求趋势' }}</span>
+      <span>{{ bucket === 'day' ? t('dashboard.trend.day') : t('dashboard.trend.hour') }}</span>
       <span class="tag">req · P95</span>
     </div>
     <div class="echart-card">
-      <EChart :option="trendOption" :empty="!points.length" height="240px" />
+      <EChart
+        :option="trendOption"
+        :empty="!points.length"
+        :empty-text="loaded ? t('common.empty') : t('common.loading')"
+        :loading="refreshing"
+        height="240px"
+      />
     </div>
 
     <div class="pie-grid">
       <div class="echart-card">
-        <div class="card-h">各 Upstream 请求分布 <span class="tag">by upstream</span></div>
-        <EChart :option="upstreamPie" :empty="!pies.upstream.length" />
+        <div class="card-h">{{ t('dashboard.chart.upstreamDist') }} <span class="tag">by upstream</span></div>
+        <EChart
+          :option="upstreamPie"
+          :empty="!pies.upstream.length"
+          :empty-text="loaded ? t('common.empty') : t('common.loading')"
+          :loading="refreshing"
+          height="300px"
+        />
       </div>
       <div class="echart-card">
-        <div class="card-h">各 Model 请求分布 <span class="tag">by model</span></div>
-        <EChart :option="modelPie" :empty="!pies.model.length" />
+        <div class="card-h">{{ t('dashboard.chart.modelDist') }} <span class="tag">by model</span></div>
+        <EChart
+          :option="modelPie"
+          :empty="!pies.model.length"
+          :empty-text="loaded ? t('common.empty') : t('common.loading')"
+          :loading="refreshing"
+          height="300px"
+        />
       </div>
       <div class="echart-card">
-        <div class="card-h">成功 / 失败分布 <span class="tag">by status</span></div>
-        <EChart :option="statusPie" :empty="!pies.status.length" />
+        <div class="card-h">{{ t('dashboard.chart.statusDist') }} <span class="tag">by status</span></div>
+        <EChart
+          :option="statusPie"
+          :empty="!pies.status.length"
+          :empty-text="loaded ? t('common.empty') : t('common.loading')"
+          :loading="refreshing"
+          height="300px"
+        />
       </div>
     </div>
   </div>
 
-  <div class="foot">llm-hub 管理台 · Dashboard（只读视图）</div>
+  <div class="foot">{{ t('common.footReadOnly', { page: t('nav.dashboard') }) }}</div>
 </template>
 
 <style scoped>
+/* The 今日请求 tile carries two numbers, so it trades the single 26px value for a pair. */
+.kpi .val.pair {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  font-size: 21px;
+}
+
+.kpi .val.pair small {
+  font-size: 11px;
+  margin-left: 3px;
+}
+
 .range-pick {
   display: inline-flex;
   align-items: center;

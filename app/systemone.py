@@ -10,7 +10,7 @@ Authentication split:
     (cfg.auth.api_keys, sourced from `.env` / GATEWAY_API_KEYS - the `.keys` config).
   - llm-hub then forwards the request to the configured `backend`, signing it with the
     key read from the environment variable named by `api_key_env` (default
-    SYSTEMONE_SERVER_API_KEY). That key never has to live in config.json, and a backend
+    SYSTEMONE_SERVER_API_KEY). That key never has to live in config.yaml, and a backend
     that needs no credential just ignores the header.
 
 Everything else (request body, response body, status code, content-type) is forwarded

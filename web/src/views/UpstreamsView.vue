@@ -1,41 +1,41 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { errorDetail, errorResponseBody, statusOf } from '@/api/client'
 import { api } from '@/api/management'
 import TopBar from '@/components/TopBar.vue'
 import type { ProbeResult, RunningModel, UpstreamDetail } from '@/types/api'
-import { deviceBadge, fmtClock, fmtInt } from '@/utils/format'
+import { deviceBadge, fmtClock, fmtInt, memoryText } from '@/utils/format'
+
+const { t } = useI18n()
 
 const upstreams = ref<ProbeResult[]>([])
-// /upstreams strips running_models, so the per-instance device table is taken from
-// /overview, which reports the same probe results plus the models resident in memory.
-const runningByUpstream = ref<Record<string, RunningModel[]>>({})
 const lastUpdated = ref('')
 const loadError = ref('')
+const refreshing = ref(false)
 const expanded = ref('')
-// name -> probe + installed models. The 503 "unreachable" answer carries only a subset,
-// hence Partial: the template guards on `unreachable` before reading the model list.
+// name -> probe + the models declared for it in config.yaml + what is resident in memory.
+// The 503 "unreachable" answer carries only a subset, hence Partial: the template guards
+// on `unreachable` before reading the model list.
 const details = ref<Record<string, Partial<UpstreamDetail>>>({})
 const detailBusy = ref('')
 let timer: ReturnType<typeof setInterval> | null = null
 
 async function load() {
+  if (refreshing.value) return
+  refreshing.value = true
   try {
     const { data } = await api.overview()
     upstreams.value = data.upstreams ?? []
-    const grouped: Record<string, RunningModel[]> = {}
-    for (const model of data.running_models ?? []) {
-      grouped[model.upstream] = grouped[model.upstream] || []
-      grouped[model.upstream].push(model)
-    }
-    runningByUpstream.value = grouped
     lastUpdated.value = fmtClock(data.generated_at)
     loadError.value = ''
     // Keep an open row in sync with the refreshed list.
     if (expanded.value) await loadDetail(expanded.value)
   } catch (error) {
     if (statusOf(error) !== 401) loadError.value = errorDetail(error)
+  } finally {
+    refreshing.value = false
   }
 }
 
@@ -52,6 +52,7 @@ async function loadDetail(name: string) {
       [name]: {
         unreachable: body?.unreachable === true || statusOf(error) === 503,
         models: [],
+        running_models: [],
       },
     }
   } finally {
@@ -65,7 +66,7 @@ async function toggle(name: string) {
     return
   }
   expanded.value = name
-  if (!details.value[name]) await loadDetail(name)
+  await loadDetail(name)
 }
 
 function vramText(u: ProbeResult): string {
@@ -74,9 +75,56 @@ function vramText(u: ProbeResult): string {
   return u.vram_total_gib ? `${used} / ${Number(u.vram_total_gib).toFixed(1)} GiB` : `${used} GiB`
 }
 
+/** One row per model declared in config.yaml, left-joined with the live /api/ps state.
+ *  A declared model that is not resident is rendered as "未加载" instead of being
+ *  listed in a separate table. Models resident but never declared are appended so the
+ *  live state is never silently dropped. */
+interface ModelRow {
+  name: string
+  alias: string | null
+  running: RunningModel | null
+  title?: string
+}
+
+function modelRows(u: ProbeResult): ModelRow[] {
+  const detail = details.value[u.name]
+  const declared = detail?.models ?? []
+  const running = detail?.running_models ?? []
+
+  const byDisplay = new Map<string, RunningModel>()
+  const byModel = new Map<string, RunningModel>()
+  for (const m of running) {
+    byDisplay.set(m.display, m)
+    byModel.set(m.model, m)
+  }
+
+  const rows: ModelRow[] = declared.map((name) => {
+    const hit = byDisplay.get(name) ?? byModel.get(name) ?? null
+    return {
+      name,
+      alias: hit?.alias ?? null,
+      running: hit,
+      title: hit && hit.model !== hit.display ? t('common.realModel', { model: hit.model }) : undefined,
+    }
+  })
+
+  // /api/ps can report models that config.yaml never declared; keep them visible.
+  const declaredSet = new Set(declared)
+  for (const m of running) {
+    if (declaredSet.has(m.display) || declaredSet.has(m.model)) continue
+    rows.push({
+      name: m.display,
+      alias: m.alias,
+      running: m,
+      title: m.model !== m.display ? t('common.realModel', { model: m.model }) : undefined,
+    })
+  }
+  return rows
+}
+
 onMounted(() => {
   load()
-  timer = setInterval(load, 10000)
+  timer = setInterval(load, 60000)
 })
 
 onBeforeUnmount(() => {
@@ -86,22 +134,29 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <TopBar title="Upstreams" sub="上游实例运行状态 · 点击任意行展开查看运行中 / 已装模型" refreshable :last-updated="lastUpdated" @refresh="load" />
+  <TopBar
+    :title="t('nav.upstreams')"
+    :sub="t('upstreams.sub')"
+    refreshable
+    :loading="refreshing"
+    :last-updated="lastUpdated"
+    @refresh="load"
+  />
 
   <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
 
   <div>
-    <div class="section-title">上游实例 <span class="tag">live</span></div>
+    <div class="section-title">{{ t('upstreams.title') }} <span class="tag">live</span></div>
     <div class="card tight">
       <table>
         <thead>
           <tr>
-            <th>名称</th>
-            <th>类型</th>
-            <th>状态</th>
-            <th>已加载</th>
-            <th>显存占用</th>
-            <th>探测延迟</th>
+            <th>{{ t('upstreams.name') }}</th>
+            <th>{{ t('upstreams.type') }}</th>
+            <th>{{ t('upstreams.status') }}</th>
+            <th>{{ t('upstreams.loaded') }}</th>
+            <th>{{ t('upstreams.vram') }}</th>
+            <th>{{ t('upstreams.probe') }}</th>
           </tr>
         </thead>
         <tbody>
@@ -109,84 +164,110 @@ onBeforeUnmount(() => {
             <tr class="dt-row" @click="toggle(u.name)">
               <td class="mono">{{ u.name }}</td>
               <td><span class="chip">{{ u.type }}</span></td>
-              <td><span class="badge" :class="u.reachable ? 'ok' : 'err'">● {{ u.reachable ? '在线' : '离线' }}</span></td>
+              <td>
+                <span class="badge" :class="u.reachable ? 'ok' : 'err'"
+                  >● {{ u.reachable ? t('common.online') : t('common.offline') }}</span
+                >
+              </td>
               <td>{{ fmtInt(u.loaded) }}</td>
               <td class="mono">{{ vramText(u) }}</td>
-              <td class="mono">{{ u.reachable ? `${u.probe_ms} ms` : '超时' }}</td>
+              <td class="mono">{{ u.reachable ? `${u.probe_ms} ms` : t('common.timeout') }}</td>
             </tr>
             <tr v-if="expanded === u.name" class="row-expand">
               <td colspan="6">
                 <div v-if="detailBusy === u.name && !details[u.name]" class="meta" style="color: var(--text-dim)">
-                  探测中…
+                  {{ t('upstreams.probing') }}
                 </div>
                 <div v-else-if="details[u.name]?.unreachable" class="meta" style="color: var(--red)">
-                  实例不可达（{{ u.error || '探测超时' }}），无法获取运行态与已装模型。
+                  <i18n-t keypath="upstreams.unreachable" scope="global">
+                    <template #reason>{{ u.error || t('upstreams.probeTimeout') }}</template>
+                  </i18n-t>
                 </div>
-                <div v-else class="exp-grid">
-                  <div>
-                    <div class="card-h">运行中模型 <span class="tag">/api/ps</span></div>
-                    <table v-if="u.ps_supported">
-                      <thead>
-                        <tr>
-                          <th>模型</th>
-                          <th>设备</th>
-                          <th>上下文</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr v-for="m in runningByUpstream[u.name] || []" :key="m.model">
-                          <td class="mono">{{ m.model }}</td>
-                          <td>
-                            <span class="badge" :class="deviceBadge(m.device, m.device_ratio).cls">
-                              {{ deviceBadge(m.device, m.device_ratio).text }}
-                            </span>
-                          </td>
-                          <td class="mono">{{ fmtInt(m.num_ctx) }}</td>
-                        </tr>
-                        <tr v-if="!(runningByUpstream[u.name] || []).length">
-                          <td colspan="3" class="empty">当前没有驻留的模型</td>
-                        </tr>
-                      </tbody>
-                    </table>
-                    <div v-else class="meta" style="font-size: 12px; color: var(--text-dim)">
-                      {{ u.type }} 不支持 /api/ps，无运行态探测。
-                    </div>
+                <div v-else>
+                  <div class="card-h">
+                    {{ t('upstreams.models') }}
+                    <span class="tag">config.yaml · upstreams[].models</span>
+                    <span class="tag">{{ u.ps_supported ? '/api/ps' : t('upstreams.psLive') }}</span>
                   </div>
-                  <div>
-                    <div class="card-h">已装模型 <span class="tag">/api/tags</span></div>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>模型</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr v-for="m in details[u.name]?.models || []" :key="m">
-                          <td class="mono">{{ m }}</td>
-                        </tr>
-                        <tr v-if="!(details[u.name]?.models || []).length">
-                          <td class="empty">{{ details[u.name]?.models_error ? `模型列表拉取失败：${details[u.name].models_error}` : '无已装模型' }}</td>
-                        </tr>
-                      </tbody>
-                    </table>
+                  <table v-if="modelRows(u).length" class="model-table">
+                    <colgroup>
+                      <col />
+                      <col style="width: 108px" />
+                      <col style="width: 96px" />
+                      <col style="width: 168px" />
+                    </colgroup>
+                    <thead>
+                      <tr>
+                        <th>{{ t('upstreams.modelTable.model') }}</th>
+                        <th>{{ t('upstreams.modelTable.device') }}</th>
+                        <th>{{ t('upstreams.modelTable.context') }}</th>
+                        <th>{{ t('upstreams.modelTable.memory') }}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="row in modelRows(u)" :key="row.name">
+                        <td class="mono" :title="row.title">
+                          {{ row.name }}
+                          <span v-if="row.alias" class="chip s2" :title="t('common.aliasTip')">alias</span>
+                        </td>
+                        <td>
+                          <span
+                            v-if="row.running"
+                            class="badge"
+                            :class="deviceBadge(row.running.device, row.running.device_ratio).cls"
+                          >
+                            {{ deviceBadge(row.running.device, row.running.device_ratio).text }}
+                          </span>
+                          <span v-else class="badge idle">{{ t('common.notLoaded') }}</span>
+                        </td>
+                        <td class="mono">{{ fmtInt(row.running?.num_ctx) }}</td>
+                        <td class="mono">{{ memoryText(row.running?.vram_gib, row.running?.size_gib) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <div v-else class="meta" style="font-size: 12px; color: var(--text-dim)">
+                    {{ t('upstreams.noModels') }}
                   </div>
                 </div>
               </td>
             </tr>
           </template>
           <tr v-if="!upstreams.length">
-            <td colspan="6" class="empty">加载中…</td>
+            <td colspan="6" class="empty">{{ t('common.loading') }}</td>
           </tr>
         </tbody>
       </table>
     </div>
   </div>
 
-  <div class="foot">llm-hub 管理台 · Upstreams（只读视图）</div>
+  <div class="foot">{{ t('common.footReadOnly', { page: t('nav.upstreams') }) }}</div>
 </template>
 
 <style scoped>
 .meta {
   font-size: 12px;
+}
+
+/* Fixed layout + explicit colgroup widths keep the 设备 column stable and stop the
+   上下文 / 显存 / 占用 headers from wrapping into three lines on a narrow grid half. */
+.model-table {
+  table-layout: fixed;
+}
+
+.model-table th,
+.model-table td {
+  white-space: nowrap;
+}
+
+/* Long declared model ids are the only cells allowed to wrap. */
+.model-table th:first-child,
+.model-table td:first-child {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.model-table td:not(:first-child) {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 </style>

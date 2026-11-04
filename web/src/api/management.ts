@@ -4,6 +4,8 @@ import { http } from './client'
 import type {
   AuthPing,
   AuthResult,
+  BenchHistory,
+  BenchJob,
   Bucket,
   Distribution,
   DistributionKey,
@@ -48,4 +50,20 @@ export const api = {
   distribution: (params: RangeQuery & { group_by: DistributionKey }) =>
     http.get<Distribution>('/stats/distribution', { params }),
   failures: (params: RangeQuery) => http.get<Failures>('/stats/failures', { params }),
+
+  // Benchmark (speed test). benchStart kicks off an async job and returns a job_id;
+  // benchStatus polls until status is "done" or "failed"; benchHistory reads the latest
+  // 3 persisted records for a (upstream, model) from llmhub.db.
+  benchStart: (body: {
+    upstream: string
+    model: string
+    rounds?: number | null
+    max_tokens?: number | null
+    think?: string | null
+  }): Promise<AxiosResponse<{ job_id: string; status: string }>> =>
+    http.post<{ job_id: string; status: string }>('/bench', body),
+  benchStatus: (jobId: string): Promise<AxiosResponse<BenchJob>> =>
+    http.get<BenchJob>(`/bench/${encodeURIComponent(jobId)}`),
+  benchHistory: (upstream: string, model: string): Promise<AxiosResponse<BenchHistory>> =>
+    http.get<BenchHistory>('/bench/history', { params: { upstream, model } }),
 }

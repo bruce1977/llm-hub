@@ -24,20 +24,28 @@ export interface ProbeResult {
 }
 
 export interface UpstreamDetail extends ProbeResult {
-  /** Absent on the 503 "unreachable" answer, which stops before the /api/tags probe. */
+  /** Models this upstream declares in `config.yaml`, aliases applied. Absent on the 503
+   *  "unreachable" answer, which stops before the model list is built. */
   models?: string[]
+  /** The same instances' resident models as reported by /overview, per upstream. */
+  running_models?: RunningModel[]
   unreachable: boolean
-  models_error?: string
 }
 
+/** A model the console reports as available: an Ollama resident model (`/api/ps`) or one
+ *  declared by a hosted provider such as OpenCode, which has no load state - its device,
+ *  memory and expiry are null and render as "-". */
 export interface RunningModel {
   model: string
+  /** Alias when `config.yaml` declares one for this real id, otherwise `model`. */
+  display: string
+  alias: string | null
   upstream: string
-  device: DeviceKind
-  device_ratio: number
+  device: DeviceKind | null
+  device_ratio: number | null
   num_ctx: number | null
-  size_gib: number
-  vram_gib: number
+  size_gib: number | null
+  vram_gib: number | null
   expires_at: string | null
 }
 
@@ -48,6 +56,8 @@ export interface Kpi {
   vram_used_gib: number
   vram_total_gib: number | null
   requests_today: number
+  /** Tokens recorded today; rows without usage (streams) contribute nothing. */
+  tokens_today: number
   p95_ms: number
   error_rate: number
 }
@@ -72,14 +82,23 @@ export interface UpstreamsResponse {
   upstreams: ProbeResult[]
 }
 
+/** One model an upstream declares in `config.yaml` (`upstreams[].models`). `display` is the
+ *  configured alias when there is one, otherwise the declared name; `model` always keeps the
+ *  real upstream id. The runtime fields (device, sizes, num_ctx) only exist while an Ollama
+ *  instance holds the model in memory - a hosted provider reports them as null. */
 export interface LlmModel {
   model: string
+  display: string
+  alias: string | null
   upstream: string
   type: UpstreamType
-  alias: string | null
-  num_ctx: number | null
   wildcard: boolean
   running: boolean
+  device: DeviceKind | null
+  device_ratio: number | null
+  num_ctx: number | null
+  size_gib: number | null
+  vram_gib: number | null
 }
 
 export interface ModelAlias {
@@ -157,7 +176,8 @@ export interface ToolsWebSearch {
   provider_configured: boolean
 }
 
-/** A row of the request-log table. `stream` is the SQLite integer flag (0 / 1). */
+/** A row of the request-log table. `stream` is the SQLite integer flag (0 / 1);
+ *  `tokens_in` / `tokens_out` are the usage split and `tokens` the reported total. */
 export interface RequestRow {
   id: number
   ts: string
@@ -172,6 +192,8 @@ export interface RequestRow {
   duration_ms: number
   ttfb_ms: number | null
   stream: number
+  tokens_in: number | null
+  tokens_out: number | null
   tokens: number | null
 }
 
@@ -278,4 +300,111 @@ export interface AuthResult {
 export interface RangeQuery {
   start?: string
   end?: string
+}
+
+// --------------------------------------------------------------------------- //
+// Benchmark (speed test) - /v1/management/bench*. Shapes mirror app/bench.py and
+// app/bench_store.py exactly: a job polls to completion, each (upstream, model) keeps
+// the latest 3 records in llmhub.db.
+// --------------------------------------------------------------------------- //
+export type BenchSource = 'server' | 'client' | 'client*' | (string & {})
+export type BenchJobStatus = 'pending' | 'running' | 'done' | 'failed'
+
+export interface BenchProgress {
+  completed: number
+  total: number
+  warmup: boolean
+}
+
+export interface BenchStats {
+  count: number
+  mean: number
+  std_dev: number
+  min: number
+  max: number
+  cv_percent: number
+}
+
+export interface BenchRound {
+  total_elapsed_s: number
+  ttft_s: number | null
+  prompt_tokens: number
+  gen_tokens: number
+  server_gen_ms: number | null
+  server_prefill_ms: number | null
+  server_load_ms: number | null
+  decode_tok_s: number
+  prefill_tok_s: number
+  timing_source: BenchSource
+  finish_reason: string | null
+  reasoning_chars: number
+  content_len: number
+  thinking_leaked: boolean
+  round: number
+  warmup: boolean
+}
+
+export interface BenchConfig {
+  server: string
+  base_url: string
+  host: string
+  port: number
+  model: string
+  rounds: number
+  warmup: number
+  max_tokens: number
+  temperature: number
+  think: string
+  think_suppressed: boolean
+  prompt: string
+}
+
+export interface BenchResult {
+  config: BenchConfig
+  rounds: BenchRound[]
+  timing_source: BenchSource
+  steady: {
+    decode: BenchStats
+    prefill: BenchStats
+    ttft: BenchStats & { mean_ms: number }
+  }
+}
+
+export interface BenchJob {
+  job_id: string
+  upstream: string
+  model: string
+  status: BenchJobStatus
+  progress: BenchProgress
+  result: BenchResult | null
+  error: string | null
+  created_at: string
+  finished_at: string | null
+}
+
+export interface BenchHistoryRecord {
+  id: number
+  upstream: string
+  model: string
+  created_at: string
+  server: string | null
+  host: string | null
+  port: number | null
+  rounds: number | null
+  warmup: number | null
+  max_tokens: number | null
+  decode_tok_s: number | null
+  decode_sd: number | null
+  prefill_tok_s: number | null
+  ttft_ms: number | null
+  timing_source: BenchSource | null
+  prompt_tokens: number | null
+  gen_tokens: number | null
+  payload: BenchResult | null
+}
+
+export interface BenchHistory {
+  upstream: string
+  model: string
+  records: BenchHistoryRecord[]
 }

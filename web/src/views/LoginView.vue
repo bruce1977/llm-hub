@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 
 import { errorDetail, statusOf } from '@/api/client'
@@ -7,6 +8,7 @@ import { gateway } from '@/stores/gateway'
 import { session, signIn } from '@/stores/session'
 import { theme, toggleTheme } from '@/stores/theme'
 
+const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 
@@ -18,7 +20,7 @@ const pwRef = ref<{ focus?: () => void } | null>(null)
 async function submit() {
   if (busy.value) return
   if (!form.password) {
-    error.value = '请输入管理台密码。'
+    error.value = t('login.errorEmpty')
     pwRef.value?.focus?.()
     return
   }
@@ -35,9 +37,9 @@ async function submit() {
       session.locked = true
     } else if (status === 401) {
       // The backend answers in English; the console is Chinese-only.
-      error.value = '用户名或密码错误，请重试。'
+      error.value = t('login.errorUnauthorized')
     } else {
-      error.value = errorDetail(err) || '登录失败。'
+      error.value = errorDetail(err) || t('login.errorFailed')
     }
     form.password = ''
     pwRef.value?.focus?.()
@@ -51,7 +53,7 @@ async function submit() {
   <div class="login-page">
     <button class="toggle theme-fab" @click="toggleTheme">
       <span>{{ theme.mode === 'dark' ? '☀' : '☾' }}</span>
-      <span>{{ theme.mode === 'dark' ? '浅色' : '深色' }}</span>
+      <span>{{ theme.mode === 'dark' ? t('login.light') : t('login.dark') }}</span>
     </button>
 
     <div v-if="!session.locked" class="login-card">
@@ -59,14 +61,14 @@ async function submit() {
         <div class="logo">L</div>
         <div>
           <div class="name">llm-hub</div>
-          <div class="ver">{{ gateway.version ? `v${gateway.version} · ` : '' }}管理台</div>
+          <div class="ver">{{ gateway.version ? `v${gateway.version} · ` : '' }}{{ t('shell.console') }}</div>
         </div>
       </div>
 
       <div>
-        <div class="login-title">管理员登录</div>
+        <div class="login-title">{{ t('login.title') }}</div>
         <div class="sub" style="font-size: 12px; color: var(--text-dim)">
-          只读管理台 <span class="tag" style="font-size: 10.5px; border: 1px solid var(--border); padding: 1px 7px; border-radius: 6px; color: var(--text-mute)">只读视图</span>
+          {{ t('login.readonly') }} <span class="tag" style="font-size: 10.5px; border: 1px solid var(--border); padding: 1px 7px; border-radius: 6px; color: var(--text-mute)">{{ t('login.readonlyTag') }}</span>
         </div>
       </div>
 
@@ -74,11 +76,11 @@ async function submit() {
 
       <form class="login-fields" @submit.prevent="submit">
         <div class="field">
-          <label for="username">用户名</label>
+          <label for="username">{{ t('login.username') }}</label>
           <input id="username" v-model="form.username" class="inp" autocomplete="username" readonly />
         </div>
         <div class="field">
-          <label for="password">管理员密码（ADMIN_PASSWORD）</label>
+          <label for="password">{{ t('login.passwordLabel') }}</label>
           <el-input
             id="password"
             ref="pwRef"
@@ -86,28 +88,37 @@ async function submit() {
             type="password"
             show-password
             autocomplete="current-password"
-            placeholder="请输入管理台密码"
+            :placeholder="t('login.passwordPlaceholder')"
             size="default"
           />
         </div>
         <button class="btn primary login-submit" type="submit" :disabled="busy">
-          {{ busy ? '登录中…' : '登 录' }}
+          {{ busy ? t('login.submitting') : t('login.submit') }}
         </button>
       </form>
 
       <div class="login-note">
-        管理台鉴权仅依赖环境变量 <code>ADMIN_PASSWORD</code>，不写入 <code>config.json</code>。<br />
-        登录后凭 12h HttpOnly 会话 Cookie 访问 <code>/v1/management/*</code>；脚本调用也可改用网关 API Key
-        （<code>Bearer</code> / <code>X-API-Key</code>）。管理密码本身不是请求凭据。
+        <i18n-t keypath="login.noteLine1" scope="global">
+          <template #env><code>ADMIN_PASSWORD</code></template>
+          <template #config><code>config.yaml</code></template>
+        </i18n-t>
+        <br />
+        <i18n-t keypath="login.noteLine2" scope="global">
+          <template #api><code>/v1/management/*</code></template>
+          <template #bearer><code>Bearer</code></template>
+          <template #apiKey><code>X-API-Key</code></template>
+        </i18n-t>
       </div>
     </div>
 
     <div v-else class="login-card">
       <div class="soon-box" style="border: none; padding: 20px 6px; gap: 12px">
         <div class="big">🔒</div>
-        <div class="t">管理台未启用</div>
+        <div class="t">{{ t('login.lockedTitle') }}</div>
         <div class="d">
-          当前未设置环境变量 <code>ADMIN_PASSWORD</code>，管理台处于锁定状态，任何访问均返回 503。
+          <i18n-t keypath="login.lockedBody" scope="global">
+            <template #env><code>ADMIN_PASSWORD</code></template>
+          </i18n-t>
         </div>
         <div class="code" style="width: 100%; text-align: center; max-height: none">HTTP 503 · Service Unavailable</div>
       </div>

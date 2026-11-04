@@ -1,7 +1,9 @@
 // Formatting helpers shared by the views. The management API emits naive UTC ISO strings
 // (second precision), so every display path appends "Z" before parsing.
 
-export type BadgeClass = 'idle' | 'gpu' | 'part' | 'cpu' | 'ok' | 'err'
+import { i18n } from '@/i18n'
+
+export type BadgeClass = 'idle' | 'gpu' | 'part' | 'cpu' | 'cloud' | 'ok' | 'err'
 
 export interface Badge {
   cls: BadgeClass
@@ -50,9 +52,20 @@ export function fmtPct(value: number | null | undefined, digits = 1): string {
   return `${(Number(value) * 100).toFixed(digits)}%`
 }
 
+/** Token totals are only ever meaningful in thousands on the KPI tiles: 12345 -> "12.35k". */
+export function fmtKiloTokens(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '—'
+  return `${(Number(value) / 1000).toFixed(2)}k`
+}
+
 export function fmtGib(value: number | null | undefined): string {
   if (value === null || value === undefined) return '—'
   return `${Number(value).toFixed(1)} GiB`
+}
+
+/** "used / total" memory, or a single dash when the provider reports none at all. */
+export function memoryText(vram: number | null | undefined, size: number | null | undefined): string {
+  return vram === null || vram === undefined ? '—' : `${fmtGib(vram)} / ${fmtGib(size)}`
 }
 
 export function fmtBytes(value: number | null | undefined): string {
@@ -89,12 +102,12 @@ export function nowInputValue(): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-export function deviceBadge(device: string | null | undefined, ratio: number | null | undefined): Badge {
-  if (!device) return { cls: 'idle', text: '—' }
-  const pct = ratio === null || ratio === undefined ? null : Math.round(ratio * 100)
-  if (device === 'gpu') return { cls: 'gpu', text: pct === null ? '● GPU' : `● GPU ${pct}%` }
-  if (device === 'partial') return { cls: 'part', text: pct === null ? '● 部分' : `● 部分 ${pct}%` }
-  return { cls: 'cpu', text: '● CPU' }
+export function deviceBadge(device: string | null | undefined, _ratio?: number | null): Badge {
+  if (device === 'cloud') return { cls: 'cloud', text: '● Cloud' }
+  if (device === 'gpu') return { cls: 'gpu', text: '● GPU' }
+  if (device === 'partial') return { cls: 'part', text: i18n.global.t('common.devicePartial') }
+  if (device === 'cpu') return { cls: 'cpu', text: '● CPU' }
+  return { cls: 'idle', text: '—' }
 }
 
 export function statusBadge(status: number | null | undefined): Badge {

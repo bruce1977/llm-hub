@@ -4,7 +4,7 @@ Read-only management API for the web console (``/v1/management``).
 Every route except login/logout depends on :func:`admin_auth.require_admin`, so it
 accepts only the signed admin session cookie minted by ``POST /auth/login``; the admin
 password is a login-page credential, never a request credential. Nothing here writes
-configuration: the console is a projection of ``config.json`` plus live probes of the
+configuration: the console is a projection of ``config.yaml`` plus live probes of the
 upstreams.
 
 Live probes reuse the same ``httpx.AsyncClient`` as forwarding, with a short timeout
@@ -14,10 +14,14 @@ so one dead upstream never stalls the whole view.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hmac
+import json
 import logging
 import os
+import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -29,6 +33,8 @@ from admin_auth import (
     get_admin_password,
     require_admin,
 )
+from bench import BenchError, BenchOptions, run_bench
+from bench_store import BenchStore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi import status as http_status
 from fastapi.responses import JSONResponse
@@ -131,7 +137,87 @@ def _masked_key(upstream) -> str | None:
     return None
 
 
-def _device_entry(model: dict[str, Any], upstream_name: str, cfg) -> dict[str, Any]:
+def _alias_by_target(cfg) -> dict[tuple[str, str], str]:
+    """``(upstream name, real model id) -> exposed alias``; the first declaration wins."""
+    mapping: dict[tuple[str, str], str] = {}
+    for alias_name, alias in cfg.aliases.items():
+        owner = cfg.get_upstream(alias.upstream) or cfg.find_upstream_for_model(alias.model)
+        if owner is not None:
+            mapping.setdefault((owner.name, alias.model), alias_name)
+    return mapping
+
+
+def _match_running(runtime: dict[tuple[str, str], dict[str, Any]], upstream_name: str, pattern: str):
+    """Runtime entry for a declared name; a prefix wildcard resolves to its first match."""
+    live = runtime.get((upstream_name, pattern))
+    if live is not None or not pattern.endswith("*"):
+        return live
+    prefix = pattern[:-1]
+    return next((m for (up, name), m in runtime.items() if up == upstream_name and name.startswith(prefix)), None)
+
+
+def _declared_models(upstream, discovered: list[str]) -> list[tuple[str, bool]]:
+    """``upstreams[].models`` as ``(name, matched_by_wildcard)``, patterns expanded.
+
+    A plain declaration is listed exactly as written - the instance is never asked for it.
+    A wildcard has no meaning until something matches it, so it is expanded with the same
+    list the gateway's own wildcard routing uses (``fetch_upstream_models``, cached 60s).
+    When discovery returns nothing the pattern is kept as its own entry: an unroutable
+    declaration is a misconfiguration the console should show, not hide.
+    """
+    entries: list[tuple[str, bool]] = [
+        (name, False) for name in upstream.models if not name.endswith("*")
+    ]
+    seen = {name for name, _ in entries}
+    for pattern in upstream.models:
+        if not pattern.endswith("*"):
+            continue
+        prefix = pattern[:-1]
+        hits = [name for name in sorted(discovered) if name.startswith(prefix)]
+        new = [name for name in hits if name not in seen]
+        entries.extend((name, True) for name in new)
+        seen.update(new)
+        if not hits:
+            entries.append((pattern, True))
+    return entries
+
+
+def _llm_row(
+    cfg,
+    aliases: dict[tuple[str, str], str],
+    runtime: dict[tuple[str, str], dict[str, Any]],
+    reachable: dict[str, bool],
+    upstream,
+    name: str,
+    via_wildcard: bool,
+) -> dict[str, Any]:
+    live = _match_running(runtime, upstream.name, name)
+    alias = aliases.get((upstream.name, name))
+    hosted = upstream.type == "opencode" and reachable.get(upstream.name, False)
+    return {
+        "model": name,
+        "display": alias or name,
+        "alias": alias,
+        "upstream": upstream.name,
+        "type": upstream.type,
+        "wildcard": via_wildcard,
+        # An OpenCode gateway is a hosted API with no /api/ps: when its probe answers,
+        # every model it declares is available and lives in the provider's cloud
+        # (`device: "cloud"`, memory unknown).
+        # A pattern that discovery matched nothing stays listed, but never as online.
+        "running": not name.endswith("*") and (live is not None or hosted),
+        "device": live["device"] if live else ("cloud" if hosted else None),
+        "device_ratio": live["device_ratio"] if live else None,
+        "num_ctx": (live["num_ctx"] if live else None) or cfg.num_ctx_overrides.get(name),
+        "size_gib": live["size_gib"] if live else None,
+        "vram_gib": live["vram_gib"] if live else None,
+    }
+
+
+def _device_entry(
+    model: dict[str, Any], upstream_name: str, cfg, aliases: dict[tuple[str, str], str]
+) -> dict[str, Any]:
+    """One ``/api/ps`` row plus the config alias, so the console names models as callers use them."""
     size = model.get("size") or 0
     vram = model.get("size_vram") or 0
     ratio = (vram / size) if size else 0.0
@@ -143,8 +229,11 @@ def _device_entry(model: dict[str, Any], upstream_name: str, cfg) -> dict[str, A
         device = "cpu"
     name = model.get("name") or model.get("model")
     num_ctx = model.get("context_length") or model.get("num_ctx") or cfg.num_ctx_overrides.get(name)
+    alias = aliases.get((upstream_name, name))
     return {
         "model": name,
+        "display": alias or name,
+        "alias": alias,
         "upstream": upstream_name,
         "device": device,
         "device_ratio": round(ratio, 3),
@@ -198,7 +287,8 @@ async def _probe_upstream(upstream, client, cfg) -> dict[str, Any]:
         info["error"] = f"/api/ps: {exc}"
         return info
 
-    info["running_models"] = [_device_entry(m, upstream.name, cfg) for m in models]
+    aliases = _alias_by_target(cfg)
+    info["running_models"] = [_device_entry(m, upstream.name, cfg, aliases) for m in models]
     info["loaded"] = len(info["running_models"])
     info["vram_used_gib"] = round(sum((m.get("size_vram") or 0) for m in models) / GiB, 1)
     return info
@@ -239,9 +329,64 @@ def _resolve_range(start: str | None, end: str | None, *, default_hours: int = 2
     return begin, finish
 
 
+async def _wildcard_discovery(cfg, client) -> dict[str, list[str]]:
+    """Live model lists, but only for the upstreams that actually declare a wildcard.
+
+    A config of plain names therefore never touches a tags endpoint; the query reuses
+    ``fetch_upstream_models``, so the console expands exactly what routing would match.
+    """
+    # Deferred import: main.py imports this module, so a module-level import would cycle.
+    from main import fetch_upstream_models
+
+    targets = [up for up in cfg.upstreams if any(m.endswith("*") for m in up.models)]
+    if not targets:
+        return {}
+    found = await asyncio.gather(*[fetch_upstream_models(client, up) for up in targets])
+    return dict(zip((up.name for up in targets), found, strict=True))
+
+
 # --------------------------------------------------------------------------- #
 # Overview & upstreams
 # --------------------------------------------------------------------------- #
+def _hosted_models(
+    cfg,
+    aliases: dict[tuple[str, str], str],
+    discovered: dict[str, list[str]],
+    reachable: dict[str, bool],
+) -> list[dict[str, Any]]:
+    """Declared models of a hosted provider, listed as available next to the resident ones.
+
+    An OpenCode gateway has no ``/api/ps``: one liveness probe covers the whole service, so
+    every model its ``config.yaml`` entry declares is online and reported with
+    ``device: "cloud"`` (it runs on the provider's infrastructure), memory unknown. A
+    wildcard that discovery could not resolve is skipped - the model tables show it, the
+    availability list must not claim a pattern is running.
+    """
+    rows: list[dict[str, Any]] = []
+    for upstream in cfg.upstreams:
+        if upstream.type != "opencode" or not reachable.get(upstream.name, False):
+            continue
+        for name, _ in _declared_models(upstream, discovered.get(upstream.name, [])):
+            if name.endswith("*"):  # a pattern nothing matched is not a model that is online
+                continue
+            alias = aliases.get((upstream.name, name))
+            rows.append(
+                {
+                    "model": name,
+                    "display": alias or name,
+                    "alias": alias,
+                    "upstream": upstream.name,
+                    "device": "cloud",
+                    "device_ratio": None,
+                    "num_ctx": cfg.num_ctx_overrides.get(name),
+                    "size_gib": None,
+                    "vram_gib": None,
+                    "expires_at": None,
+                }
+            )
+    return rows
+
+
 @router.get("/overview", summary="Dashboard KPIs, upstream summary and running models", tags=["management"])
 async def overview(request: Request, _=Depends(require_admin)):
     cfg = request.app.state.manager.config
@@ -250,6 +395,10 @@ async def overview(request: Request, _=Depends(require_admin)):
     today = await _log(request).today_summary()
 
     running = [model for info in infos for model in info["running_models"]]
+    aliases = _alias_by_target(cfg)
+    discovered = await _wildcard_discovery(cfg, client)
+    reachable = {i["name"]: i["reachable"] for i in infos}
+    running.extend(_hosted_models(cfg, aliases, discovered, reachable))
     vram_total = sum(i["vram_total_gib"] for i in infos if i["vram_total_gib"] is not None)
     has_total = any(i["vram_total_gib"] is not None for i in infos)
     return JSONResponse(
@@ -261,6 +410,7 @@ async def overview(request: Request, _=Depends(require_admin)):
                 "vram_used_gib": round(sum(i["vram_used_gib"] for i in infos), 1),
                 "vram_total_gib": round(vram_total, 1) if has_total else None,
                 "requests_today": today["requests_today"],
+                "tokens_today": today["tokens_today"],
                 "p95_ms": today["p95_ms"],
                 "error_rate": today["error_rate"],
             },
@@ -280,8 +430,14 @@ async def list_upstreams(request: Request, _=Depends(require_admin)):
     return JSONResponse({"upstreams": [_public_upstream(i) for i in infos]})
 
 
-@router.get("/upstreams/{name}", summary="One upstream: health, running and installed models", tags=["management"])
+@router.get("/upstreams/{name}", summary="One upstream: health, configured models and running state", tags=["management"])
 async def upstream_detail(name: str, request: Request, _=Depends(require_admin)):
+    """Live probe plus the models this upstream declares in ``config.yaml``.
+
+    Plain names are listed as written; only a prefix wildcard is resolved through the
+    upstream's model list, which is the same call the gateway's routing makes. An aliased
+    model is shown under its alias.
+    """
     cfg = request.app.state.manager.config
     client = request.app.state.client
     upstream = cfg.get_upstream(name)
@@ -293,61 +449,54 @@ async def upstream_detail(name: str, request: Request, _=Depends(require_admin))
         payload = {**_public_upstream(info), "unreachable": True}
         return JSONResponse(payload, status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE)
 
-    models: list[str] = []
-    models_error = None
-    try:
-        resp = await client.get(
-            f"{upstream.base_url_stripped()}/{upstream.tags_path()}",
-            headers=_upstream_headers(upstream),
-            timeout=PROBE_TIMEOUT,
-        )
-        resp.raise_for_status()
-        models = upstream.parse_model_names(resp.json())
-    except Exception as exc:
-        models_error = str(exc)
-
-    payload = {**_public_upstream(info), "models": models, "unreachable": False}
-    if models_error:
-        payload["models_error"] = models_error
-    return JSONResponse(payload)
+    aliases = _alias_by_target(cfg)
+    discovered = await _wildcard_discovery(cfg, client)
+    names = [name for name, _ in _declared_models(upstream, discovered.get(upstream.name, []))]
+    return JSONResponse(
+        {
+            **_public_upstream(info),
+            "models": [aliases.get((upstream.name, model), model) for model in names],
+            # A hosted provider has no /api/ps, so its available models are the declared ones.
+            "running_models": [
+                *info["running_models"],
+                *_hosted_models(cfg, aliases, discovered, {upstream.name: True}),
+            ],
+            "unreachable": False,
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #
 # Model configuration projections (read-only)
 # --------------------------------------------------------------------------- #
-@router.get("/models/llm", summary="LLM model / alias projection", tags=["management"])
+@router.get("/models/llm", summary="LLM models declared per upstream, plus aliases", tags=["management"])
 async def models_llm(request: Request, _=Depends(require_admin)):
-    cfg = request.app.state.manager.config
-    infos = await _probe_all(cfg, request.app.state.client)
-    running = {(i["name"], m["model"]) for i in infos for m in i["running_models"]}
+    """One row per model name an upstream declares in ``config.yaml``, with runtime state.
 
-    def alias_for(model: str, upstream_name: str) -> str | None:
-        for alias_name, alias in cfg.aliases.items():
-            if alias.model != model:
-                continue
-            owner = cfg.get_upstream(alias.upstream) or cfg.find_upstream_for_model(alias.model)
-            if owner is not None and owner.name != upstream_name:
-                continue
-            return alias_name
-        return None
+    Only ``upstreams[].models`` is listed - a model installed on the instance but never
+    declared is not routable through the gateway, so it does not belong in this table. A
+    prefix wildcard (``opencode/*``) is expanded to the names it actually matches, because
+    the pattern itself is not a model. A declared name that has an alias is displayed under
+    the alias (``display``) while ``model`` keeps the real upstream id.
+    """
+    cfg = request.app.state.manager.config
+    client = request.app.state.client
+    infos = await _probe_all(cfg, client)
+    runtime = {(i["name"], m["model"]): m for i in infos for m in i["running_models"]}
+    reachable = {i["name"]: i["reachable"] for i in infos}
+    aliases = _alias_by_target(cfg)
+    discovered = await _wildcard_discovery(cfg, client)
 
     models = [
-        {
-            "model": model,
-            "upstream": upstream.name,
-            "type": upstream.type,
-            "alias": alias_for(model, upstream.name),
-            "num_ctx": cfg.num_ctx_overrides.get(model),
-            "wildcard": model.endswith("*"),
-            "running": (upstream.name, model) in running,
-        }
+        _llm_row(cfg, aliases, runtime, reachable, upstream, name, via_wildcard)
         for upstream in cfg.upstreams
-        for model in upstream.models
+        for name, via_wildcard in _declared_models(upstream, discovered.get(upstream.name, []))
     ]
-    aliases = []
+
+    alias_rows = []
     for alias_name, alias in cfg.aliases.items():
         owner = cfg.get_upstream(alias.upstream) or cfg.find_upstream_for_model(alias.model)
-        aliases.append(
+        alias_rows.append(
             {
                 "alias": alias_name,
                 "target": alias.model,
@@ -356,7 +505,7 @@ async def models_llm(request: Request, _=Depends(require_admin)):
                 "description": alias.description,
             }
         )
-    return JSONResponse({"models": models, "aliases": aliases, "num_ctx_overrides": cfg.num_ctx_overrides})
+    return JSONResponse({"models": models, "aliases": alias_rows, "num_ctx_overrides": cfg.num_ctx_overrides})
 
 
 @router.get("/models/rerank", summary="Rerank configuration projection", tags=["management"])
@@ -588,3 +737,181 @@ async def stats_failures(request: Request, start: str | None = None, end: str | 
     log = _log(request)
     await log.flush()
     return JSONResponse(await log.failures(start=begin, end=finish))
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark (speed test)
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass
+class BenchJob:
+    job_id: str
+    upstream: str
+    model: str
+    status: str = "pending"  # pending -> running -> done | failed
+    progress: dict = dataclasses.field(default_factory=lambda: {"completed": 0, "total": 0, "warmup": False})
+    result: dict | None = None
+    error: str | None = None
+    created_at: str = dataclasses.field(default_factory=lambda: now_ts())
+    finished_at: str | None = None
+
+
+# In-memory registry of benchmark jobs. A real deployment is single-process, so this is
+# enough; finished jobs are swept once the map grows past MAX_JOBS.
+_BENCH_JOBS: dict[str, BenchJob] = {}
+MAX_BENCH_JOBS = 200
+
+
+def _run_bench_job_thread(job: BenchJob, upstream, options: BenchOptions, store: BenchStore) -> None:
+    """Drive one benchmark on its own event loop in a worker thread.
+
+    `asyncio.create_task` is not enough: the task lives on the *request's* event loop, so an
+    ASGI server that finishes/tears down that loop (or a test client that closes the request
+    scope) cancels the benchmark and the job stays "running" forever. A dedicated loop keeps
+    the job independent of whoever called POST /bench.
+    """
+    try:
+        asyncio.run(_run_bench_job(job, upstream, options, store))
+    except Exception as exc:  # noqa: BLE001 -- never let a worker thread die silently
+        job.status = "failed"
+        job.error = f"测速线程异常: {exc}"
+        job.finished_at = now_ts()
+        logger.exception("bench worker crashed for %s/%s", job.upstream, job.model)
+
+
+def _spawn_bench_job(job: BenchJob, upstream, options: BenchOptions, store: BenchStore) -> None:
+    threading.Thread(
+        target=_run_bench_job_thread,
+        args=(job, upstream, options, store),
+        name=f"bench-{job.job_id[:8]}",
+        daemon=True,
+    ).start()
+
+
+def _sweep_bench_jobs() -> None:
+    if len(_BENCH_JOBS) <= MAX_BENCH_JOBS:
+        return
+    finished = sorted(
+        (j for j in _BENCH_JOBS.values() if j.status in ("done", "failed")),
+        key=lambda j: j.created_at,
+    )
+    for old in finished[: len(_BENCH_JOBS) - MAX_BENCH_JOBS]:
+        _BENCH_JOBS.pop(old.job_id, None)
+
+
+async def _run_bench_job(job: BenchJob, upstream, options: BenchOptions, store: BenchStore) -> None:
+    server_type = "ollama" if upstream.type == "ollama" else "lm"
+    job.status = "running"
+
+    async def on_progress(completed: int, total: int, is_warmup: bool) -> None:
+        job.progress = {"completed": completed, "total": total, "warmup": is_warmup}
+
+    try:
+        result = await run_bench(
+            base_url=upstream.base_url_stripped(),
+            server_type=server_type,
+            model=job.model,
+            options=options,
+            headers=upstream.headers,
+            on_progress=on_progress,
+        )
+        job.result = result
+        job.finished_at = now_ts()
+        cfg_out = result["config"]
+        steady = result["steady"]
+        gen_tokens = max((r["gen_tokens"] for r in result["rounds"] if not r["warmup"]), default=None)
+        store.record(
+            {
+                "upstream": job.upstream,
+                "model": job.model,
+                "created_at": job.finished_at,
+                "server": cfg_out.get("server"),
+                "host": cfg_out.get("host"),
+                "port": cfg_out.get("port"),
+                "rounds": cfg_out.get("rounds"),
+                "warmup": cfg_out.get("warmup"),
+                "max_tokens": cfg_out.get("max_tokens"),
+                "decode_tok_s": steady["decode"]["mean"],
+                "decode_sd": steady["decode"]["std_dev"],
+                "prefill_tok_s": steady["prefill"]["mean"],
+                "ttft_ms": steady["ttft"]["mean_ms"],
+                "timing_source": result.get("timing_source"),
+                "prompt_tokens": max((r["prompt_tokens"] for r in result["rounds"] if not r["warmup"]), default=None),
+                "gen_tokens": gen_tokens,
+                "payload": json.dumps(result, ensure_ascii=False),
+            }
+        )
+        # Publish "done" only after the row is queued: a client that polls status and then
+        # immediately asks for the history must not observe an empty table.
+        job.status = "done"
+    except BenchError as exc:
+        job.status = "failed"
+        job.error = str(exc)
+        job.finished_at = now_ts()
+    except Exception as exc:  # noqa: BLE001 -- surface any failure to the console
+        job.status = "failed"
+        job.error = f"测速异常: {exc}"
+        job.finished_at = now_ts()
+
+
+class BenchStart(BaseModel):
+    upstream: str
+    model: str
+    rounds: int | None = None
+    max_tokens: int | None = None
+    think: str | None = None
+
+
+@router.post("/bench", summary="Start a model benchmark (speed test)", tags=["management"])
+async def bench_start(body: BenchStart, request: Request, _=Depends(require_admin)):
+    cfg = request.app.state.manager.config
+    upstream = next((u for u in cfg.upstreams if u.name == body.upstream), None)
+    if upstream is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"未知上游: {body.upstream}")
+    model = (body.model or "").strip()
+    if not model:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="model 不能为空")
+    try:
+        options = BenchOptions(
+            rounds=body.rounds or 4,
+            max_tokens=body.max_tokens if body.max_tokens is not None else 500,
+            think=body.think or "auto",
+        )
+    except BenchError as exc:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    job_id = uuid.uuid4().hex
+    job = BenchJob(job_id=job_id, upstream=upstream.name, model=model)
+    _BENCH_JOBS[job_id] = job
+    _sweep_bench_jobs()
+    store: BenchStore = request.app.state.bench_store
+    _spawn_bench_job(job, upstream, options, store)
+    return {"job_id": job_id, "status": "pending"}
+
+
+@router.get("/bench/history", summary="Recent benchmark records for a model", tags=["management"])
+async def bench_history(upstream: str, model: str, request: Request, _=Depends(require_admin)):
+    # Declared BEFORE "/bench/{job_id}" so the literal "history" segment is not swallowed
+    # by the job_id path parameter (which would 404 with "任务不存在或已过期").
+    store: BenchStore = request.app.state.bench_store
+    await store.flush()  # a job that just finished may still be sitting in the write queue
+    records = await store.history(upstream, model)
+    return {"upstream": upstream, "model": model, "records": records}
+
+
+@router.get("/bench/{job_id}", summary="Poll a benchmark job status", tags=["management"])
+async def bench_status(job_id: str, _=Depends(require_admin)):
+    job = _BENCH_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="任务不存在或已过期")
+    return {
+        "job_id": job.job_id,
+        "upstream": job.upstream,
+        "model": job.model,
+        "status": job.status,
+        "progress": job.progress,
+        "result": job.result,
+        "error": job.error,
+        "created_at": job.created_at,
+        "finished_at": job.finished_at,
+    }
+

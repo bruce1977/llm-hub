@@ -2,7 +2,7 @@
 Admin authentication for the web management console.
 
 A single admin password is supplied via the ``ADMIN_PASSWORD`` environment variable
--- there is no config.json entry for it. The password is only accepted by the login
+-- there is no config.yaml entry for it. The password is only accepted by the login
 endpoint: a successful login mints a short-lived, HMAC-signed session cookie, and
 protected admin routes depend on ``require_admin``.
 

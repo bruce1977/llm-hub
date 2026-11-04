@@ -1,0 +1,1 @@
+import{lt as e}from"./vue-i18n-BCQxwiIy.js";var t=e({version:null});export{t};

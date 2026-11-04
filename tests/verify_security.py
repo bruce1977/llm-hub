@@ -6,15 +6,16 @@ NOTE: CONFIG_PATH must be set *before* importing `config` (its CONFIG_PATH globa
 is bound at import time), so we create one fixed temp config and write each case to it.
 """
 
-import json
 import os
 import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+import yaml
+
 # Fixed temp config path, exported to the environment BEFORE config is imported.
-_TMP = tempfile.mktemp(prefix="llm-hub-sec-", suffix=".json")
+_TMP = tempfile.mktemp(prefix="llm-hub-sec-", suffix=".yaml")
 os.environ["CONFIG_PATH"] = _TMP
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +25,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from main import app  # noqa: E402
 
-EXAMPLE = Path("data/example.config.json").read_text(encoding="utf-8")
+EXAMPLE = Path("data/config.example.yaml").read_text(encoding="utf-8")
 
 PASSED = 0
 FAILED = 0
@@ -42,12 +43,12 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 @contextmanager
 def client_with(**overrides):
-    cfg = json.loads(EXAMPLE)
+    cfg = yaml.safe_load(EXAMPLE)
     # These tests exercise middleware-level controls, not auth; disable auth so the
     # gateway starts without keys (auth is covered by tests/smoke_test.py).
     cfg["auth"]["enabled"] = False
     cfg.setdefault("security", {}).update(overrides)
-    Path(_TMP).write_text(json.dumps(cfg), encoding="utf-8")
+    Path(_TMP).write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     with TestClient(app) as c:  # enters lifespan -> builds ConfigManager from _TMP
         yield c
 

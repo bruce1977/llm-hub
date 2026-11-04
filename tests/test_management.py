@@ -24,6 +24,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -79,6 +80,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 {
                     "models": [
                         {"name": "qwen3:8b", "size": 10 * GIB, "size_vram": 10 * GIB, "context_length": 8192},
+                        {"name": "qwen3:4b", "size": 4 * GIB, "size_vram": 0, "context_length": 4096},
                         {"name": "qwen3-reranker:4b", "size": 8 * GIB, "size_vram": 4 * GIB, "context_length": 4096},
                         {"name": "tiny:cpu", "size": 2 * GIB, "size_vram": 0, "context_length": 2048},
                     ]
@@ -89,11 +91,28 @@ class MockHandler(BaseHTTPRequestHandler):
                 {
                     "models": [
                         {"name": "qwen3:8b"},
+                        {"name": "qwen3:4b"},
                         {"name": "qwen3-reranker:4b"},
-                        {"name": "qwen3:*"},
+                        {"name": "qwen3.5:9b"},
                     ]
                 }
             )
+        elif path.endswith("/v1/models"):
+            # OpenAI-compatible discovery, used by the opencode / lmstudio upstream types.
+            self._send(
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": "auto"},
+                        {"id": "opencode/big-pickle"},
+                        {"id": "opencode/gpt-5-mini"},
+                        {"id": "other/not-matched"},
+                    ],
+                }
+            )
+        elif path.endswith("/health"):
+            # The OpenCode gateway liveness endpoint, probed by upstream_detail / overview.
+            self._send({"status": "ok"})
         else:
             self._send({"error": "not found"}, status=404)
 
@@ -159,7 +178,7 @@ _CONFIG = {
             "name": "mock-ollama",
             "type": "ollama",
             "base_url": f"http://127.0.0.1:{MOCK_PORT}",
-            "models": ["qwen3:8b", "qwen3-reranker:4b", "qwen3:*"],
+            "models": ["qwen3:8b", "qwen3-reranker:4b", "qwen3:*", "gone:1b"],
             "headers": {"Authorization": "Bearer upstream-secret"},
             "description": "mock instance",
             "vram_total_gb": 24.0,
@@ -193,7 +212,6 @@ _CONFIG = {
     "websearch": {"enabled": False},
     "security": {
         "admin_endpoints": "deny",
-        "allow_docs": False,
         "allowed_http_methods": ["GET", "POST"],
         "path_allowlist": [],
         "rate_limit": {"enabled": False},
@@ -273,18 +291,30 @@ def run() -> int:
         data = r.json()
         kpi = data.get("kpi", {})
         check("one upstream online of two", kpi.get("upstreams_online") == 1 and kpi.get("upstreams_total") == 2, str(kpi))
-        check("three running models", kpi.get("running_models") == 3, str(kpi))
+        check("four running models", kpi.get("running_models") == 4, str(kpi))
         check("vram used = 14.0 GiB", kpi.get("vram_used_gib") == 14.0, str(kpi))
         check("vram total = 32.0 GiB", kpi.get("vram_total_gib") == 32.0, str(kpi))
         devices = {m["model"]: m["device"] for m in data.get("running_models", [])}
         check("device classification gpu/partial/cpu", devices == {
             "qwen3:8b": "gpu",
+            "qwen3:4b": "cpu",
             "qwen3-reranker:4b": "partial",
             "tiny:cpu": "cpu",
         }, str(devices))
         up = {i["name"]: i for i in data.get("upstreams", [])}
         check("mock upstream online", up["mock-ollama"]["status"] == "online", str(up.get("mock-ollama")))
         check("dead upstream offline with error", up["dead-ollama"]["status"] == "offline" and up["dead-ollama"]["error"])
+        by_running = {m["model"]: m for m in data.get("running_models", [])}
+        check(
+            "running model is displayed under its alias",
+            by_running["qwen3:8b"]["display"] == "q35" and by_running["qwen3:8b"]["alias"] == "q35",
+            str(by_running.get("qwen3:8b")),
+        )
+        check(
+            "resident model without an alias keeps its id",
+            by_running["tiny:cpu"]["display"] == "tiny:cpu" and by_running["tiny:cpu"]["alias"] is None,
+            str(by_running.get("tiny:cpu")),
+        )
 
         print("[3] upstream listing / detail")
         r = client.get("/v1/management/upstreams")
@@ -293,9 +323,24 @@ def run() -> int:
         r = client.get("/v1/management/upstreams/mock-ollama")
         check("upstream detail -> 200", r.status_code == 200, f"got {r.status_code}")
         detail = r.json()
-        check("installed models from /api/tags", detail.get("models") == ["qwen3:8b", "qwen3-reranker:4b", "qwen3:*"], str(detail.get("models")))
-        check("detail reports 3 loaded models", detail.get("loaded") == 3, str(detail.get("loaded")))
-        check("detail has no models_error", detail.get("models_error") is None, str(detail.get("models_error")))
+        check(
+            "models come from config, with the wildcard expanded",
+            detail.get("models") == ["q35", "qwen3-reranker:4b", "gone:1b", "qwen3:4b"],
+            str(detail.get("models")),
+        )
+        check(
+            "detail lists no model the config does not cover",
+            "qwen3.5:9b" not in (detail.get("models") or []) and "other/not-matched" not in (detail.get("models") or []),
+            str(detail.get("models")),
+        )
+        check("detail no longer names a discovery endpoint", detail.get("models_endpoint") is None, str(detail))
+        check("detail reports 4 loaded models", detail.get("loaded") == 4, str(detail.get("loaded")))
+        check(
+            "detail carries the per-instance runtime",
+            [m["model"] for m in detail.get("running_models", [])]
+            == ["qwen3:8b", "qwen3:4b", "qwen3-reranker:4b", "tiny:cpu"],
+            str(detail.get("running_models")),
+        )
         r = client.get("/v1/management/upstreams/dead-ollama")
         check("unreachable upstream -> 503", r.status_code == 503, f"got {r.status_code}")
         check("unreachable marker present", r.json().get("unreachable") is True, r.text[:200])
@@ -309,12 +354,166 @@ def run() -> int:
         llm = r.json()
         models = {m["model"]: m for m in llm.get("models", []) if m["upstream"] == "mock-ollama"}
         check("qwen3:8b projected", "qwen3:8b" in models, str(list(models)))
-        check("wildcard declaration projected", models.get("qwen3:*", {}).get("wildcard") is True, str(models.get("qwen3:*")))
-        check("alias resolved onto the model", models["qwen3:8b"]["alias"] == "q35", str(models.get("qwen3:8b")))
-        check("num_ctx override projected", models["qwen3:8b"]["num_ctx"] == 8192, str(models.get("qwen3:8b")))
+        check(
+            "installed-but-undeclared model is not listed",
+            all(m["model"] != "qwen3.5:9b" for m in llm.get("models", [])),
+            str([m["model"] for m in llm.get("models", [])]),
+        )
+        check(
+            "declared model the instance lacks is still listed",
+            models.get("gone:1b", {}).get("running") is False
+            and models.get("gone:1b", {}).get("device") is None,
+            str(models.get("gone:1b")),
+        )
+        check(
+            "wildcard row is replaced by the models it matches",
+            "qwen3:*" not in models
+            and models.get("qwen3:4b", {}).get("wildcard") is True
+            and models.get("qwen3:8b", {}).get("wildcard") is False,
+            str(list(models)),
+        )
+        check(
+            "each expanded model carries its own runtime",
+            models.get("qwen3:4b", {}).get("running") is True
+            and models["qwen3:4b"]["device"] == "cpu"
+            and models["qwen3:4b"]["num_ctx"] == 4096,
+            str(models.get("qwen3:4b")),
+        )
+        check(
+            "alias is displayed instead of the real id",
+            models.get("qwen3:8b", {}).get("display") == "q35"
+            and models["qwen3:8b"]["alias"] == "q35",
+            str(models.get("qwen3:8b")),
+        )
+        check(
+            "unaliased model displays its declared name",
+            models.get("gone:1b", {}).get("display") == "gone:1b"
+            and models["gone:1b"]["alias"] is None,
+            str(models.get("gone:1b")),
+        )
+        check("runtime device from /api/ps", models.get("qwen3:8b", {}).get("device") == "gpu", str(models.get("qwen3:8b")))
+        check(
+            "runtime memory from /api/ps",
+            (models["qwen3:8b"]["size_gib"], models["qwen3:8b"]["vram_gib"]) == (10.0, 10.0),
+            str(models.get("qwen3:8b")),
+        )
+        check(
+            "loaded-only model is not listed",
+            "tiny:cpu" not in models,
+            str(list(models)),
+        )
+        check(
+            "idle model has no runtime state",
+            models.get("gone:1b", {}).get("device") is None
+            and models["gone:1b"]["size_gib"] is None
+            and models["gone:1b"]["running"] is False,
+            str(models.get("gone:1b")),
+        )
+        check("runtime num_ctx wins", models.get("qwen3-reranker:4b", {}).get("num_ctx") == 4096, str(models.get("qwen3-reranker:4b")))
+        check("num_ctx override for an idle model", models.get("qwen3:8b", {}).get("num_ctx") == 8192, str(models.get("qwen3:8b")))
         check("running flag from /api/ps", models["qwen3:8b"]["running"] is True, str(models.get("qwen3:8b")))
+        check(
+            "dead upstream keeps its declared rows",
+            [m["model"] for m in llm.get("models", []) if m["upstream"] == "dead-ollama"] == ["dead:*"]
+            and all(m["running"] is False for m in llm.get("models", []) if m["upstream"] == "dead-ollama"),
+            str([m for m in llm.get("models", []) if m["upstream"] == "dead-ollama"]),
+        )
         check("aliases list includes q35", any(a["alias"] == "q35" and a["target"] == "qwen3:8b" for a in llm.get("aliases", [])))
         check("num_ctx_overrides echoed", llm.get("num_ctx_overrides", {}).get("qwen3:8b") == 8192)
+
+        # ------------------------------- opencode: hosted API, no runtime telemetry ---
+        base_upstreams = list(_CONFIG["upstreams"])
+
+        def swap_upstreams(items: list[dict]) -> list[dict]:
+            with open(_CONFIG_PATH, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            raw["upstreams"] = items
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(raw, fh, ensure_ascii=False)
+            client.app.state.manager.reload()
+            rows = client.get("/v1/management/models/llm").json()["models"]
+            return [m for m in rows if m["upstream"] == "mock-opencode"]
+
+        opencode_up = {
+            "name": "mock-opencode",
+            "type": "opencode",
+            "base_url": f"http://127.0.0.1:{MOCK_PORT}",
+            "models": ["auto", "opencode/*"],
+        }
+        try:
+            rows = swap_upstreams(base_upstreams + [opencode_up])
+            check(
+                "opencode wildcard expands to the provider models",
+                [m["model"] for m in rows] == ["auto", "opencode/big-pickle", "opencode/gpt-5-mini"],
+                str(rows),
+            )
+            check("expanded rows are marked as wildcard-covered", [m["wildcard"] for m in rows] == [False, True, True], str(rows))
+            check("opencode probe online makes every model available", all(m["running"] for m in rows), str(rows))
+            check("opencode rows report the cloud device", all(m["device"] == "cloud" for m in rows), str(rows))
+            check("opencode memory is unknown", all(m["size_gib"] is None and m["vram_gib"] is None for m in rows), str(rows))
+
+            # A prefix that matches nothing on the provider stays visible as the pattern itself,
+            # but must never be reported as an online model.
+            with open(_CONFIG_PATH, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            raw["upstreams"] = base_upstreams + [
+                opencode_up,
+                {**opencode_up, "name": "mock-opencode-empty", "models": ["opencode/zzz:*"]},
+            ]
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(raw, fh, ensure_ascii=False)
+            client.app.state.manager.reload()
+            empty = [
+                m
+                for m in client.get("/v1/management/models/llm").json()["models"]
+                if m["upstream"] == "mock-opencode-empty"
+            ]
+            check(
+                "an unresolvable wildcard keeps its pattern row",
+                [m["model"] for m in empty] == ["opencode/zzz:*"],
+                str(empty),
+            )
+            check(
+                "an unresolvable wildcard is not reported running",
+                all(m["running"] is False for m in empty),
+                str(empty),
+            )
+
+            overview = client.get("/v1/management/overview").json()
+            check(
+                "an unresolvable wildcard adds no dashboard row",
+                not [m for m in overview["running_models"] if m["upstream"] == "mock-opencode-empty"],
+                str(overview["running_models"]),
+            )
+
+            hosted = [m for m in overview["running_models"] if m["upstream"] == "mock-opencode"]
+            check(
+                "dashboard lists the hosted provider models",
+                [m["model"] for m in hosted] == ["auto", "opencode/big-pickle", "opencode/gpt-5-mini"],
+                str(hosted),
+            )
+            check(
+                "hosted dashboard rows are cloud with no memory",
+                all(m["device"] == "cloud" and m["size_gib"] is None and m["vram_gib"] is None for m in hosted),
+                str(hosted),
+            )
+            check(
+                "hosted models count in the running KPI",
+                overview["kpi"]["running_models"] == 4 + len(hosted),
+                str(overview["kpi"]),
+            )
+
+            rows = swap_upstreams(base_upstreams + [{**opencode_up, "base_url": f"http://127.0.0.1:{DEAD_PORT}"}])
+            check("opencode offline when the probe fails", all(m["running"] is False for m in rows), str(rows))
+            overview = client.get("/v1/management/overview").json()
+            check(
+                "an offline hosted provider adds no dashboard rows",
+                not [m for m in overview["running_models"] if m["upstream"] == "mock-opencode"],
+                str(overview["running_models"]),
+            )
+        finally:
+            swap_upstreams(base_upstreams)
+        check("upstreams restored after the opencode probe", len(client.get("/v1/management/upstreams").json()["upstreams"]) == 2)
 
         r = client.get("/v1/management/models/rerank")
         check("GET /models/rerank -> 200", r.status_code == 200, f"got {r.status_code}")
@@ -356,6 +555,11 @@ def run() -> int:
         check("GET /requests/{id} -> 200", detail_r.status_code == 200, f"got {detail_r.status_code}")
         entry = detail_r.json()
         check("token usage extracted", entry.get("tokens") == 12, str(entry.get("tokens")))
+        check(
+            "Ollama usage split into input / output",
+            (entry.get("tokens_in"), entry.get("tokens_out")) == (5, 7),
+            str((entry.get("tokens_in"), entry.get("tokens_out"))),
+        )
         check("client ip recorded", bool(entry.get("client_ip")), str(entry.get("client_ip")))
         check("api_key masked in stored body", "secret-should-be-masked" not in (entry.get("request_body") or ""), entry.get("request_body"))
         check("mask marker present in stored body", "***" in (entry.get("request_body") or ""), entry.get("request_body"))
@@ -398,6 +602,25 @@ def run() -> int:
             version_entry.get("query") == "format=json",
             str(version_entry.get("query")),
         )
+        check(
+            "a response without usage records no token split",
+            version_entry.get("tokens_in") is None and version_entry.get("tokens_out") is None,
+            str((version_entry.get("tokens_in"), version_entry.get("tokens_out"))),
+        )
+
+        r = client.post(
+            "/v1/chat/completions",
+            headers=GW,
+            json={"model": "qwen3:8b", "stream": False, "messages": [{"role": "user", "content": "openai usage"}]},
+        )
+        check("non-stream /v1/chat/completions -> 200", r.status_code == 200, f"got {r.status_code}")
+        openai_row = client.get("/v1/management/requests", params={"path": "chat/completions"}).json()["rows"][0]
+        openai_entry = client.get(f"/v1/management/requests/{openai_row['id']}").json()
+        check(
+            "OpenAI usage split into input / output",
+            (openai_entry.get("tokens_in"), openai_entry.get("tokens_out"), openai_entry.get("tokens")) == (4, 8, 12),
+            str((openai_entry.get("tokens_in"), openai_entry.get("tokens_out"), openai_entry.get("tokens"))),
+        )
 
         r = client.post(
             "/v1/chat/completions",
@@ -437,6 +660,10 @@ def run() -> int:
         check("streaming row flagged stream=1", any(
             r["stream"] == 1 for r in by_path.get("/v1/chat/completions", [])
         ), str(by_path.get("/v1/chat/completions")))
+        check("token split is on the list rows too", any(
+            x["tokens_in"] == 5 and x["tokens_out"] == 7
+            for x in client.get("/v1/management/requests", params={"path": "api/chat"}).json()["rows"]
+        ))
         check("failed call logged with upstream", any(
             r["status"] == 502 and r["upstream"] == "dead-ollama" for r in rows
         ))
@@ -517,6 +744,11 @@ def run() -> int:
 
         r = client.get("/v1/management/overview")
         check("overview counts today's requests", r.json()["kpi"]["requests_today"] >= 4, str(r.json()["kpi"]))
+        check(
+            "overview sums today's tokens",
+            r.json()["kpi"]["tokens_today"] >= 24,
+            str(r.json()["kpi"]),
+        )
 
         # ------------------------------------------- allowlist exemption ---
         print("[7] perimeter exemptions")
@@ -581,6 +813,95 @@ def run() -> int:
         check("re-enabled row is the new call", newest["path"] == "/api/chat" and newest["status"] == 200, str(newest))
 
     # ------------------------------------------- tools/websearch projection ---
+        # ------------------------------------------- model speed test (bench) ---
+        # Runs inside the TestClient context on purpose: the bench job is a worker thread
+        # writing through app.state.bench_store, which only exists while the lifespan runs.
+        print("[10b] model speed test (bench)")
+
+        r = client.post("/v1/management/bench", json={"upstream": "nope", "model": "qwen3:8b"})
+        check("bench: unknown upstream -> 404", r.status_code == 404, f"got {r.status_code}")
+
+        r = client.post("/v1/management/bench", json={"upstream": "mock-ollama", "model": "   "})
+        check("bench: blank model -> 400", r.status_code == 400, f"got {r.status_code}")
+
+        # Route-order regression guard: "history" is a literal segment and must not be captured
+        # by /bench/{job_id} (which would answer 404 "任务不存在或已过期").
+        r = client.get("/v1/management/bench/history", params={"upstream": "mock-ollama", "model": "never-tested"})
+        check(
+            "bench history: unknown pair -> 200 with no records (not a job lookup)",
+            r.status_code == 200 and r.json().get("records") == [],
+            f"got {r.status_code}: {r.text[:160]}",
+        )
+
+        r = client.get("/v1/management/bench/deadbeef")
+        check("bench: unknown job id -> 404", r.status_code == 404, f"got {r.status_code}")
+
+        def _run_bench_job(model: str = "qwen3:8b") -> dict:
+            started = client.post(
+                "/v1/management/bench",
+                json={"upstream": "mock-ollama", "model": model, "rounds": 2, "max_tokens": 8},
+            )
+            if started.status_code != 200:
+                return {"status": f"start-failed-{started.status_code}", "detail": started.text[:160]}
+            job_id = started.json()["job_id"]
+            state: dict = {}
+            for _ in range(200):  # ~10s ceiling; the mock upstream answers instantly
+                state = client.get(f"/v1/management/bench/{job_id}").json()
+                if state.get("status") in ("done", "failed"):
+                    break
+                time.sleep(0.05)
+            return state
+
+        state = _run_bench_job()
+        check("bench job reaches done", state.get("status") == "done", str(state)[:200])
+        steady = (state.get("result") or {}).get("steady") or {}
+        check(
+            "bench result carries decode / prefill / ttft",
+            all(k in steady for k in ("decode", "prefill", "ttft"))
+            and steady.get("decode", {}).get("mean") is not None,
+            str(steady)[:200],
+        )
+        check(
+            "bench result keeps per-round detail",
+            len((state.get("result") or {}).get("rounds") or []) == 2,  # rounds includes the warm-up
+            str((state.get("result") or {}).get("rounds"))[:200],
+        )
+
+        history = client.get(
+            "/v1/management/bench/history", params={"upstream": "mock-ollama", "model": "qwen3:8b"}
+        ).json().get("records", [])
+        check(
+            "bench result is persisted and readable",
+            len(history) == 1 and history[0]["decode_tok_s"] is not None,
+            str(history)[:200],
+        )
+        check(
+            "persisted record keeps the timing source",
+            history and history[0]["timing_source"] in ("server", "client", "client*"),
+            str(history[:1])[:200],
+        )
+
+        # Retention: four more runs must leave exactly the newest three rows for this pair.
+        for _ in range(4):
+            _run_bench_job()
+        history = client.get(
+            "/v1/management/bench/history", params={"upstream": "mock-ollama", "model": "qwen3:8b"}
+        ).json().get("records", [])
+        check(
+            "bench history keeps only the latest 3 per (upstream, model)",
+            len(history) == 3,
+            f"got {len(history)}",
+        )
+        check(
+            "bench history is newest-first",
+            [h["created_at"] for h in history]
+            == sorted((h["created_at"] for h in history), reverse=True),
+            str([h["created_at"] for h in history]),
+        )
+
+        r = client.get("/v1/management/bench/history", params={"upstream": "mock-ollama", "model": "qwen3:8b"})
+        check("bench history echoes the requested key", r.json().get("model") == "qwen3:8b", r.text[:160])
+
     print("[10] tools/websearch projection")
 
     def patch_config(**blocks) -> None:
@@ -653,10 +974,16 @@ def run() -> int:
     with sqlite3.connect(legacy_db) as conn:
         conn.row_factory = sqlite3.Row
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
+        declared = {row["name"]: row["type"] for row in conn.execute("PRAGMA table_info(requests)")}
         old_rows = conn.execute("SELECT COUNT(*) AS c FROM requests").fetchone()["c"]
     check("old columns kept", old_rows == 1, str(old_rows))
-    for column in ("ts_end", "requested_model", "query"):
+    for column in ("ts_end", "requested_model", "query", "tokens_in", "tokens_out"):
         check(f"column added on upgrade: {column}", column in columns, str(sorted(columns)))
+    check(
+        "token columns are added as INTEGER",
+        (declared.get("tokens_in"), declared.get("tokens_out")) == ("INTEGER", "INTEGER"),
+        str((declared.get("tokens_in"), declared.get("tokens_out"))),
+    )
 
     # ------------------------------------------------ console static surface ---
     print("[12] web console static serving")
@@ -671,6 +998,14 @@ def run() -> int:
               r.status_code == 200 and "text/html" in r.headers.get("content-type", ""),
               f"got {r.status_code} {r.headers.get('content-type')}")
         check("shell mounts the SPA root", '<div id="app">' in r.text, r.text[:120])
+        check("shell declares the tab icon under the /admin/ base",
+              '/admin/favicon.svg' in r.text, r.text[:200])
+        r = client.get("/admin/favicon.svg")
+        check("tab icon is served as svg",
+              r.status_code == 200 and "image/svg+xml" in r.headers.get("content-type", ""),
+              f"got {r.status_code} {r.headers.get('content-type')}")
+        check("tab icon is real markup, not the SPA fallback",
+              r.text.lstrip().startswith("<svg"), r.text[:80])
         check("console keeps the scoped admin CSP",
               "frame-ancestors 'self'" in r.headers.get("content-security-policy", ""),
               r.headers.get("content-security-policy"))

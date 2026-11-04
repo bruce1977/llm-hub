@@ -1,6 +1,8 @@
 import axios from 'axios'
 import type { AxiosError, AxiosResponse } from 'axios'
 
+import { i18n } from '@/i18n'
+
 /** What the gateway puts in a failed response body (`HTTPException` uses `detail`). */
 export interface ErrorBody {
   detail?: unknown
@@ -59,6 +61,6 @@ export function errorDetail(error: unknown): string {
   if (data && typeof data === 'object' && data.detail) {
     return typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)
   }
-  if ((error as AxiosError | null)?.code === 'ECONNABORTED') return '请求超时，请稍后重试。'
-  return (error as Error | null)?.message || '请求失败。'
+  if ((error as AxiosError | null)?.code === 'ECONNABORTED') return i18n.global.t('common.timeoutError')
+  return (error as Error | null)?.message || i18n.global.t('common.requestFailed')
 }

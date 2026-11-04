@@ -7,7 +7,8 @@ Covers:
   - /v1/models and /api/ps aggregation with no upstreams (graceful empty result)
   - POST /v1/systemone: gateway API-key auth + correct forwarding to the backend,
     including the "local" model sentinel (no injection) vs a concrete model (injected)
-  - /docs switch (security.allow_docs): 404 when off, 200 + schema when on
+  - /docs gate (auth.allow_access_ip_whitelist): 404 for an address outside the whitelist,
+    200 + schema for a matching one
 
 Run:
     python tests/test_gateway_new.py
@@ -48,7 +49,6 @@ _CFG = {
     },
     "security": {
         "admin_endpoints": "deny",
-        "allow_docs": False,
         "allowed_http_methods": ["GET", "POST"],
         "path_allowlist": [],
         "rate_limit": {"enabled": False},
@@ -160,15 +160,15 @@ def run() -> int:
             app.state.manager._config.upstreams = original_upstreams
             main._UPSTREAM_MODELS_CACHE.pop("opencode-auth", None)
 
-        # --------------------------------------------- /docs hidden ---
-        print("[3] /docs switch (off by default)")
+        # --------------------------------------------- /docs gate ---
+        print("[3] /docs gated on auth.allow_access_ip_whitelist")
         r = client.get("/docs")
-        check("GET /docs -> 404 when allow_docs=false", r.status_code == 404, f"got {r.status_code}")
+        check("GET /docs -> 404 with an empty whitelist", r.status_code == 404, f"got {r.status_code}")
 
-        # enable docs at runtime and re-check
-        app.state.manager._config.security.allow_docs = True
+        # whitelisting the caller's address serves the docs
+        app.state.manager._config.auth.allow_access_ip_whitelist = [r"^testclient$"]
         r = client.get("/docs")
-        check("GET /docs -> 200 when allow_docs=true", r.status_code == 200, f"got {r.status_code}")
+        check("GET /docs -> 200 for a whitelisted address", r.status_code == 200, f"got {r.status_code}")
         r = client.get("/openapi.json")
         spec = r.json()
         paths = set(spec.get("paths", {}).keys())
@@ -238,7 +238,7 @@ def run() -> int:
             bool(models_key) and models_key[0].get("schema", {}).get("type") == "string",
             str(models_key),
         )
-        app.state.manager._config.security.allow_docs = False
+        app.state.manager._config.auth.allow_access_ip_whitelist = []
 
         # --------------------------------------------- /v1/systemone: auth ---
         print("[4] POST /v1/systemone authentication")
@@ -387,14 +387,14 @@ def run() -> int:
         check("websearch without a key -> 401", r.status_code == 401, f"got {r.status_code}")
 
         # the endpoint is documented with a real request schema (query required)
-        app.state.manager._config.security.allow_docs = True
+        app.state.manager._config.auth.allow_access_ip_whitelist = [r"^testclient$"]
         spec = client.get("/openapi.json").json()
         op = spec["paths"]["/v1/tools/web-search"]["post"]
         schema = op["requestBody"]["content"]["application/json"]["schema"]
         check("docs: websearch documents the request schema", schema.get("required") == ["query"], str(schema)[:160])
         check("docs: websearch request has top_k/recency fields", {"top_k", "recency"} <= set(schema["properties"]), str(sorted(schema["properties"])))
         check("docs: websearch response schema declares text/sources", set(op["responses"]["200"]["content"]["application/json"]["schema"]["required"]) >= {"text", "sources"})
-        app.state.manager._config.security.allow_docs = False
+        app.state.manager._config.auth.allow_access_ip_whitelist = []
 
         # cleanup: leave the fixture config as the other sections expect
         app.state.manager._config.upstreams = []

@@ -26,6 +26,8 @@ from typing import Any
 TMP_DIR = tempfile.mkdtemp(prefix="llm-hub-test-")
 CONFIG_FILE = os.path.join(TMP_DIR, "config.json")
 os.environ["CONFIG_PATH"] = CONFIG_FILE
+# API keys are an environment concern: config.yaml has no api_keys node any more.
+os.environ["GATEWAY_API_KEYS"] = "sk-test-1,sk-test-2"
 
 # The Python modules live directly in APP_DIR; the same layout is mounted at /app in Docker.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -268,7 +270,6 @@ def main() -> int:
         "server": {"host": "127.0.0.1", "port": 8000, "log_level": "warning"},
         "auth": {
             "enabled": True,
-            "api_keys": ["sk-test-1", "sk-test-2"],
             "allow_anonymous_health": True,
         },
         "routing": {"strict": False},
@@ -884,7 +885,8 @@ def main() -> int:
         # -------------------------------------------- LM Studio upstream type ---
         print("[14] LM Studio upstream integration")
         from config import Config as GatewayConfig
-        from config import build_default_config, merge_env_api_keys
+        from config import SecurityConfig
+        from config import build_default_config, collect_env_api_keys
 
         lm_cfg = GatewayConfig(
             upstreams=[
@@ -941,12 +943,22 @@ def main() -> int:
         try:
             os.environ["GATEWAY_API_KEYS"] = "envKey-cccc3333"
             os.environ["GATEWAY_API_KEYS_FILE"] = keyfile
-            merged = merge_env_api_keys(["existing-key-0000"])
-            check("inline env key is merged", "envKey-cccc3333" in merged, str(merged))
+            collected = collect_env_api_keys()
+            check("inline env key is collected", "envKey-cccc3333" in collected, str(collected))
             check(
-                "file-based keys are merged", "fileKey-aaaa1111" in merged and "fileKey-bbbb2222" in merged, str(merged)
+                "file-based keys are collected",
+                "fileKey-aaaa1111" in collected and "fileKey-bbbb2222" in collected,
+                str(collected),
             )
-            check("pre-existing config key is preserved", "existing-key-0000" in merged, str(merged))
+            check(
+                "auth.api_keys in config.yaml is ignored",
+                "yamlKey-dddd4444"
+                not in GatewayConfig(
+                    upstreams=[{"name": "u", "base_url": "http://127.0.0.1:1", "models": ["m"]}],
+                    auth={"enabled": True, "api_keys": ["yamlKey-dddd4444"]},
+                ).auth.api_keys,
+                "a config-file key must not reach the runtime key list",
+            )
         finally:
             if prev_inline is None:
                 os.environ.pop("GATEWAY_API_KEYS", None)
@@ -961,11 +973,95 @@ def main() -> int:
             except OSError:
                 pass
 
+        default_auth = build_default_config()["auth"]
         check(
-            "default config template ships no API keys",
-            build_default_config()["auth"]["api_keys"] == [],
-            str(build_default_config()["auth"]["api_keys"]),
+            "default config template ships no api_keys node",
+            "api_keys" not in default_auth,
+            str(sorted(default_auth)),
         )
+        check(
+            "default config template ships an empty IP whitelist",
+            default_auth["allow_access_ip_whitelist"] == [],
+            str(default_auth.get("allow_access_ip_whitelist")),
+        )
+        check(
+            "security.allow_docs was removed from the config model",
+            "allow_docs" not in SecurityConfig.model_fields,
+            str(sorted(SecurityConfig.model_fields)),
+        )
+
+        from config import AuthConfig, default_keys_file
+
+        implicit = default_keys_file()
+        check(
+            "implicit .keys file sits next to config.yaml",
+            implicit.name == ".keys"
+            and implicit.parent == __import__("pathlib").Path(os.environ["CONFIG_PATH"]).parent,
+            str(implicit),
+        )
+        check(
+            "the allow_access_ip_whilelist misspelling is normalised",
+            AuthConfig(**{"allow_access_ip_whilelist": [r"^10\.0\.0\.1$"]}).allow_access_ip_whitelist
+            == [r"^10\.0\.0\.1$"],
+            "pydantic would otherwise drop the unknown field and leave the whitelist empty",
+        )
+
+        # ------------------------- auth.allow_access_ip_whitelist: docs + key bypass ---
+        print("[16b] auth.allow_access_ip_whitelist")
+        manager = getattr(client.app.state, "manager", None)
+        auth_cfg = manager.config.auth
+        try:
+            auth_cfg.allow_access_ip_whitelist = []
+            check(
+                "/docs is 404 while the whitelist is empty",
+                client.get("/docs").status_code == 404,
+                f"got {client.get('/docs').status_code}",
+            )
+            check(
+                "an address outside the whitelist still needs a key",
+                client.get("/v1/models").status_code == 401,
+                f"got {client.get('/v1/models').status_code}",
+            )
+
+            auth_cfg.allow_access_ip_whitelist = [r"^testclient$"]
+            check(
+                "/docs is served to a whitelisted address",
+                client.get("/docs").status_code == 200,
+                f"got {client.get('/docs').status_code}",
+            )
+            check(
+                "/openapi.json is served to a whitelisted address",
+                client.get("/openapi.json").status_code == 200,
+                f"got {client.get('/openapi.json').status_code}",
+            )
+            check(
+                "a whitelisted address skips the API-key check",
+                client.get("/v1/models").status_code == 200,
+                f"got {client.get('/v1/models').status_code}",
+            )
+
+            # The bypass is matched against the TCP peer only: X-Forwarded-For is attacker
+            # supplied, so honouring it here would hand anyone a key-free gateway.
+            auth_cfg.allow_access_ip_whitelist = [r"^10\.1\.2\.3$"]
+            check(
+                "a spoofed X-Forwarded-For does not unlock the gateway",
+                client.get("/v1/models", headers={"X-Forwarded-For": "10.1.2.3"}).status_code == 401,
+                "the whitelist must not read X-Forwarded-For",
+            )
+            check(
+                "a spoofed X-Forwarded-For does not unlock /docs",
+                client.get("/docs", headers={"X-Forwarded-For": "10.1.2.3"}).status_code == 404,
+                "the docs gate must not read X-Forwarded-For",
+            )
+
+            auth_cfg.allow_access_ip_whitelist = ["^(["]
+            check(
+                "a malformed regex grants nothing",
+                client.get("/v1/models").status_code == 401 and client.get("/docs").status_code == 404,
+                "an invalid pattern must fail closed",
+            )
+        finally:
+            auth_cfg.allow_access_ip_whitelist = []
 
         # ------------------------- OpenCode gateway upstream type + web search config ---
         print("[17] OpenCode upstream type and web search config")
@@ -1127,7 +1223,7 @@ def run_e2e(client, headers) -> None:
 
     e2e_config = {
         "server": {"host": "127.0.0.1", "port": 8000, "log_level": "warning"},
-        "auth": {"enabled": True, "api_keys": ["sk-test-1"], "allow_anonymous_health": True},
+        "auth": {"enabled": True, "allow_anonymous_health": True},
         "upstreams": [
             {
                 "name": "real",

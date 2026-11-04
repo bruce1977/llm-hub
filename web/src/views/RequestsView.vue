@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { errorDetail, statusOf } from '@/api/client'
 import { api } from '@/api/management'
@@ -18,6 +19,8 @@ import { fmtClock, fmtInt, fmtMs, fmtPct, fromInputValue, hoursAgoInput, nowInpu
 const PAGE_SIZE = 15
 const STATUS_OPTIONS = ['2xx', '3xx', '4xx', '5xx']
 
+const { t } = useI18n()
+
 const filters = reactive({
   start: hoursAgoInput(24),
   end: nowInputValue(),
@@ -29,7 +32,21 @@ const filters = reactive({
 
 const result = ref<RequestsResponse | null>(null)
 const upstreamOptions = ref<string[]>([])
-const modelOptions = ref<string[]>([])
+// Installed models (and aliases) with the upstreams that can serve them; the 模型 filter
+// is derived from it, so choosing an upstream narrows the list to what that instance offers.
+interface ModelChoice {
+  name: string
+  upstreams: string[]
+}
+const modelChoices = ref<ModelChoice[]>([])
+const modelOptions = computed<string[]>(() => {
+  const names = new Set<string>()
+  for (const choice of modelChoices.value) {
+    if (filters.upstream && !choice.upstreams.includes(filters.upstream)) continue
+    names.add(choice.name)
+  }
+  return [...names].sort()
+})
 const lastUpdated = ref('')
 const loadError = ref('')
 const loading = ref(false)
@@ -90,14 +107,29 @@ async function loadOptions() {
   try {
     const [overview, llm] = await Promise.all([api.overview(), api.modelsLlm()])
     upstreamOptions.value = (overview.data.upstreams ?? []).map((u) => u.name)
-    const names = new Set<string>()
-    ;(llm.data.models ?? []).forEach((m) => names.add(m.model))
-    ;(llm.data.aliases ?? []).forEach((a) => names.add(a.alias))
-    modelOptions.value = [...names].sort()
+    const models = llm.data.models ?? []
+    const choices: ModelChoice[] = models.map((m) => ({ name: m.model, upstreams: [m.upstream] }))
+    // An alias without its own upstream resolves wherever its target lives, so it stays
+    // offered under exactly those upstreams.
+    for (const alias of llm.data.aliases ?? []) {
+      const home = alias.upstream
+        ? [alias.upstream]
+        : models.filter((m) => m.model === alias.target).map((m) => m.upstream)
+      choices.push({ name: alias.alias, upstreams: home })
+    }
+    modelChoices.value = choices
   } catch {
     // 选项拉取失败不影响明细表：筛选用输入框仍可用
   }
 }
+
+// Picking an upstream that cannot serve the current model would silently filter to nothing.
+watch(
+  () => filters.upstream,
+  () => {
+    if (filters.model && !modelOptions.value.includes(filters.model)) filters.model = ''
+  },
+)
 
 function apply() {
   load(1)
@@ -133,81 +165,91 @@ onMounted(() => {
 
 <template>
   <TopBar
-    title="Requests"
-    sub="请求明细与统计 · 数据源 SQLite"
+    :title="t('nav.requests')"
+    :sub="t('requests.sub')"
     refreshable
+    :loading="loading"
     :last-updated="lastUpdated"
     @refresh="load()"
   />
 
   <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
   <div v-if="logState && !logState.enabled" class="warn-strip">
-    ⚠ 请求日志已停用（<code>request_log.enabled=false</code>），新请求不再入库；以下仍是历史区间的数据。
+    ⚠
+    <i18n-t keypath="requests.logDisabled" scope="global">
+      <template #code><code>request_log.enabled=false</code></template>
+    </i18n-t>
   </div>
 
   <div class="filters">
     <div class="field">
-      <label for="f-start">起始时间</label>
+      <label for="f-start">{{ t('requests.filters.start') }}</label>
       <input id="f-start" v-model="filters.start" type="datetime-local" class="dt" />
     </div>
     <div class="field">
-      <label for="f-end">结束时间</label>
+      <label for="f-end">{{ t('requests.filters.end') }}</label>
       <input id="f-end" v-model="filters.end" type="datetime-local" class="dt" />
     </div>
     <div class="field">
-      <label for="f-upstream">上游</label>
+      <label for="f-upstream">{{ t('requests.filters.upstream') }}</label>
       <select id="f-upstream" v-model="filters.upstream" class="sel">
-        <option value="">全部</option>
+        <option value="">{{ t('requests.filters.all') }}</option>
         <option v-for="name in upstreamOptions" :key="name" :value="name">{{ name }}</option>
       </select>
     </div>
     <div class="field">
-      <label for="f-model">模型</label>
+      <label for="f-model">{{
+        filters.upstream
+          ? t('requests.filters.modelWithUpstream', { upstream: filters.upstream })
+          : t('requests.filters.model')
+      }}</label>
       <select id="f-model" v-model="filters.model" class="sel">
-        <option value="">全部</option>
+        <option value="">{{ t('requests.filters.all') }}</option>
         <option v-for="name in modelOptions" :key="name" :value="name">{{ name }}</option>
       </select>
     </div>
     <div class="field">
-      <label for="f-status">状态</label>
+      <label for="f-status">{{ t('requests.filters.status') }}</label>
       <select id="f-status" v-model="filters.status" class="sel">
-        <option value="">全部</option>
+        <option value="">{{ t('requests.filters.all') }}</option>
         <option v-for="s in STATUS_OPTIONS" :key="s" :value="s">{{ s }}</option>
       </select>
     </div>
     <div class="field">
-      <label for="f-path">路径 / 关键字</label>
+      <label for="f-path">{{ t('requests.filters.path') }}</label>
       <input id="f-path" v-model="filters.path" class="inp" placeholder="/v1/chat/completions" @keyup.enter="apply" />
     </div>
-    <button class="btn primary" :disabled="loading" @click="apply">应用筛选</button>
-    <button class="btn" @click="reset">重置</button>
+    <button class="btn primary" :disabled="loading" @click="apply">{{ t('requests.filters.apply') }}</button>
+    <button class="btn" @click="reset">{{ t('common.reset') }}</button>
   </div>
 
   <div class="minikpis">
-    <div class="minikpi"><div class="l">区间请求</div><div class="v">{{ fmtInt(stats?.count) }}</div></div>
+    <div class="minikpi"><div class="l">{{ t('requests.stats.count') }}</div><div class="v">{{ fmtInt(stats?.count) }}</div></div>
     <div class="minikpi"><div class="l">P50</div><div class="v">{{ fmtMs(stats?.p50_ms) }}</div></div>
     <div class="minikpi"><div class="l">P95</div><div class="v">{{ fmtMs(stats?.p95_ms) }}</div></div>
     <div class="minikpi"><div class="l">P99</div><div class="v">{{ fmtMs(stats?.p99_ms) }}</div></div>
     <div class="minikpi">
-      <div class="l">错误率</div>
+      <div class="l">{{ t('requests.stats.errorRate') }}</div>
       <div class="v" :class="{ bad: (stats?.error_rate ?? 0) > 0 }">{{ fmtPct(stats?.error_rate) }}</div>
     </div>
   </div>
 
   <div>
-    <div class="view-title">请求明细 <span class="tag">SQLite · 每页 {{ PAGE_SIZE }}</span></div>
+    <div class="view-title">
+      {{ t('requests.table.title') }} <span class="tag">{{ t('requests.table.tag', { n: PAGE_SIZE }) }}</span>
+    </div>
     <div class="card table-card">
       <table>
         <thead>
           <tr>
-            <th>时间</th>
-            <th>方法</th>
-            <th>路径 / 模型</th>
-            <th>上游</th>
-            <th>状态</th>
-            <th>耗时</th>
-            <th>流式</th>
-            <th>操作</th>
+            <th>{{ t('requests.table.time') }}</th>
+            <th>{{ t('requests.table.method') }}</th>
+            <th>{{ t('requests.table.pathModel') }}</th>
+            <th>{{ t('requests.table.upstream') }}</th>
+            <th>{{ t('requests.table.status') }}</th>
+            <th>{{ t('requests.table.duration') }}</th>
+            <th>{{ t('requests.table.stream') }}</th>
+            <th>{{ t('requests.table.actions') }}</th>
           </tr>
         </thead>
         <tbody>
@@ -221,14 +263,14 @@ onMounted(() => {
             <td>{{ row.upstream || '—' }}</td>
             <td><span class="badge" :class="statusBadge(row.status).cls">{{ statusBadge(row.status).text }}</span></td>
             <td class="mono">{{ fmtMs(row.duration_ms) }}</td>
-            <td>{{ row.stream ? '是' : '否' }}</td>
-            <td><span class="link" @click="openDetail(row)">详情</span></td>
+            <td>{{ row.stream ? t('common.yes') : t('common.no') }}</td>
+            <td><span class="link" @click="openDetail(row)">{{ t('common.detail') }}</span></td>
           </tr>
           <tr v-if="!rows.length && !loading">
-            <td colspan="8" class="empty">该区间内没有请求记录</td>
+            <td colspan="8" class="empty">{{ t('requests.table.empty') }}</td>
           </tr>
           <tr v-if="!rows.length && loading">
-            <td colspan="8" class="empty">加载中…</td>
+            <td colspan="8" class="empty">{{ t('common.loading') }}</td>
           </tr>
         </tbody>
       </table>
@@ -236,20 +278,20 @@ onMounted(() => {
   </div>
 
   <div class="pager">
-    <span>共 {{ fmtInt(pagination.total) }} 条 · 每页 {{ pagination.page_size }} 条</span>
+    <span>{{ t('common.total', { n: fmtInt(pagination.total) }) }} · {{ t('requests.pager.perPage', { n: pagination.page_size }) }}</span>
     <div class="pg-btns">
-      <button :disabled="pagination.page <= 1" @click="goto(pagination.page - 1)">上一页</button>
+      <button :disabled="pagination.page <= 1" @click="goto(pagination.page - 1)">{{ t('requests.pager.prev') }}</button>
       <template v-for="(n, index) in pageButtons" :key="`${n}-${index}`">
         <span v-if="n === '…'" class="muted">…</span>
         <button v-else :class="{ cur: n === pagination.page }" @click="goto(n)">{{ n }}</button>
       </template>
-      <button :disabled="pagination.page >= pagination.pages" @click="goto(pagination.page + 1)">下一页</button>
+      <button :disabled="pagination.page >= pagination.pages" @click="goto(pagination.page + 1)">{{ t('requests.pager.next') }}</button>
     </div>
   </div>
 
   <RequestDrawer v-model="drawerOpen" :record-id="detailId" />
 
-  <div class="foot">llm-hub 管理台 · Requests（只读视图）</div>
+  <div class="foot">{{ t('common.footReadOnly', { page: t('nav.requests') }) }}</div>
 </template>
 
 <style scoped>
