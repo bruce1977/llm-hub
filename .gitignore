@@ -5,6 +5,7 @@
 
 # Local config (machine-specific, not committed): keep example.* tracked instead
 data/config.json
+data/config.yaml
 config.json
 
 # Request log database (SQLite + WAL sidecar files)

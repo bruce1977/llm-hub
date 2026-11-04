@@ -5,15 +5,15 @@
 .DESCRIPTION
     Starts the FastAPI gateway exactly the way the modules expect (they are flat inside app/,
     so uvicorn must be pointed at app/ with --app-dir) and checks the usual reasons a local
-    start fails before launching: missing dependencies, missing or invalid config.json,
+    start fails before launching: missing dependencies, missing or invalid config.yaml,
     an authenticated gateway with no API key, weak/placeholder keys, a port already in use
     and an unbuilt web console.
 
     The working directory is app/, like the image's WORKDIR /app, so the relative paths in
-    .env (../data/config.json, ../data/.keys) resolve here the same way they do in the
+    .env (../data/config.yaml, ../data/.keys) resolve here the same way they do in the
     container.
 
-    Secrets are read from .env (never from config.json) and only their names are printed.
+    Secrets are read from .env (never from config.yaml) and only their names are printed.
 
 .PARAMETER Port
     Listen port. Default: server.port from the config file (8000 in the template).
@@ -22,9 +22,9 @@
     Bind address. Default: server.host from the config file.
 
 .PARAMETER Config
-    Path to config.json. Default: CONFIG_PATH from .env when it resolves (the value there is
-    written as ../data/config.json, relative to app/ as in the image), otherwise
-    <repo>\data\config.json - created from data\example.config.json when it does not exist yet.
+    Path to config.yaml. Default: CONFIG_PATH from .env when it resolves (the value there is
+    written as ../data/config.yaml, relative to app/ as in the image), otherwise
+    <repo>\data\config.yaml - created from data\config.example.yaml when it does not exist yet.
 
 .PARAMETER EnvFile
     Path to the env file with GATEWAY_API_KEYS / ADMIN_PASSWORD. Default: <repo>\.env.
@@ -81,7 +81,7 @@ function Fail([string]$Message) {
 
 # --------------------------------------------------------------------- layout ---
 # The image runs with WORKDIR /app, so every relative path the app receives (CONFIG_PATH and
-# GATEWAY_API_KEYS_FILE from .env, e.g. ../data/config.json) is read from inside app/.
+# GATEWAY_API_KEYS_FILE from .env, e.g. ../data/config.yaml) is read from inside app/.
 # The launcher keeps that convention: app/ is the working directory for both the probe and
 # uvicorn, which is also what the README's `cd app` commands assume.
 $Root = Split-Path -Parent $PSScriptRoot
@@ -158,7 +158,7 @@ if (Test-Path -LiteralPath $EnvFile) {
 }
 
 # --------------------------------------------------------------------- config ---
-$DefaultConfig = Join-Path $Root 'data\config.json'
+$DefaultConfig = Join-Path $Root 'data\config.yaml'
 $ConfigPath = $DefaultConfig
 if ($ConfigExplicit) {
     # a path the caller typed is read from where they are standing
@@ -173,14 +173,21 @@ if ($ConfigExplicit) {
     }
 }
 
-$Template = Join-Path $Root 'data\example.config.json'
+$Template = Join-Path $Root 'data\config.example.yaml'
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
-    if (Test-Path -LiteralPath $Template) {
+    # Mirror the app's own rule (config.ConfigManager._active_path): a pre-YAML config.json
+    # beside the expected path is a real configuration, so use it rather than papering over
+    # it with a fresh template.
+    $Legacy = Join-Path (Split-Path -Parent $ConfigPath) 'config.json'
+    if (Test-Path -LiteralPath $Legacy) {
+        Warn ("{0} not found - using the legacy {1}; rename it to {2}." -f $ConfigPath, $Legacy, [System.IO.Path]::GetFileName($ConfigPath))
+        $ConfigPath = $Legacy
+    } elseif (Test-Path -LiteralPath $Template) {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ConfigPath) | Out-Null
         Copy-Item -LiteralPath $Template -Destination $ConfigPath
-        Warn "created $ConfigPath from data\example.config.json - set the real upstream URLs before relying on it."
+        Warn "created $ConfigPath from data\config.example.yaml - set the real upstream URLs before relying on it."
     } else {
-        Fail "config file not found: $ConfigPath (and no data\example.config.json to copy)."
+        Fail "config file not found: $ConfigPath (and no data\config.example.yaml to copy)."
     }
 }
 Step "config: $ConfigPath"
@@ -211,7 +218,7 @@ if ($KeysFile -and -not (Test-Path -LiteralPath (Resolve-FromPath $KeysFile $App
 }
 
 # ----------------------------------------------------------------- preflight ---
-# The verdict is computed by the app's own modules so the rules cannot drift: config.json is
+# The verdict is computed by the app's own modules so the rules cannot drift: config.yaml is
 # parsed by the real Pydantic models and the keys are screened by auth.find_weak_keys.
 $Probe = @"
 import importlib.util
@@ -232,7 +239,7 @@ logging.disable(logging.CRITICAL)
 report = {}
 
 missing = []
-for module in ('fastapi', 'uvicorn', 'httpx', 'pydantic'):
+for module in ('fastapi', 'uvicorn', 'httpx', 'pydantic', 'yaml'):
     try:
         __import__(module)
     except ImportError:
@@ -249,7 +256,7 @@ try:
     from config import ConfigManager
 
     cfg = ConfigManager().config
-except Exception as exc:  # a broken config.json must be reported, not traced
+except Exception as exc:  # a broken config.yaml must be reported, not traced
     report['config_error'] = '%s: %s' % (type(exc).__name__, str(exc).splitlines()[0] if str(exc) else '')
     print(MARKER + json.dumps(report))
     sys.exit(0)
@@ -386,7 +393,7 @@ Step "uvicorn $($UvicornArgs -join ' ')"
 Note 'press Ctrl-C to stop'
 
 # The working directory is app/, exactly the image's WORKDIR /app, so the relative paths written
-# in .env (../data/config.json, ../data/.keys) and next to config.json resolve the same way here.
+# in .env (../data/config.yaml, ../data/.keys) and next to config.yaml resolve the same way here.
 Push-Location -LiteralPath $AppDir
 try {
     & $PyExe @PyPrefix -m uvicorn @UvicornArgs

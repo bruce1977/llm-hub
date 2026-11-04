@@ -40,7 +40,7 @@ echo Image:   %IMAGE_NAME%
 echo Version: %VERSION%
 echo.
 
-docker build -t %IMAGE_NAME%:latest -t %IMAGE_NAME%:%VERSION% .
+docker build --build-arg VERSION=%VERSION% -t %IMAGE_NAME%:latest -t %IMAGE_NAME%:%VERSION% .
 if errorlevel 1 (
     echo.
     echo ERROR: docker build failed.

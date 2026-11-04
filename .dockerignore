@@ -1,12 +1,32 @@
+# Build context hygiene: the Dockerfile only copies app/*.py, app/static and app/web,
+# so everything else is dead weight in the context (web/node_modules alone is ~230 MB).
+# Run `npm run build` in web/ first - app/web is what the image actually ships.
+
 __pycache__/
 *.py[cod]
 *.pyo
 .venv/
 venv/
+
+# Never ship local state or secrets: config.yaml / .env / the SQLite databases live
+# in data/ and are mounted at /data instead.
+data/
+
+# Not copied into the image
+tests/
+docs/
+web/
+scripts/
+
+# Tooling caches and editor noise
 .git/
 .gitignore
 .env
+.env.*
 .idea/
 .vscode/
+.pytest_cache/
+.ruff_cache/
+.workbuddy/
 *.log
-data/*.local.json
+*.md
