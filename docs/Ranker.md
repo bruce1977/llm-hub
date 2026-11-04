@@ -3,7 +3,7 @@
 面向 **Qwen3-Reranker-4B** 生成式 reranker，覆盖两侧配置：
 
 1. **Ollama 侧** —— Modelfile（决定模型本体参数、显存占用）
-2. **llm-hub 侧** —— `data/config.json` 的 `rerank` 段（决定网关怎么调用）
+2. **llm-hub 侧** —— `data/config.yaml` 的 `rerank` 段（决定网关怎么调用）
 
 > 实测环境：Ollama 0.33.3 / Windows / RTX 独显，模型 `qwen3-reranker:4b`（由 `dengcao/Qwen3-Reranker-4B:Q4_K_M` 派生）。
 > 调参日期：2026-09-10。
@@ -17,8 +17,8 @@
 | # | 位置 | 改动 | 原因 |
 |---|------|------|------|
 | 1 | Ollama Modelfile | `PARAMETER num_ctx 4096` | 基座默认 40960，直接用会吃 **9.3 GB** 显存 |
-| 2 | `config.json` | `rerank.options` **留空/删除** | 传了 `num_ctx` 会与模型值打架，每次冷启触发 **~4.4s** KV cache 重分配 |
-| 3 | `config.json` | `instruction` 用严格版 | 写成"Return a relevance score"会让模型输出数字而非 yes/no |
+| 2 | `config.yaml` | `rerank.options` **留空/删除** | 传了 `num_ctx` 会与模型值打架，每次冷启触发 **~4.4s** KV cache 重分配 |
+| 3 | `config.yaml` | `instruction` 用严格版 | 写成"Return a relevance score"会让模型输出数字而非 yes/no |
 
 ---
 
@@ -159,7 +159,7 @@ qwen3.context_length = 40960             ← GGUF 原始元数据，仅参考
 
 ---
 
-## 3. llm-hub 侧：`data/config.json`
+## 3. llm-hub 侧：`data/config.yaml`
 
 ### 3.1 完整参数表
 
@@ -424,7 +424,7 @@ G4  Ollama 兼容层               → /api/tags /api/show /api/generate /api/ch
 | `D:\ollama\models\modelfile\qwen3-reranker-4b-q4k-3g.modelfile` | 模型定义 |
 | `D:\ollama\models\modelfile\qwen3-reranker-4b_create.bat` | 创建脚本 |
 | `D:\ollama\models\modelfile\qwen3-reranker-4b_template.txt` | 导出的 GGUF 内嵌模板（4116 B），改模板时参考 |
-| `data\config.json` → `rerank` 段 | 网关配置 |
+| `data\config.yaml` → `rerank` 段 | 网关配置 |
 | `app\config.py` → `RerankConfig` | 配置 schema 与默认值（权威来源） |
 | `app\rerank.py` | 打分实现，**无需改动** |
 | `rerank_instance_test.mjs` | 实例测试脚本（Node.js） |

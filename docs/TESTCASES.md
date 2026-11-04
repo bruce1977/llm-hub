@@ -918,11 +918,11 @@ curl http://localhost:8000/api/chat \
 
 ```bash
 # 1. 准备配置
-cp data/example.config.json data/config.json
+cp data/config.example.yaml data/config.yaml
 cp .env.example .env
 
 # 2. 编辑配置
-# 编辑 data/config.json 添加真实的上游实例
+# 编辑 data/config.yaml 添加真实的上游实例
 # 编辑 .env 设置真实的 API 密钥
 
 # 3. 启动服务
@@ -1010,7 +1010,7 @@ with httpx.stream("POST", url, json=payload, headers=headers) as response:
 
 ## 联网检索
 
-> 端点由 `config.json` 的 `websearch` 段驱动，检索方是一个 `type: "opencode"` 的上游；
+> 端点由 `config.yaml` 的 `websearch` 段驱动，检索方是一个 `type: "opencode"` 的上游；
 > 请求体与上游响应均原样透传。以下响应为对 `vm.gateway:11430` 的实测结果。
 
 ### 测试 31: 关键词检索网页段落
@@ -1109,8 +1109,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 ## 管理 API（Web 管理台）
 
 > 端点统一挂在 `/v1/management` 下（实现在 `app/management.py`），由 `require_admin` 保护，
-> 接受**两种凭据之一**：登录换来的会话 Cookie，或 `auth.api_keys` 里的网关 API Key
-> （`Authorization: Bearer` / `X-API-Key`）。`ADMIN_PASSWORD` 只是登录凭据，当作请求头凭据提交
+> 接受**两种凭据之一**：登录换来的会话 Cookie，或 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`
+> 提供的网关 API Key（`Authorization: Bearer` / `X-API-Key`）。`ADMIN_PASSWORD` 只是登录凭据，当作请求头凭据提交
 > 仍返回 **401**。未设置 `ADMIN_PASSWORD` 时所有接口返回 **503**；凭据缺失或错误返回 **401**。
 > `/v1/management` 与 `/admin` 一样豁免 `security.path_allowlist`。管理台前端由网关在 `/admin`
 > 直接提供静态服务（构建产物在 `app/web`）。
@@ -1151,9 +1151,9 @@ curl -X POST http://localhost:8000/v1/management/auth/logout
 - 用户名比较会先 `strip()` 再转小写，所以 ` Admin ` 也能登录
 - 未带 Cookie 也未带网关 Key，或会话 token 被篡改、过期 -> `401`
 - 把 `ADMIN_PASSWORD` 放到 `Authorization: Bearer` / `X-API-Key` -> `401`（它只是登录凭据，
-  不在 `auth.api_keys` 里）；不在 `auth.api_keys` 中的随机 Key 同样 `401`
+  不在网关 Key 列表里）；不在 `GATEWAY_API_KEYS` / 密钥文件中的随机 Key 同样 `401`
 - 网关 API Key 只接受请求头，放在查询串（`?api_key=...`）-> `401`，避免密钥落进访问日志
-- `auth.enabled: false` 或未配置任何网关 Key 时，Key 这条路径直接关闭，管理接口只认 Cookie
+- `auth.enabled: false` 或环境变量与密钥文件都没有配置 Key 时，Key 这条路径直接关闭，管理接口只认 Cookie
   （绝不会因此变成匿名可访问）
 - 修改 `ADMIN_PASSWORD` 后旧会话立即失效（签名密钥即密码本身）
 - Cookie 为 HttpOnly + SameSite=Lax，仅在 HTTPS 下加 `Secure`
@@ -1178,6 +1178,7 @@ curl -b cookie.txt http://localhost:8000/v1/management/upstreams/ollama
     "vram_used_gib": 9.6,
     "vram_total_gib": 32.0,
     "requests_today": 128,
+    "tokens_today": 3142,
     "p95_ms": 740,
     "error_rate": 0.0234
   },
@@ -1218,8 +1219,13 @@ curl -b cookie.txt http://localhost:8000/v1/management/upstreams/ollama
 - `num_ctx` 取 `/api/ps` 的 `context_length`，缺失时回退 `num_ctx_overrides`
 - 只有 `type: "ollama"` 会探测 `/api/ps`（`ps_supported: true`），其他类型只做健康检查
 - `vram_total_gib` 来自 `upstreams[].vram_total_gb`；所有上游都没配时为 `null`
+- `tokens_today` 是今天（UTC）已记录请求的 token 合计，优先取 `tokens`，缺失时回退 `tokens_in + tokens_out`；
+  没有 usage 的行（如流式响应）不计入
 - `upstreams/{name}`：名字不存在 -> `404`；探测失败 -> `503` 且响应体带 `"unreachable": true`；
-  可达时额外返回 `models`（已安装模型）；模型列表拉取失败时带 `models_error`
+  可达时额外返回 `models`（该上游在 `config.yaml` 声明的模型，配了别名的以别名显示，前缀通配用
+  `main.fetch_upstream_models()` 展开成命中的具体模型）与 `running_models`（Ollama 为 `/api/ps`
+  的运行态，含设备、显存/占用与别名；`opencode` 类型探测有效时列出它声明的全部模型，设备与显存为
+  `null`）
 
 ### 测试 36: 配置投影与凭据脱敏
 
@@ -1230,8 +1236,14 @@ curl -b cookie.txt http://localhost:8000/v1/management/models/systemone
 ```
 
 **断言:**
-- `models/llm`：`models[]`（`model`、`upstream`、`type`、`alias`、`num_ctx`、`wildcard`、`running`）、
-  `aliases[]`、`num_ctx_overrides`；通配条目 `qwen3:*` 原样展示并标 `wildcard: true`
+- `models/llm`：行只来自 `config.yaml` 的 `upstreams[].models`——声明的普通名字原样成行（实例里装了
+  但没声明的模型不列，网关本来就路由不到它们），前缀通配（`qwen3:*`、`opencode/*`）复用
+  `main.fetch_upstream_models()`（60s 缓存）展开成命中的具体模型并标 `wildcard: true`；展开不到任何
+  模型时保留通配本身成一行且 `running: false`。`models[]` 每项含 `model`（真实 id）、`display`
+  （配置了别名则是别名，否则即声明名）、`alias`、`upstream`、`type`、`wildcard`、`running`、`device`、
+  `device_ratio`、`num_ctx`、`size_gib`、`vram_gib`；只有驻留行才有设备与内存，`opencode` 上游探测有效
+  即其声明的模型全部 `running: true`、`device: "cloud"`、内存为 `null`，离线上游只贡献声明名且 `running: false`。
+  另返回 `aliases[]`（别名 / 目标 / 上游）与 `num_ctx_overrides`
 - `models/rerank`：`enabled`、`endpoint`、`mode`、`upstream_api`（`auto` / `generate` / `chat`）、
   `on_error`（`score_zero` / `fail`）、`models[]`、`scoring`、`limits`，外加可直接复制的
   `request_example` / `response_example`
@@ -1260,7 +1272,8 @@ curl -b cookie.txt "http://localhost:8000/v1/management/requests/42"
   "rows": [
     {"id": 42, "ts": "2026-11-03T12:02:11", "ts_end": "2026-11-03T12:02:13", "method": "POST",
      "path": "/v1/chat/completions", "query": null, "requested_model": "q35", "model": "qwen3:8b",
-     "upstream": "ollama", "status": 200, "duration_ms": 2400, "ttfb_ms": 210, "stream": 1, "tokens": 12}
+     "upstream": "ollama", "status": 200, "duration_ms": 2400, "ttfb_ms": 210, "stream": 1,
+     "tokens_in": 5, "tokens_out": 7, "tokens": 12}
   ],
   "pagination": {"page": 1, "page_size": 15, "total": 2, "pages": 1},
   "request_log": {"enabled": true, "db": "/data/llmhub.db", "retention_days": 30, "dropped": 0}
@@ -1268,7 +1281,7 @@ curl -b cookie.txt "http://localhost:8000/v1/management/requests/42"
 ```
 
 **断言:**
-- 每笔经网关的请求都会落库：方法、路径、模型、上游、状态码、耗时、TTFT、是否流式、token 数、
+- 每笔经网关的请求都会落库：方法、路径、模型、上游、状态码、耗时、TTFT、是否流式、输入/输出/总 token 数、
   请求/响应大小、客户端 IP、错误信息；流式请求在流结束后落库
 - `status` 只接受档位 `2xx` / `3xx` / `4xx` / `5xx`（传具体数字 -> `400`）
 - `page < 1`、`page_size` 不在 `1..200`、`status` 非法 -> `400`；时间戳非法或 `start > end` -> `400`
@@ -1336,7 +1349,11 @@ curl -b cookie.txt "http://localhost:8000/v1/management/stats/failures?start=202
 |------|------|
 | 时间 | `ts` 到达、`ts_end` 完成（流式在流关闭时写入）、`duration_ms`、`ttfb_ms`；`ts`/`ts_end` 精确到秒，亚秒耗时以 `duration_ms` 为准 |
 | 请求 | `method`、`path`、`query`、`requested_model`（客户端写的名字）、`model`（别名解析后）、`request_body`、`req_size`、`stream`、`client_ip` |
-| 结果 | `status`、`upstream`、`response_body`、`res_size`、`tokens`、`error` |
+| 结果 | `status`、`upstream`、`response_body`、`res_size`、`tokens_in`、`tokens_out`、`tokens`、`error` |
+
+token 用量按方向拆成两列入库：`tokens_in` 是输入（提示）、`tokens_out` 是输出（生成），
+`tokens` 仍是总量。来源有两处——OpenAI 兼容响应的 `usage.prompt_tokens` / `completion_tokens`
+（总量优先取上游回报的 `total_tokens`），以及 Ollama 原生响应的 `prompt_eval_count` / `eval_count`。
 
 ```bash
 # 别名调用的详情：requested_model 保留别名，model 是解析后的真实模型
@@ -1346,21 +1363,29 @@ curl -b cookie.txt "http://localhost:8000/v1/management/requests/<id>"
 # GET 带查询串时，path 与 query 分开存
 curl -b cookie.txt "http://localhost:8000/api/version?format=json" -H "Authorization: Bearer <API_KEY>"
 curl -b cookie.txt "http://localhost:8000/v1/management/requests/<id>"   # "query": "format=json"
+
+# token 拆分：Ollama 原生（prompt_eval_count / eval_count）与 OpenAI 兼容（usage.*）两个来源
+curl -X POST http://localhost:8000/api/chat -H "Authorization: Bearer <API_KEY>" \
+  -d '{"model":"qwen3:8b","stream":false,"messages":[{"role":"user","content":"ping"}]}'
+curl -b cookie.txt "http://localhost:8000/v1/management/requests/<id>"
+# 数值取自上游回报：`tests/test_management.py` 的 mock 回 5+7=12，OpenAI 兼容分支回 4+8=12
 ```
 
 > 无 `model` 的 GET 无法路由，网关回 `404` 且 `error` 写明原因，但这一行**仍会入库**
 > （本地 Ollama 实测：`status=404`、`requested_model=null`、`query="format=json&verbose=1"`）。
 
-**入库开关（`config.json` -> `request_log.enabled`，默认 `true`，逐请求读取）:**
+**入库开关（`config.yaml` -> `request_log.enabled`，默认 `true`，逐请求读取）:**
 
 ```bash
-# 关闭：把 "request_log": {"enabled": false} 写进 config.json 并保存
+# 关闭：把 "request_log": {"enabled": false} 写进 config.yaml 并保存
 # 配置的 mtime 每秒最多比对一次，等约 1 秒再验证下一条请求
 curl -b cookie.txt http://localhost:8000/v1/management/overview
 # {"request_log": {"enabled": false, "db": "/data/llmhub.db", "retention_days": 30, "dropped": 0}, ...}
 ```
 
 **断言:**
+- `tokens_in` / `tokens_out` 与 `tokens` 三列同时入库，OpenAI 兼容与 Ollama 原生两个来源都能拆开
+- 上游没有回报用量时三列都是 `NULL`（与真实的 `0` 可区分）；`/requests` 的 `rows` 也带这三列
 - 关闭后请求照常转发（仍返回 `200`），但明细总数不再增加，请求体也不再采集
 - `/overview` 与 `/requests` 的 `request_log.enabled` 同步回报 `false`，前端可提示「日志已停用」
 - 改回 `true` 后，越过约 1 秒的热加载窗口，下一条请求即入库（无需重启容器）

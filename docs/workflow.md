@@ -108,7 +108,7 @@
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-  git clone           配置 config.json    pip install -r      uvicorn main:app
+  git clone           配置 config.yaml    pip install -r      uvicorn main:app
                       配置 .env           requirements.txt    --reload
 ```
 
@@ -122,9 +122,9 @@
 
 2. **配置环境**
    ```bash
-   cp data/example.config.json data/config.json
+   cp data/config.example.yaml data/config.yaml
    cp .env.example .env
-   # 编辑 config.json 添加上游实例
+   # 编辑 config.yaml 添加上游实例
    # 编辑 .env 添加 API 密钥
    ```
 
@@ -188,7 +188,7 @@ python -m ruff format app/ tests/
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-  docker pull         配置 config.json    docker run          curl /health
+  docker pull         配置 config.yaml    docker run          curl /health
   bruce1977/llm-hub   配置 .env           docker run           curl /v1/models
                        latest              -d --name llm-hub
 ```
@@ -201,9 +201,9 @@ docker pull bruce1977/llm-hub:latest
 
 # 准备配置
 mkdir -p data
-cp data/example.config.json data/config.json
+cp data/config.example.yaml data/config.yaml
 cp .env.example .env
-# 编辑 data/config.json 和 .env
+# 编辑 data/config.yaml 和 .env
 
 # 启动
 docker run -d --name llm-hub \
@@ -254,7 +254,7 @@ curl http://localhost:8888/v1/models
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-  编辑 config.json    文件 mtime 更新    ConfigManager        新配置生效
+  编辑 config.yaml    文件 mtime 更新    ConfigManager        新配置生效
   (如添加上游)        (每秒检测一次)     检测到变化           (~1秒内)
 ```
 
@@ -271,7 +271,7 @@ curl http://localhost:8888/v1/models
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
   检查 auth.enabled   检查密钥长度        检查客户端 IP       检查管理端点
-  检查 api_keys       检查弱密钥          CIDR 匹配          deny/readonly
+  检查环境密钥        检查弱密钥          CIDR 匹配          deny/readonly
 ```
 
 ## 故障排查流程
@@ -286,7 +286,7 @@ curl http://localhost:8888/v1/models
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-  docker logs         验证 config.json   curl 上游 URL       检查 Ollama
+  docker logs         验证 config.yaml   curl 上游 URL       检查 Ollama
   查看应用日志        验证 .env          检查防火墙          检查 LM Studio
 ```
 

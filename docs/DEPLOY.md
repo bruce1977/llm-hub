@@ -9,7 +9,7 @@
 ### 步骤 1: 准备配置
 
 ```bash
-cp data/example.config.json data/config.json
+cp data/config.example.yaml data/config.yaml
 cp .env.example .env
 ```
 
@@ -20,7 +20,11 @@ GATEWAY_API_KEYS=sk-gateway-$(openssl rand -hex 16)
 TZ=Asia/Shanghai
 ```
 
-编辑 `data/config.json` 添加上游实例，参考 `data/example.config.json`。
+编辑 `data/config.yaml` 添加上游实例，参考 `data/config.example.yaml`。
+
+> 配置文件是 YAML（镜像里 `CONFIG_PATH=/data/config.yaml`），可以写注释。升级时如果 `/data` 下只有旧版
+> `config.json`，网关会带着警告继续用它，不会用模板覆盖；把文件改名为 `config.yaml` 即可（JSON 本身是合法
+> YAML）。读取配置需要 `PyYAML`，已列在 `requirements.txt`。
 
 ### 步骤 2: 启动服务
 
@@ -98,10 +102,10 @@ scripts\start-local.bat -CheckOnly
 scripts\start-local.bat -Install -Port 8888
 ```
 
-它做三件事：定位 python 与 `data\config.json`、按 `.env` 注入环境变量（shell 里已设置的变量优先），然后
+它做三件事：定位 python 与 `data\config.yaml`、按 `.env` 注入环境变量（shell 里已设置的变量优先），然后
 调用应用**自己的**模块跑一遍检查——缺依赖、Pydantic 拒绝配置、开了鉴权却没有 API Key、弱/占位 Key、端口被占用、
 `app\web` 未构建——全部通过才用 `--app-dir app` 在 `app/` 目录下启动 uvicorn，与镜像的 `WORKDIR /app` 一致，
-所以 `.env` 里的 `../data/config.json`、`../data/.keys` 在本地和容器里解析到同一份文件。其余参数见 README 的「启动脚本」一节。
+所以 `.env` 里的 `../data/config.yaml`、`../data/.keys` 在本地和容器里解析到同一份文件。其余参数见 README 的「启动脚本」一节。
 
 ### 管理台前端与镜像
 
@@ -137,8 +141,9 @@ scripts\docker-build.bat
 
 | 变量 | 必需 | 说明 |
 |------|------|------|
-| `GATEWAY_API_KEYS` | ✅ | API 密钥，逗号分隔 |
-| `CONFIG_PATH` | ❌ | 配置文件路径，默认 `/data/config.json` |
+| `GATEWAY_API_KEYS` | ✅* | API 密钥，逗号分隔（*与下一行的密钥文件二选一；`auth.allow_access_ip_whitelist` 非空时可为空） |
+| `GATEWAY_API_KEYS_FILE` | ❌ | 密钥文件路径。不设置时自动读取 `CONFIG_PATH` 同目录的 `.keys`（如挂载的 `/config/.keys`、默认布局的 `/data/.keys`）；显式设置则以其为准 |
+| `CONFIG_PATH` | ❌ | 配置文件路径，默认 `/data/config.yaml` |
 | `TZ` | ❌ | 时区，默认 `UTC` |
 | `SYSTEMONE_SERVER_API_KEY` | ❌ | System One 后端密钥，仅当 `systemone.api_key_env` 指向它时才需要；laya-server 必需，Ollama 0.40+ 后端会忽略该头 |
 | `OPENCODE_GATEWAY_API_KEY` | ❌ | 联网检索上游密钥，仅当 `websearch.api_key_env` 指向它时才需要（默认留空 = 不签名） |
@@ -148,7 +153,7 @@ scripts\docker-build.bat
 
 > 管理台会把请求明细写入 SQLite（WAL 模式），需要 `/data` 目录可写。若使用只读挂载，
 > 请把 `REQUEST_LOG_DB` 指到可写路径，或设为空目录下的默认位置。
-> 是否入库由 `config.json` 的 `request_log.enabled` 控制（默认 `true`）：该开关逐请求读取，
+> 是否入库由 `config.yaml` 的 `request_log.enabled` 控制（默认 `true`）：该开关逐请求读取，
 > 改成 `false` 保存后无需重启容器；配置的 mtime 每秒最多比对一次，因此约 1 秒内停止写入。
 
 ---
@@ -166,22 +171,22 @@ docker run -d --name llm-hub \
   --add-host=host.docker.internal:host-gateway \
   ...
 
-# 或直接使用宿主机 IP（config.json 中）
+# 或直接使用宿主机 IP（config.yaml 中）
 "base_url": "http://172.17.0.1:11434"
 ```
 
 ### 健康检查返回 401
 
-确保 `config.json` 中 `auth.allow_anonymous_health` 为 `true`。
+确保 `config.yaml` 中 `auth.allow_anonymous_health` 为 `true`。
 
 ### 配置修改后不生效
 
 ```bash
 # 检查文件修改时间
-stat data/config.json
+stat data/config.yaml
 
 # 某些编辑器不会更新 mtime，手动触发
-touch data/config.json
+touch data/config.yaml
 
 # 或重启容器
 docker restart llm-hub

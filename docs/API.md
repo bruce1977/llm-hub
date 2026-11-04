@@ -51,10 +51,18 @@
 
 **例外：** `/`、`/health` 端点默认无需认证（由 `auth.allow_anonymous_health` 控制）。
 
-**Swagger UI：** 打开 `/docs`，**每个端点的 Parameters 区都有一个 `X-API-Key` 输入框**——点
-**Try it out** 后填入 Key，点 **Execute** 时随本次请求发送（只影响该端点的这一次请求）。
-也可以用右上角 **Authorize** 一次性填入 `Authorization: Bearer` 或 `X-API-Key`，此后所有请求自动携带
-（`persistAuthorization` 刷新页面后依然保留）。
+**客户端 IP 白名单：** `auth.allow_access_ip_whitelist`（正则字符串数组，`re.fullmatch` 逐条匹配）
+命中的来源可以访问 `/docs` 与 `/openapi.json`，并且调用任何业务 API 时免查 API Key；未命中时
+`/docs`、`/openapi.json` 一律 **404**（不是 401/403，对外看起来就像没有这两个路径）。匹配对象是
+ASGI 的客户端地址（`request.client.host`），网关代码从不读取 `X-Forwarded-For`；但 uvicorn 的
+`ProxyHeadersMiddleware` 在 TCP 对端属于可信代理时（`--forwarded-allow-ips`，默认 `127.0.0.1`）
+会用转发头改写 `request.client`，所以前置代理必须自行清理 `X-Forwarded-For`。
+
+**Swagger UI：** 打开 `/docs`（需先满足上面的 IP 白名单），**每个端点的 Parameters 区都有一个
+`X-API-Key` 输入框**——点 **Try it out** 后填入 Key，点 **Execute** 时随本次请求发送（只影响该端点的
+这一次请求）。也可以用右上角 **Authorize** 一次性填入 `Authorization: Bearer` 或 `X-API-Key`，此后
+所有请求自动携带（`persistAuthorization` 刷新页面后依然保留）。白名单命中的来源即使不填 Key 也能
+直接 Execute。
 
 ---
 
@@ -317,26 +325,23 @@ curl http://localhost:8888/api/ps \
 | 认证 | ✅ 需要（网关自身的 API Key，来自 `.env` / `GATEWAY_API_KEYS`） |
 | 说明 | 将请求原样转发到配置的 System One 后端（`1panel/laya-server`，或 **Ollama 0.40+**——它原生提供 `POST /v1/systemone`）。网关用 `systemone.api_key_env`（默认 `SYSTEMONE_SERVER_API_KEY`）环境变量中的密钥对后端签名，请求体与响应体均原样透传。 |
 
-**配置（`config.json` 的 `systemone` 段）：**
+**配置（`config.yaml` 的 `systemone` 段）：**
 
-```json
-{
-  "systemone": {
-    "enabled": true,
-    "backend": "http://llm.home:11435",
-    "model": "tev1",
-    "api_key_env": "SYSTEMONE_SERVER_API_KEY",
-    "path": "v1/systemone",
-    "timeout": 60.0
-  }
-}
+```yaml
+systemone:
+  enabled: true
+  backend: http://llm.home:11435
+  model: tev1
+  api_key_env: SYSTEMONE_SERVER_API_KEY
+  path: v1/systemone
+  timeout: 60.0
 ```
 
 - `backend` 指向任一 System One 后端即可，网关侧行为完全一致——纯转发，不做模型解析、不改写响应。容器内指向宿主机 Ollama 时用 `http://host.docker.internal:11435`。
 - `model` **会原样出现在转发给后端的请求体里**：仅当它是具体值且调用方自身没带 `model` 时才注入；`"local"` 是**哨兵值**，表示不注入、由调用方自行指定。
 - laya-server 的 `model` 为字面量枚举，**仅接受 `auto` / `english` / `multilingual` / `typed-decisions`**，其它值返回 **HTTP 422** `literal_error`。
 - Ollama 的 `model` 必须是**真实模型名**：`auto` → **404** `model 'auto' not found`；缺失 → **400** `model is required`。因此后端换成 Ollama 时，把 `model` 配成实际模型（如示例中的 `tev1`）。
-- 后端密钥从环境变量读取，绝不写入 `config.json`。该 `Authorization` 头对不需要鉴权的 Ollama 后端无副作用，Ollama 会直接忽略。
+- 后端密钥从环境变量读取，绝不写入 `config.yaml`。该 `Authorization` 头对不需要鉴权的 Ollama 后端无副作用，Ollama 会直接忽略。
 
 **请求体结构（两家后端 `state` / `questions` 均必填；差异：laya-server **拒绝未知顶层字段**，实测 Ollama 会忽略）：**
 
@@ -412,36 +417,32 @@ curl -X POST http://localhost:8888/v1/systemone \
 | 路径 | `/v1/tools/web-search` |
 | 方法 | `POST` |
 | 认证 | ✅ 需要（网关自身的 API Key，来自 `.env` / `GATEWAY_API_KEYS`） |
-| 说明 | 关键词检索网页正文段落。请求体转发到 `websearch.upstream` 指定的上游（`websearch.path`，默认 `v1/web-search`），上游响应原样返回，网关不改写。 |
+| 说明 | 关键词检索网页正文段落。请求体转发到 `websearch.upstream` 指定的上游（`websearch.path`，默认 `v1/web-search`），上游响应原样返回，网关不改写。检索能力的实现方是 [opencode-port](https://github.com/bruce1977/opencode-port)（OpenCode API Gateway）。 |
 
-**配置（`config.json` 的 `websearch` 段 + 对应上游）：**
+**配置（`config.yaml` 的 `websearch` 段 + 对应上游）：**
 
-```json
-{
-  "upstreams": [
-    {
-      "name": "opencode",
-      "type": "opencode",
-      "base_url": "http://vm.gateway:11430",
-      "models": ["auto", "opencode/*"],
-      "timeout": 300,
-      "priority": 30
-    }
-  ],
-  "websearch": {
-    "enabled": true,
-    "upstream": "opencode",
-    "path": "v1/web-search",
-    "api_key_env": "",
-    "timeout": 300.0
-  }
-}
+```yaml
+upstreams:
+- name: opencode
+  type: opencode
+  base_url: http://vm.gateway:11430
+  models:
+  - auto
+  - opencode/*
+  timeout: 300
+  priority: 30
+websearch:
+  enabled: true
+  upstream: opencode
+  path: v1/web-search
+  api_key_env: ''
+  timeout: 300.0
 ```
 
 - 检索方是一个普通的 `upstreams` 条目（`type: "opencode"`）：它的地址、超时、附加 `headers` 只配一次，同时被模型聚合（`/v1/models`、`/api/tags`）、聊天路由和 `/probe` 复用。`opencode` 类型走 OpenAI 兼容的发现接口（`GET /v1/models`，解析 `data[].id`），健康探测走 `GET /health`。
 - `websearch.upstream` 留空时自动选取**第一个 `type: "opencode"` 的上游**；填了名字却找不到对应上游则返回 **503**（不会静默回退到别的上游）。
-- `api_key_env` 默认空字符串 = 不签名（当前 OpenCode 网关匿名可访问）。若上游启用了密钥，把它设成变量名（如 `OPENCODE_GATEWAY_API_KEY`），网关会以 `Authorization: Bearer <值>` 调用上游；密钥只从环境变量读取，绝不写入 `config.json`。
-- `model` 字段**纯透传**：调用方传什么就转什么，不传则由上游自行选择；网关不会用自己的 `aliases` 去解析它。
+- `api_key_env` 默认空字符串 = 不签名（当前 OpenCode 网关匿名可访问）。若上游启用了密钥，把它设成变量名（如 `OPENCODE_GATEWAY_API_KEY`），网关会以 `Authorization: Bearer <值>` 调用上游；密钥只从环境变量读取，绝不写入 `config.yaml`。
+- `model` 字段**纯透传**：取 opencode-port 支持的模型名（**不是 llm-hub 在 `config.yaml` 里配置的模型**），调用方传什么就转什么，不传则由上游自行选择；网关不会用自己的 `aliases` 去解析它。上游（opencode-port）的模型清单可在控制台的 Tools · Web Search →「模型清单」查看；省略 `model` 时由 opencode-port 依次取 `web_search.model` → 首个本地模型（`ollama-local/*`）→ `models.auto.fallback` 作为默认模型，该模型只在 `synthesize=true` 时参与答案综合。
 - `synthesize: true` 会额外驱动一次模型综合作答，耗时由上游的推理速度决定，可能远超纯检索（实测 5~15s）。上游自身对单次推理有 **300 秒** 的硬上限：绕过本网关直接压测 `vm.gateway:11430`，`synthesize` 在 311s 返回 `502 {"error":{"message":"inference timed out (>300s)","code":"opencode_unavailable"}}`。因此 `websearch.timeout` 至少保持 300（默认即 `300.0`），让上游自己的错误原样透传（**502**）而不是先被网关判成 **504**；再往上调也不会更快拿到答案。需要 `answer` 时建议把 `model` 指向更快的上游。
 
 **请求体字段：**
@@ -449,7 +450,7 @@ curl -X POST http://localhost:8888/v1/systemone \
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `query` | string | ✅ | 检索关键词（非空） |
-| `model` | string | ❌ | 上游侧模型 id，原样透传 |
+| `model` | string | ❌ | opencode-port 支持的模型名（不是 llm-hub 配置的模型），原样透传；省略时使用 opencode-port 的默认模型 |
 | `top_k` | int | ❌ | 抓取页数，1~50 |
 | `max_chars_per_page` | int | ❌ | 单页正文字符上限，超出则 `truncated: true` |
 | `locale` | string | ❌ | 检索语言提示，如 `zh-CN` |
@@ -879,8 +880,9 @@ Web 管理台使用的只读接口，统一挂在 `/v1/management` 前缀下（�
 
 - **管理台会话 Cookie**：`POST /v1/management/auth/login` 用 `ADMIN_PASSWORD` 换取
   12 小时 HMAC 签名 HttpOnly Cookie（浏览器走这条路）；
-- **网关 API Key**：`auth.api_keys` 中的任一 Key，经 `Authorization: Bearer` 或
-  `X-API-Key` 提交，便于脚本与 curl 复用已有凭据。
+- **网关 API Key**：`GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`（如 `data/.keys`）提供
+  的任一 Key，经 `Authorization: Bearer` 或 `X-API-Key` 提交，便于脚本与 curl 复用已有凭据。
+  未设置 `GATEWAY_API_KEYS_FILE` 时会自动读取 `CONFIG_PATH` 同目录的 `.keys`（如 `/config/.keys`）。
 
 **认证方式：**
 
@@ -898,7 +900,7 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 
 `ADMIN_PASSWORD` 本身只是登录页凭据，不是请求凭据：把它当作 `Bearer` / `X-API-Key`
 提交一律 **401**；查询串里的 key 也不接受（避免落进访问日志与浏览器历史）。
-网关鉴权关闭（`auth.enabled: false` 或没有配置 key）时没有可接受的 API Key，
+网关鉴权关闭（`auth.enabled: false` 或环境变量与密钥文件都没有 key）时没有可接受的 API Key，
 管理接口退回 Cookie-only，绝不会变成匿名可访问。
 
 | 方法 | 路径 | 说明 |
@@ -906,10 +908,10 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 | `POST` | `/v1/management/auth/login` | Body `{"password": "..."}`；成功 `200` 并下发 Cookie，密码错误 `401` |
 | `POST` | `/v1/management/auth/logout` | 清除会话 Cookie |
 | `GET` | `/v1/management/auth/ping` | 受保护心跳，返回 `{"ok": true, "admin": true}` |
-| `GET` | `/v1/management/overview` | KPI、上游摘要、运行中模型（含 GPU/部分/CPU 判定）、`request_log` 开关与库信息 |
+| `GET` | `/v1/management/overview` | KPI（含今日请求数与今日 token 合计 `tokens_today`）、上游摘要、可用模型清单（Ollama 取 `/api/ps` 的驻留模型；OpenCode 这类托管上游没有 `/api/ps`，探测成功时把它声明的模型一并计入，设备为 `"cloud"`、显存为 `null`），每行含 `model` / `display`（配置了别名时用别名）/ `alias`；另有 `request_log` 开关与库信息 |
 | `GET` | `/v1/management/upstreams` | 上游实例列表（状态 / 已加载数 / 显存 / 探测延迟） |
-| `GET` | `/v1/management/upstreams/{name}` | 单实例详情：`/api/ps` 运行中模型 + `/api/tags` 已装模型；不可达返回 `503` 且带 `"unreachable": true` |
-| `GET` | `/v1/management/models/llm` | 模型 / 别名 / `num_ctx_overrides` 只读投影 |
+| `GET` | `/v1/management/upstreams/{name}` | 单实例详情：`models` 取自 `config.yaml` 的 `upstreams[].models`（有别名时以别名显示），前缀通配（如 `opencode/*`）用与路由同一个发现结果展开成具体模型；`running_models` 是 `/api/ps` 的运行中模型（含设备与显存/占用），托管上游则列出它声明的模型（设备为 `"cloud"`、显存为 `null`）；不可达返回 `503` 且带 `"unreachable": true` |
+| `GET` | `/v1/management/models/llm` | 逐上游的模型清单，来源是 `config.yaml` 的 `upstreams[].models`（实例上装了但没声明的模型不列出，因为它们本来就走不通网关）；前缀通配按发现结果展开。每行 `model`（真实 id）/ `display`（别名，无别名时即声明名）/ `alias` / `wildcard`（由通配展开而来）/ `running` / `device` / `device_ratio` / `num_ctx` / `size_gib` / `vram_gib`；OpenCode 上游探测有效即全部 `running: true`，设备为 `"cloud"` 且显存为 `null`。另有 `aliases`（别名 / 目标 / 上游）与 `num_ctx_overrides` |
 | `GET` | `/v1/management/models/rerank` | Rerank 配置投影（`api_key` 一律掩码为 `••••••`），含 `upstream_api` / `on_error` 与请求/响应示例 |
 | `GET` | `/v1/management/models/systemone` | System One 配置投影（同样掩码），含请求/SSE 示例 |
 | `GET` | `/v1/management/tools/websearch` | Web Search 配置投影：`enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url`（由 provider upstream 派生）/ `api_key_env` / `api_key`（掩码）/ `timeout` / `provider_configured` |
@@ -918,6 +920,9 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 | `GET` | `/v1/management/stats/timeseries` | 时序聚合：`bucket=hour\|day`，每桶 `count` / `errors` / `p95` |
 | `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count}]}`；`status` 只分 `ok`(<400) / `error`(≥400)，未命中上游的行计入 `-` |
 | `GET` | `/v1/management/stats/failures` | 失败统计：`by_code` / `by_upstream` / `samples` |
+| `POST` | `/v1/management/bench` | 启动一次模型测速任务，Body `{"upstream": "...", "model": "...", "rounds"?: 4, "max_tokens"?: 500, "think"?: "auto"}`，立即返回 `{"job_id": "...", "status": "pending"}`；任务在后台跑 |
+| `GET` | `/v1/management/bench/history` | 该 `upstream` + `model` 最近的 **3** 份测速记录（`?upstream=&model=`），按时间倒序，每行含 `decode_tok_s` / `decode_sd` / `prefill_tok_s` / `ttft_ms` / `timing_source` 与完整 `payload`。**注册顺序在 `/bench/{job_id}` 之前**，否则 "history" 会被当成 job_id |
+| `GET` | `/v1/management/bench/{job_id}` | 轮询任务状态：`status` 为 `pending` / `running` / `done` / `failed`，`progress` 为 `{completed, total, warmup}`，完成时 `result` 含各轮明细与 `steady` 汇总，失败时 `error` 给出原因 |
 
 **状态码：**
 
@@ -959,23 +964,55 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 |------|------|
 | 时间 | `ts`（到达）、`ts_end`（完成，流式在流关闭时写入）、`duration_ms`、`ttfb_ms`；`ts`/`ts_end` 精确到秒，亚秒耗时看 `duration_ms` |
 | 请求 | `method`、`path`、`query`、`requested_model`（客户端写的名字）、`model`（别名解析后）、`request_body`、`req_size`、`stream`、`client_ip` |
-| 结果 | `status`、`upstream`、`response_body`、`res_size`、`tokens`、`error` |
+| 结果 | `status`、`upstream`、`response_body`、`res_size`、`tokens_in`、`tokens_out`、`tokens`、`error` |
 | 标记 | `request_body_truncated`、`response_body_truncated` |
 
-- **入库开关**：`config.json` 的 `request_log.enabled`（默认 `true`）逐请求读取，无需重启。
+- **token 用量分方向入库**：`tokens_in` / `tokens_out` 分别是输入（提示）与输出（生成）的 token 数，
+  取自 OpenAI 兼容响应的 `usage.prompt_tokens` / `usage.completion_tokens`，或 Ollama 响应里的
+  `prompt_eval_count` / `eval_count`；`tokens` 继续保存总量，优先采用上游自己回报的 `total_tokens`
+  （它计入推理 token 时会大于两者之和）。上游没有回报用量时三列都是 `NULL`，与真实的 `0` 可区分。
+- **入库开关**：`config.yaml` 的 `request_log.enabled`（默认 `true`）逐请求读取，无需重启。
   关掉后代理不再采集请求/响应体、也不写库，`/overview` 与 `/requests` 里的
   `request_log.enabled` 会回报 `false`；改回 `true` 即恢复记录。
   配置热加载每秒最多比对一次文件 mtime，所以开关在**约 1 秒内**生效（已实测）。
   数据库路径与保留天数仍由环境变量决定。
-- 默认写入 `config.json` 同级目录的 `llmhub.db`（容器内即 `/data/llmhub.db`），WAL 模式；
+- 默认写入 `config.yaml` 同级目录的 `llmhub.db`（容器内即 `/data/llmhub.db`），WAL 模式；
   可用 `REQUEST_LOG_DB` 覆盖路径、`REQUEST_LOG_RETENTION_DAYS`（默认 30，0 表示永久保留）控制清理。
 - 旧库自动升级：启动时比对 `PRAGMA table_info(requests)`，缺失的列用 `ALTER TABLE ADD COLUMN` 补齐。
 - 写入通过有界内存队列异步批量落盘，不阻塞转发主链路；队列满时丢弃并告警。
 - 请求/响应体截断至 8 KB，`authorization`、`api_key`、`token`、`password` 等字段在落库前替换为 `***`。
 
+**模型测速（bench，实现在 `app/bench.py` + `app/bench_store.py`）：**
+
+口径与 `D:/apps/ollama/bench_llm.mjs` 一致，纯 Python 实现，不依赖 Node：
+
+- **预热**：默认 1 轮不计入统计；正式 4 轮，取均值 / 标准差 / 最小 / 最大 / 变异系数。
+- **TTFT**：首 token 到达的墙钟时间（毫秒）。注意 Ollama 的非流式请求拿不到首 token 时刻，所以测速**始终走流式**。
+- **Decode（tok/s）**：优先用服务端回报的 `eval_duration`（Ollama `/api/chat`）或 `usage` + `timings.predicted_ms`（OpenAI 兼容），缺失时回落客户端墙钟；口径写在 `timing_source`：`server` / `client` / `client*`（流式但不带服务端计时）。
+- **Prefill（tok/s）**：`prompt_eval_duration` / `prompt_ms` → 提示 token 数 / 秒，同样回落客户端。
+- **思考模型**：模型名命中 `qwen3` / `deepseek-r1` / `reasoning` 等模式时自动加 `think: false`（Ollama）或最小推理预算，避免思考链把 decode 拉低；`think` 参数可显式覆盖（`auto` / `true` / `false`）。
+- **模型名对齐**：先请求上游的模型列表做 preflight，按「精确 → 归一化（去 `:latest`）→ 子串」顺序解析；找不到直接报错，不会静默测到别的模型。
+- **代理**：内部 `httpx.AsyncClient` 使用 `trust_env=False`，与网关主客户端一致——本机若导出 `HTTP_PROXY`，否则打上游的请求会被绕到代理上（表现为 `502`）。
+
+结果落在 `llmhub.db` 的 `bench_results` 表（与 `requests` 同库，WAL）：
+
+| 分类 | 字段 |
+|------|------|
+| 标识 | `id`、`upstream`、`model`、`created_at`（任务完成时刻） |
+| 目标 | `server`（`ollama` / `lm`）、`host`、`port` |
+| 参数 | `rounds`、`warmup`、`max_tokens` |
+| 指标 | `decode_tok_s`（均值）、`decode_sd`、`prefill_tok_s`、`ttft_ms`、`timing_source`、`prompt_tokens`、`gen_tokens` |
+| 明细 | `payload`（完整 JSON：逐轮数据 + `steady` 汇总 + `config`） |
+
+每个 `(upstream, model)` **只保留最新 3 份**：写入后按 `created_at DESC, id DESC` 删除第 4 份及更早的记录。
+任务本身只存在内存（`_BENCH_JOBS`，上限 200 条，完成后被清扫），进程重启后旧 job_id 一律 `404`——历史成绩请走 `/bench/history`。
+
+任务跑在**独立线程 + 独立事件循环**里，不占用 `POST /bench` 那个请求的生命周期；结果行先入写队列再置 `done`，
+`/bench/history` 读之前会先 flush 队列，所以「状态刚变 done 就查历史」也能读到记录。
+
 **网关边界：** `/v1/management` 与 `/admin` 一样不受 `security.path_allowlist` 限制（它使用
 独立的会话认证），但仍受 HTTP 方法白名单、客户端 IP 白名单与速率限制约束。管理台只读，
-不提供任何修改 `config.json` 的写接口。
+不提供任何修改 `config.yaml` 的写接口；测速接口是本组里唯一的写操作，也只写 `llmhub.db`。
 
 ---
 
@@ -1146,15 +1183,12 @@ curl http://localhost:8888/api/delete \
 
 **配置示例：**
 
-```json
-{
-  "aliases": {
-    "qwen3.5:4b-nothink": {
-      "model": "qwen3.5:4b",
-      "params": {"think": false}
-    }
-  }
-}
+```yaml
+aliases:
+  qwen3.5:4b-nothink:
+    model: qwen3.5:4b
+    params:
+      think: false
 ```
 
 **使用示例：**

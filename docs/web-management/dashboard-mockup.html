@@ -42,6 +42,7 @@
     width:1180px; max-width:100%; margin:0 auto;
     display:flex; background:var(--surface);
     border:1px solid var(--border); border-radius:14px; overflow:hidden;
+    min-height:max(640px, calc(100vh - 48px));
   }
 
   /* ---------- sidebar ---------- */
@@ -71,10 +72,44 @@
   .nav-sub{padding-left:14px;}
   .nav-item.soon{opacity:.45; cursor:not-allowed;}
   .nav-item.soon::after{content:"soon"; font-size:9px; margin-left:auto; color:var(--text-mute); border:1px solid var(--border-strong); padding:1px 5px; border-radius:6px;}
-  .sidebar .spacer{flex:1;}
-  .user{display:flex; align-items:center; gap:9px; padding:9px 8px; border-top:1px solid var(--border);}
-  .user .av{width:28px; height:28px; border-radius:50%; background:var(--surface-3); display:flex; align-items:center; justify-content:center; font-size:12px; color:var(--text-dim);}
-  .user .un{font-size:12px;} .user .rl{font-size:10.5px; color:var(--text-mute);}
+
+  /* ---------- account dock (fixed bottom-left) ---------- */
+  .user-dock{position:fixed; left:max(38px,calc((100vw - 1180px)/2 + 18px)); bottom:34px; z-index:60;
+    display:flex; flex-direction:column; align-items:flex-start; gap:10px;}
+  .user-card{display:flex; align-items:center; gap:10px; padding:7px 12px 7px 8px;
+    border:1px solid var(--border-strong); border-radius:999px; background:var(--surface-2); color:var(--text);
+    font-family:inherit; cursor:pointer; box-shadow:0 10px 28px rgba(0,0,0,.3);}
+  .user-card.open{border-color:var(--accent); background:var(--surface-3);}
+  .av{width:34px; height:34px; flex:0 0 34px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    font-weight:700; font-size:14px; letter-spacing:.3px; color:#fff;
+    background:linear-gradient(135deg,var(--accent),#7b5cff);
+    box-shadow:0 0 0 2px var(--surface-2),0 0 0 3.5px var(--accent-soft);}
+  .user-card .uc-text{display:flex; flex-direction:column; line-height:1.3; text-align:left;}
+  .user-card .un{font-size:12.5px; font-weight:600;} .user-card .rl{font-size:10px; color:var(--text-mute);}
+  .uc-chev{font-size:10px; color:var(--text-mute); margin-left:2px; transform:rotate(180deg);}
+  .user-menu{width:238px; padding:6px; background:var(--surface-2); border:1px solid var(--border-strong);
+    border-radius:12px; box-shadow:0 18px 44px rgba(0,0,0,.4);}
+  .um-head{display:flex; align-items:center; gap:10px; padding:8px 10px 9px;}
+  .um-head .av{width:38px; height:38px; flex-basis:38px; font-size:16px;}
+  .um-head .un{font-size:13px; font-weight:700;} .um-head .rl{font-size:10.5px; color:var(--text-mute);}
+  .um-sep{height:1px; margin:5px 6px; background:var(--border);}
+  .um-item{width:100%; display:flex; align-items:center; gap:9px; padding:8px 10px; border:none; border-radius:8px;
+    background:none; color:var(--text-dim); font-family:inherit; font-size:12.5px; text-align:left; cursor:pointer;}
+  .um-item:hover{background:var(--surface-3); color:var(--text);}
+  .um-item .um-ico{width:16px; text-align:center; font-size:13px; opacity:.9;}
+  .um-item .um-t{flex:1;} .um-item .um-val{font-size:11px; color:var(--text-mute);}
+  .um-item .um-chev{font-size:9px; color:var(--text-mute);}
+  .um-item.danger{color:var(--red);}
+  .um-switch{position:relative; width:30px; height:16px; border-radius:999px; background:var(--accent-soft); border:1px solid var(--accent);}
+  .um-switch > i{position:absolute; top:1.5px; left:2px; width:11px; height:11px; border-radius:50%; background:var(--accent); transform:translateX(13px);}
+  .um-sub-wrap{position:relative;}
+  .um-flyout{position:absolute; top:-6px; left:calc(100% + 6px); width:172px; padding:5px;
+    background:var(--surface-2); border:1px solid var(--border-strong); border-radius:10px;
+    box-shadow:0 16px 36px rgba(0,0,0,.42);}
+  .um-flyout .um-item{padding:7px 9px; font-size:12px;}
+  .um-flyout .um-item.on{color:var(--accent); font-weight:600;}
+  .um-flyout .um-item:disabled{cursor:not-allowed; opacity:.55;}
+  .soon-tag{font-size:9px; color:var(--text-mute); border:1px solid var(--border-strong); padding:0 5px; border-radius:6px;}
 
   /* ---------- content ---------- */
   .content{flex:1; min-width:0; padding:22px 24px; display:flex; flex-direction:column; gap:18px;}
@@ -158,7 +193,8 @@
   .badge{display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:600; padding:2px 8px; border-radius:6px;}
   .badge.gpu{color:var(--green); background:rgba(63,185,80,.12);}
   .badge.part{color:var(--amber); background:rgba(210,153,34,.12);}
-  .badge.cpu{color:#e5673a; background:rgba(229,103,58,.16); border:1px solid rgba(229,103,58,.5); font-weight:700;}
+  .badge.cpu{color:#e5673a; background:rgba(229,103,58,.16);}
+  .badge.cloud{color:#a371f7; background:rgba(163,113,247,.14);}
   .badge.idle{color:var(--text-mute); background:var(--surface-3); border:1px solid var(--border);}
   .badge.ok{color:var(--green); background:rgba(63,185,80,.12);}
   .badge.err{color:var(--red); background:rgba(248,81,73,.12);}
@@ -271,6 +307,19 @@
   .param-table .pr.no{color:var(--text-mute);}
   .param-table .pd{color:var(--text-dim);}
   .api-note{font-size:11.5px; color:var(--text-mute); margin-top:10px; line-height:1.6;}
+  .feature-intro{font-size:11.5px; color:var(--text-dim); line-height:1.75;}
+  .feat-grid{display:grid; grid-template-columns:1fr 1fr; gap:10px 18px;}
+  .grid-2{display:grid; grid-template-columns:1fr 1fr; gap:14px;}
+  .feat{display:flex; gap:10px; align-items:flex-start;}
+  .fico{flex:none; width:22px; height:22px; border-radius:6px; display:grid; place-items:center;
+        font-size:12px; color:var(--accent); background:var(--accent-soft);}
+  .ft{font-size:12.5px; color:var(--text); font-weight:600;}
+  .fd{font-size:11.5px; line-height:1.65; color:var(--text-dim);}
+  .ver-dot{width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px;
+           border:1.5px solid var(--accent); background:var(--accent); vertical-align:middle;}
+  .qr-box{width:168px; height:168px; margin:6px auto 2px; border:1px solid var(--border);
+          border-radius:10px; overflow:hidden; background:#fff; display:grid; place-items:center;}
+  .qr-box img{display:block; width:100%; height:100%; object-fit:contain;}
 </style>
 </head>
 <body>
@@ -289,27 +338,44 @@
 
       <div class="nav-item active" data-view="dashboard" onclick="navTo('dashboard', this)"><span class="ico">▦</span> Dashboard</div>
       <div class="nav-item" data-view="upstreams" onclick="navTo('upstreams', this)"><span class="ico">⛁</span> Upstreams</div>
+      <div class="nav-item" data-view="requests" onclick="navTo('requests', this)"><span class="ico">☰</span> Requests</div>
 
       <div class="nav-label">Models</div>
       <div class="nav-item nav-sub" data-view="models-llm" onclick="navTo('models-llm', this)"><span class="ico">✦</span> LLM</div>
-      <div class="nav-item nav-sub" data-view="models-rerank" onclick="navTo('models-rerank', this)"><span class="ico">⚡</span> Rerank</div>
+      <div class="nav-item nav-sub" data-view="models-embed" onclick="navTo('models-embed', this)"><span class="ico">◍</span> Embed</div>
+      <div class="nav-item nav-sub" data-view="models-rerank" onclick="navTo('models-rerank', this)"><span class="ico">⇅</span> Rerank</div>
       <div class="nav-item nav-sub" data-view="models-systemone" onclick="navTo('models-systemone', this)"><span class="ico">◈</span> System one</div>
 
       <div class="nav-label">Tools</div>
-      <div class="nav-item nav-sub" data-view="tools-websearch" onclick="navTo('tools-websearch', this)"><span class="ico">🔍</span> Web Search</div>
-
-      <div class="nav-item" data-view="requests" onclick="navTo('requests', this)"><span class="ico">☰</span> Requests</div>
-      <div class="nav-item soon" title="即将开放"><span class="ico">⚙</span> Settings</div>
-
-      <div class="spacer"></div>
-      <div class="user">
-        <div class="av">A</div>
-        <div>
-          <div class="un">admin</div>
-          <div class="rl">Administrator</div>
-        </div>
-      </div>
+      <div class="nav-item nav-sub" data-view="tools-websearch" onclick="navTo('tools-websearch', this)"><span class="ico">◎</span> Web Search</div>
     </aside>
+
+    <!-- Account dock: fixed to the viewport corner, menu open for the design capture. -->
+    <div class="user-dock">
+      <div class="user-menu">
+        <div class="um-head">
+          <div class="av">A</div>
+          <div><div class="un">admin</div><div class="rl">Administrator</div></div>
+        </div>
+        <div class="um-sub-wrap">
+          <button class="um-item"><span class="um-ico">文</span><span class="um-t">语言 / Language</span><span class="um-val">中文</span><span class="um-chev">▸</span></button>
+          <div class="um-flyout">
+            <button class="um-item on"><span class="um-ico">✓</span><span class="um-t">中文</span></button>
+            <button class="um-item" disabled><span class="um-ico">·</span><span class="um-t">English</span><span class="soon-tag">soon</span></button>
+          </div>
+        </div>
+        <button class="um-item"><span class="um-ico">☾</span><span class="um-t">深色模式</span><span class="um-switch"><i></i></span></button>
+        <button class="um-item"><span class="um-ico">⚙</span><span class="um-t">设置</span><span class="um-val">Settings</span></button>
+        <button class="um-item" onclick="navTo('about')"><span class="um-ico">?</span><span class="um-t">关于</span><span class="um-val">About</span></button>
+        <div class="um-sep"></div>
+        <button class="um-item danger"><span class="um-ico">⇥</span><span class="um-t">退出登录</span></button>
+      </div>
+      <button class="user-card open">
+        <span class="av">A</span>
+        <span class="uc-text"><span class="un">admin</span><span class="rl">Administrator</span></span>
+        <span class="uc-chev">▴</span>
+      </button>
+    </div>
 
     <!-- ===================== CONTENT ===================== -->
     <main class="content">
@@ -406,15 +472,15 @@
             <tbody>
               <tr>
                 <td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td>
-                <td><span class="badge gpu">● GPU 100%</span></td><td class="mono">65536</td>
+                <td><span class="badge gpu">● GPU</span></td><td class="mono">65536</td>
               </tr>
               <tr>
                 <td class="mono">qwen3.5:9b</td><td>Ollama-Arc-B65</td>
-                <td><span class="badge gpu">● GPU 100%</span></td><td class="mono">16384</td>
+                <td><span class="badge gpu">● GPU</span></td><td class="mono">16384</td>
               </tr>
               <tr>
                 <td class="mono">qwen3-reranker:4b-rk</td><td>Ollama-iGPU</td>
-                <td><span class="badge part">● 部分 62%</span></td><td class="mono">8192</td>
+                <td><span class="badge part">● 部分</span></td><td class="mono">8192</td>
               </tr>
             </tbody>
           </table>
@@ -479,8 +545,8 @@
                   <div><div class="card-h">运行中模型 <span class="tag">/api/ps</span></div>
                     <table><thead><tr><th>模型</th><th>设备</th><th>上下文</th></tr></thead>
                       <tbody>
-                        <tr><td class="mono">qwen3.6:35b-pruned</td><td><span class="badge gpu">● GPU 100%</span></td><td class="mono">65536</td></tr>
-                        <tr><td class="mono">qwen3.5:9b</td><td><span class="badge gpu">● GPU 100%</span></td><td class="mono">16384</td></tr>
+                        <tr><td class="mono">qwen3.6:35b-pruned</td><td><span class="badge gpu">● GPU</span></td><td class="mono">65536</td></tr>
+                        <tr><td class="mono">qwen3.5:9b</td><td><span class="badge gpu">● GPU</span></td><td class="mono">16384</td></tr>
                       </tbody></table></div>
                   <div><div class="card-h">已装模型 <span class="tag">/api/tags</span></div>
                     <table><thead><tr><th>模型</th><th>大小</th></tr></thead>
@@ -499,8 +565,8 @@
                   <div><div class="card-h">运行中模型 <span class="tag">/api/ps</span></div>
                     <table><thead><tr><th>模型</th><th>设备</th><th>上下文</th></tr></thead>
                       <tbody>
-                        <tr><td class="mono">qwen3-reranker:4b-rk</td><td><span class="badge part">● 部分 62%</span></td><td class="mono">8192</td></tr>
-                        <tr><td class="mono">qwen3-reranker:4b</td><td><span class="badge cpu">● 纯 CPU</span></td><td class="mono">8192</td></tr>
+                        <tr><td class="mono">qwen3-reranker:4b-rk</td><td><span class="badge part">● 部分</span></td><td class="mono">8192</td></tr>
+                        <tr><td class="mono">qwen3-reranker:4b</td><td><span class="badge cpu">● CPU</span></td><td class="mono">8192</td></tr>
                       </tbody></table></div>
                   <div><div class="card-h">已装模型 <span class="tag">/api/tags</span></div>
                     <table><thead><tr><th>模型</th><th>大小</th></tr></thead>
@@ -574,6 +640,32 @@
         <div class="foot">llm-hub 管理台 · Models · LLM（只读视图风格稿）</div>
       </section>
 
+      <!-- ===================== MODELS · EMBED ===================== -->
+      <section class="view" id="view-models-embed">
+        <div class="topbar">
+          <div><h1>Models · Embed</h1><div class="sub">嵌入向量端点（只读）· 由网关按 model 路由后原样透传</div></div>
+          <div class="actions">
+            <span class="refresh">静态说明 · 不发请求</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">功能介绍 <span class="tag">embedding</span></div>
+          <div class="feature-intro">
+            嵌入（Embedding）把文本映射成定长向量，是语义检索、聚类、去重与 RAG 的基础。llm-hub 提供 Ollama 原生
+            <code>POST /api/embed</code> 与 OpenAI 兼容 <code>POST /v1/embeddings</code> 两个入口：调用方按
+            <code>model</code> 选择嵌入模型，网关先做别名解析再路由到对应上游，请求与响应原样透传。嵌入模型与 LLM 共用
+            <code>upstreams[].models</code> / <code>aliases</code>，未声明的模型不会被路由；OpenAI SDK 等客户端把
+            baseURL 指向网关即可获得统一的向量服务。
+          </div>
+        </div>
+        <div class="api-lead">
+          网关把 <code>POST /api/embed</code>（Ollama 原生）与 <code>POST /v1/embeddings</code>（OpenAI 兼容）
+          原样透传给 <code>model</code> 解析到的上游；模型须在 <code>config.yaml</code> 中声明，否则 404。
+        </div>
+        <div class="foot">llm-hub 管理台 · Models · Embed（只读视图风格稿）</div>
+      </section>
+
       <!-- ===================== MODELS · RERANK ===================== -->
       <section class="view" id="view-models-rerank">
         <div class="topbar">
@@ -581,6 +673,15 @@
           <div class="actions">
             <span class="refresh">最后更新 10:17:24</span>
             <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">功能介绍 <span class="tag">rerank</span></div>
+          <div class="feature-intro">
+            重排（Rerank）在初步召回之后，用模型对候选文档逐条打分并重新排序，提升问答、搜索与 RAG 的命中质量。llm-hub
+            暴露 <code>POST /v1/rerank</code>：传入 <code>query</code> 与 <code>documents</code>，网关把请求转换成上游可执行的形式——生成式模型按对数概率打分（logprobs），或按向量余弦相似度打分（embedding），再把分数归一化为
+            <code>results[].relevance_score</code>，可用 <code>top_n</code> 与
+            <code>return_documents</code> 控制输出，打分方式可按模型覆盖。
           </div>
         </div>
         <div class="card">
@@ -655,6 +756,16 @@
           <div class="actions">
             <span class="refresh">最后更新 10:17:24</span>
             <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">功能介绍 <span class="tag">decision</span></div>
+          <div class="feature-intro">
+            System One 是面向「快速决策」的判定 API：输入一段状态与若干问题，模型直接给出选项、是/否概率或分数，适合意图识别、路由分流、风控与表单校验等低延迟场景。llm-hub 的
+            <code>POST /v1/systemone</code> 原样透传请求与响应，只负责调用方鉴权和上游签名，因此既兼容 laya-server
+            的 <code>noul</code> / <code>choice</code> / <code>score</code> 决策契约，也可以直接指向 Ollama 0.40+ 的同名端点与本地模型；请求可用
+            <code>model</code> 指定后端模型，缺省时按配置注入，<code>stream: true</code> 时后端以 SSE
+            逐条回带判定结果。
           </div>
         </div>
         <div class="card">
@@ -735,6 +846,16 @@
           </div>
         </div>
         <div class="card">
+          <div class="card-h">功能介绍 <span class="tag">web search</span></div>
+          <div class="feature-intro">
+            Web 搜索把关键词检索接入大模型应用：<code>POST /v1/tools/web-search</code> 接收查询词，由后台的
+            opencode-port 抓取匹配网页，返回标题、链接、摘要与正文段落，为问答、摘要与 RAG 提供最新的外部知识。请求体原样转发，仅
+            <code>query</code> 必填；<code>top_k</code>、<code>locale</code>、<code>recency</code>
+            控制检索范围与时效，<code>include_sources</code> 附带来源列表，<code>synthesize: true</code>
+            时额外由模型综合生成答案。检索既可以作为独立工具调用，也可以把返回的 <code>text</code> 直接拼进 prompt。
+          </div>
+        </div>
+        <div class="card">
           <div class="card-h">Web Search 配置 <span class="tag">web-search</span></div>
           <div class="kv">
             <div class="k">Endpoint</div><div class="v mono">/v1/tools/web-search</div>
@@ -746,6 +867,29 @@
             <div class="k">Timeout</div><div class="v mono">300s</div>
           </div>
         </div>
+        <div class="card">
+          <div class="card-h">可用模型 <span class="tag">opencode</span></div>
+          <div class="api-note">Web Search 的检索能力来自后台配置的 <b>opencode-port</b>（OpenCode API Gateway，项目地址
+            <a class="link" href="https://github.com/bruce1977/opencode-port" target="_blank" rel="noreferrer">github.com/bruce1977/opencode-port</a>）：
+            在 <code>config.yaml</code> 中把一个 <code>type: "opencode"</code> 的 upstream 指向它的地址（默认
+            <code>127.0.0.1:10000</code>），再把 <code>websearch.upstream</code> 指向该 upstream。下表就是该 Provider
+            声明的模型——声明 <code>opencode/*</code> 时会展开成 opencode-port 当前支持的模型（内置
+            <code>opencode/*-free</code>、虚拟模型 <code>auto</code>，以及它接入的 <code>ollama-local/*</code>）。
+            请求里的 <code>model</code> 不是 llm-hub 配置的模型，而是 opencode-port 支持的模型名，也可以不填——省略时由
+            opencode-port 使用它自己的默认模型。</div>
+          <table>
+            <thead><tr><th>模型</th><th>上游</th><th>类型</th><th>设备</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">opencode/auto <span class="chip s2" style="margin-left:6px;">alias</span></td><td>opencode</td><td><span class="chip">opencode</span></td><td><span class="badge cloud">● Cloud</span></td><td><span class="badge ok">● 在线</span></td></tr>
+              <tr><td class="mono">opencode/big-pickle <span class="chip s2" style="margin-left:6px;">wildcard</span></td><td>opencode</td><td><span class="chip">opencode</span></td><td><span class="badge cloud">● Cloud</span></td><td><span class="badge ok">● 在线</span></td></tr>
+              <tr><td class="mono">opencode/deepseek-v4.1-flash-free <span class="chip s2" style="margin-left:6px;">wildcard</span></td><td>opencode</td><td><span class="chip">opencode</span></td><td><span class="badge cloud">● Cloud</span></td><td><span class="badge ok">● 在线</span></td></tr>
+              <tr><td class="mono">opencode/mimo-v2.6-flash-free <span class="chip s2" style="margin-left:6px;">wildcard</span></td><td>opencode</td><td><span class="chip">opencode</span></td><td><span class="badge cloud">● Cloud</span></td><td><span class="badge ok">● 在线</span></td></tr>
+            </tbody>
+          </table>
+          <div class="api-note">Provider 是一个普通 upstream，它的模型同样会出现在 <code>/v1/models</code> 与 Models · LLM 页面中，
+            聊天请求也可路由到它。模型 id 以斜杠分隔（如 <code>opencode/big-pickle</code>），路由通配需写成
+            <code>"opencode/*"</code>，冒号形式匹配不到任何模型。</div>
+        </div>
         <div>
           <div class="view-title">请求 API 格式 <span class="tag">/v1/tools/web-search</span></div>
           <div class="api-doc">
@@ -754,7 +898,7 @@
               <thead><tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr></thead>
               <tbody>
                 <tr><td class="pn">query</td><td class="pt">string</td><td class="pr">是</td><td class="pd">搜索关键词或自然语言问题（唯一必填字段）</td></tr>
-                <tr><td class="pn">model</td><td class="pt">string</td><td class="pr no">否</td><td class="pd">Provider 侧模型 id，原样透传；省略时由 Provider 决定，不参与本地 alias 解析</td></tr>
+                <tr><td class="pn">model</td><td class="pt">string</td><td class="pr no">否</td><td class="pd">opencode-port 支持的模型名（不是 llm-hub 配置的模型），原样透传；省略时使用 opencode-port 的默认模型</td></tr>
                 <tr><td class="pn">top_k</td><td class="pt">integer</td><td class="pr no">否</td><td class="pd">检索页面数，范围 1–50；省略时取 Provider 默认值</td></tr>
                 <tr><td class="pn">max_chars_per_page</td><td class="pt">integer</td><td class="pr no">否</td><td class="pd">单页字符预算，超出截断，响应 truncated=true</td></tr>
                 <tr><td class="pn">locale</td><td class="pt">string</td><td class="pr no">否</td><td class="pd">地区/语言提示，如 zh-CN</td></tr>
@@ -882,6 +1026,67 @@
             <span class="chip s2">上游增删改</span>
           </div>
         </div>
+      </section>
+
+      <!-- ===================== ABOUT ===================== -->
+      <section class="view" id="view-about">
+        <div class="topbar">
+          <div><h1>About</h1><div class="sub">关于 llm-hub · 项目简介、主要功能与版本信息</div></div>
+          <div class="actions">
+            <span class="refresh">最后更新 10:17:24</span>
+            <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">项目简介 <span class="tag">overview</span></div>
+          <div class="feature-intro">
+            llm-hub 是一个 FastAPI 编写的轻量级大模型网关：把多台 Ollama 实例、LM Studio 与 OpenAI 兼容服务收敛成一个统一的 API 入口，按模型名路由、合并别名与参数注入，并原样透传流式响应。在此之上它自己实现了
+            Rerank、System One 决策与 Web 搜索等扩展接口，附带只读 Web 管理台与 SQLite 请求明细，适合个人与团队把散落的模型实例整理成一套稳定、可观测、可鉴权的服务。
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">主要功能 <span class="tag">features</span></div>
+          <div class="feat-grid">
+            <div class="feat"><span class="fico">⛁</span><div><div class="ft">多上游聚合路由</div><div class="fd">按模型名精确匹配、前缀通配（qwen3:* / opencode/*）、优先级选择与宽松回退</div></div></div>
+            <div class="feat"><span class="fico">✦</span><div><div class="ft">别名与参数注入</div><div class="fd">aliases 统一对外命名，options 注入推理参数，num_ctx_overrides 固化上下文长度</div></div></div>
+            <div class="feat"><span class="fico">◍</span><div><div class="ft">嵌入与重排</div><div class="fd">/api/embed、/v1/embeddings 原样透传；/v1/rerank 支持 logprobs 与 embedding 两种打分</div></div></div>
+            <div class="feat"><span class="fico">◈</span><div><div class="ft">System One 决策</div><div class="fd">noul / choice / score 判定接口，兼容 laya-server 与 Ollama 0.40+ 后端</div></div></div>
+            <div class="feat"><span class="fico">◎</span><div><div class="ft">Web 搜索</div><div class="fd">转发到 opencode-port 抓取网页段落与来源，可选由模型综合生成答案</div></div></div>
+            <div class="feat"><span class="fico">⚿</span><div><div class="ft">安全与配额</div><div class="fd">API Key 只来自环境变量、IP 白名单、方法与路径白名单、限流、请求体上限与安全响应头</div></div></div>
+            <div class="feat"><span class="fico">▤</span><div><div class="ft">请求明细与统计</div><div class="fd">SQLite 记录耗时 / TTFB / token / 脱敏请求响应，提供 P50·P95·P99 与分布统计</div></div></div>
+            <div class="feat"><span class="fico">⌂</span><div><div class="ft">只读管理台</div><div class="fd">/admin 下的 Vue 控制台：配置投影、上游探测、请求查询、模型清单与压测</div></div></div>
+            <div class="feat"><span class="fico">↻</span><div><div class="ft">运维友好</div><div class="fd">配置热重载、流式（NDJSON / SSE）原样透传、单镜像 Docker 部署</div></div></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">版本信息 <span class="tag">runtime</span></div>
+          <div class="kv">
+            <div class="k">Gateway 版本</div><div class="v mono"><span class="ver-dot"></span>v1.2.0 <span class="chip">实时取自 /v1/management/overview</span></div>
+            <div class="k">管理台</div><div class="v mono">Vue 3 控制台（只读）· /admin</div>
+            <div class="k">上游在线</div><div class="v mono">3 / 4</div>
+            <div class="k">运行中模型</div><div class="v mono">8</div>
+            <div class="k">今日请求 / Token</div><div class="v mono">2 次 · 0.04k</div>
+            <div class="k">请求明细库</div><div class="v mono"><span class="badge ok">● 记录中</span> 保留 30 天</div>
+            <div class="k">数据时间</div><div class="v mono">10:17:24</div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-h">项目地址 <span class="tag">github</span></div>
+            <div class="kv">
+              <div class="k">源码仓库</div><div class="v"><a class="link" href="https://github.com/bruce1977/llm-hub" target="_blank" rel="noreferrer">github.com/bruce1977/llm-hub</a></div>
+              <div class="k">Docker 镜像</div><div class="v mono">bruce1977/llm-hub:latest</div>
+              <div class="k">接口文档</div><div class="v mono">/docs · /openapi.json</div>
+            </div>
+            <div class="api-note">仓库包含完整源码、部署说明与更新日志；Issue 与 PR 欢迎提交你希望聚合的新的上游类型。</div>
+          </div>
+          <div class="card">
+            <div class="card-h">公众号 <span class="tag">wechat</span></div>
+            <div class="qr-box"><img src="images/wechat-qr.jpg" alt="微信公众号二维码"></div>
+            <div class="api-note">扫码关注，获取版本更新、部署经验与新上游接入的分享。图片经 <code>/admin/wechat-qr.jpg</code> 同源提供。</div>
+          </div>
+        </div>
+        <div class="foot">llm-hub 管理台 · About</div>
       </section>
     </main>
   </div>
