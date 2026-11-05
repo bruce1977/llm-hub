@@ -33,9 +33,9 @@ clients                              llm-hub                                 bac
 | **Routing by model** | The `model` field decides the upstream — no per-port URLs in your clients. Same model on several instances? Lowest `priority` wins. |
 | **One auth layer** | Many keys, constant-time compare, `Bearer` / `X-API-Key`. Keys live in the environment or a secret file, never in `config.yaml`. |
 | **APIs Ollama lacks** | `POST /v1/rerank` (logprobs or embedding scoring) and `POST /v1/tools/web-search`, both routed to the upstream that can serve them. |
-| **Aliases** | `qwen3.5:4b-nothink` → `qwen3.5:4b` with `think: false` injected; also pins `num_ctx` per model to stop Ollama re-spawning. |
+| **Aliases** | `qwen3.5:4b-nothink` → `qwen3.5:4b` with `think: false` injected — every `aliases:` entry is a model of its own, so the console lists it as its own row, while `model_aliases` only renames. Also pins `num_ctx` per model to stop Ollama re-spawning. |
 | **Transparent streaming** | NDJSON (`/api/chat`, `/api/generate`) and SSE (`/v1/chat/completions`) are passed through untouched, timings included. |
-| **Console + telemetry** | Vue console at `/admin`, request log in SQLite, per-model **speed test** (TTFT, decode / prefill tok/s, last 3 runs), 简体中文 / English. |
+| **Console + telemetry** | Vue console at `/admin`, request log in SQLite, per-model **speed test** (TTFT, decode / prefill tok/s, last 3 runs), an **API tester** behind a Test button on every documented endpoint, 简体中文 / English. |
 
 ## Screenshots
 
@@ -105,7 +105,7 @@ curl http://localhost:8888/health
 
 | Document | What is in it |
 |---|---|
-| [USAGE.md](docs/USAGE.md) | Everything: config reference (`server` / `auth` / `upstreams` / `routing` / `aliases` / `rerank` / `websearch` / `request_log`), LM Studio integration, web console internals, full endpoint docs, FAQ, security checklist, local development |
+| [USAGE.md](docs/USAGE.md) | Everything: config reference (`server` / `auth` / `upstreams` / `routing` / `aliases` / `api_models` / `rerank` / `websearch` / `request_log`), LM Studio integration, web console internals, full endpoint docs, FAQ, security checklist, local development |
 | [docs/API.md](docs/API.md) | Forwarding rules, error codes, request/response examples |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | Image build and publish scripts, reverse proxy, volumes |
 | [docs/TESTCASES.md](docs/TESTCASES.md) | End-to-end test matrix (smoke / management / gateway) |

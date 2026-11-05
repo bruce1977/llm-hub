@@ -32,14 +32,21 @@ export interface UpstreamDetail extends ProbeResult {
   unreachable: boolean
 }
 
-/** A model the console reports as available: an Ollama resident model (`/api/ps`) or one
- *  declared by a hosted provider such as OpenCode, which has no load state - its device,
- *  memory and expiry are null and render as "-". */
+/** A model the console reports as available: an Ollama resident model (`/api/ps`), one
+ *  declared by a hosted provider such as OpenCode (which has no load state - its device,
+ *  memory and expiry are null and render as "-"), or a model derived from a root `aliases:`
+ *  entry, which runs inside its target's instance and therefore reports no memory of its own. */
 export interface RunningModel {
   model: string
-  /** Alias when `config.yaml` declares one for this real id, otherwise `model`. */
+  /** Rename target: the `model_aliases` short name when there is one, otherwise `model`. */
   display: string
   alias: string | null
+  /** True for a model declared under root `aliases:` - it is callable on its own name. */
+  derived: boolean
+  /** Real upstream id a derived model runs on; only present when `derived` is true. */
+  target?: string
+  params?: Record<string, unknown>
+  description?: string | null
   upstream: string
   device: DeviceKind | null
   device_ratio: number | null
@@ -82,14 +89,21 @@ export interface UpstreamsResponse {
   upstreams: ProbeResult[]
 }
 
-/** One model an upstream declares in `config.yaml` (`upstreams[].models`). `display` is the
- *  configured alias when there is one, otherwise the declared name; `model` always keeps the
- *  real upstream id. The runtime fields (device, sizes, num_ctx) only exist while an Ollama
- *  instance holds the model in memory - a hosted provider reports them as null. */
+/** One model an upstream declares in `config.yaml` (`upstreams[].models`), or one derived from
+ *  a root `aliases:` entry. `display` is the `model_aliases` rename when there is one, otherwise
+ *  the declared name; `model` is the name the caller sends, so a derived model carries its own
+ *  alias name here and keeps the real id in `target`. The runtime fields (device, sizes,
+ *  num_ctx) only exist while an Ollama instance holds the model in memory - a hosted provider
+ *  reports them as null, and a derived model shows no memory because its instance is already
+ *  counted under its own name. */
 export interface LlmModel {
   model: string
   display: string
   alias: string | null
+  derived: boolean
+  target?: string
+  params?: Record<string, unknown>
+  description?: string | null
   upstream: string
   type: UpstreamType
   wildcard: boolean
@@ -103,6 +117,8 @@ export interface LlmModel {
 
 export interface ModelAlias {
   alias: string
+  /** `rename` came from `upstreams[].model_aliases`; `derived` is a model of its own. */
+  kind: 'rename' | 'derived'
   target: string
   upstream: string | null
   params: Record<string, unknown>
@@ -239,6 +255,7 @@ export interface RequestsQuery {
   model?: string
   status?: string
   path?: string
+  method?: string
   page?: number
   page_size?: number
 }
@@ -407,4 +424,111 @@ export interface BenchHistory {
   upstream: string
   model: string
   records: BenchHistoryRecord[]
+}
+
+// --------------------------------------------------------------------------- //
+// Interactive API testers - /v1/management/api-test*. Shapes mirror app/api_test.py:
+// `KINDS` is a closed allowlist of endpoint families, and each one gets the models that
+// actually answer it, the credentials the call is signed with (masked) and, after a run,
+// the envelope the gateway produced.
+// --------------------------------------------------------------------------- //
+export type ApiTestKind =
+  | 'generate'
+  | 'chat'
+  | 'embed_ollama'
+  | 'embed_openai'
+  | 'rerank'
+  | 'systemone'
+  | 'websearch'
+
+/** A model the selector offers: an `LlmModel` row plus the masked key of the upstream that
+ *  would sign the call. `unknown` marks a name written in `api_models` that nothing serves -
+ *  a misconfiguration to show, not hide, so its upstream may be null. */
+export interface ApiTestModel extends Omit<LlmModel, 'upstream' | 'type'> {
+  upstream: string | null
+  type: UpstreamType | null
+  api_key: string | null
+  unknown: boolean
+}
+
+export interface ApiTestKindContext {
+  kind: ApiTestKind
+  method: string
+  /** The public path the gateway serves, which for rerank is the configured endpoint. */
+  endpoint: string
+  family: string
+  model_required: boolean
+  /** A name outside `models` is legal (a laya routing enum, an opencode-port model id). */
+  free_model: boolean
+  enabled: boolean
+  /** Which config block the list came from, shown so the user knows where to edit it. */
+  source: string
+  models: ApiTestModel[]
+  default_model: string | null
+  /** Masked key for the capability's own env variable, when that variable is set. */
+  api_key: string | null
+  api_key_env: string | null
+}
+
+export interface ApiTestContext {
+  kinds: Partial<Record<ApiTestKind, ApiTestKindContext>>
+  max_response_bytes: number
+}
+
+/** One executed tester request. A refusal is data, not an exception: the gateway's own
+ *  status and detail land in `status` / `text` exactly as an external caller would see them. */
+export interface ApiTestResult {
+  kind: ApiTestKind
+  method: string
+  endpoint: string
+  stream: boolean
+  truncated: boolean
+  error: string | null
+  requested_model: string | null
+  model: string | null
+  upstream: string | null
+  injected: Record<string, unknown> | null
+  status: number
+  ok: boolean
+  duration_ms: number
+  ttft_ms: number | null
+  content_type: string | null
+  /** Parsed JSON body, null for a streamed or non-JSON answer (see `text`). */
+  body: unknown
+  text: string
+}
+
+// --------------------------------------------------------------------------- //
+// Config (Settings console): the whole config.yaml object, editable in place.
+// The console only renders the four common segments (upstreams / rerank /
+// systemone / websearch); the rest is preserved verbatim on save, so we keep the
+// payload loose and let the backend validate the segments it owns.
+// --------------------------------------------------------------------------- //
+export interface ConfigPayload {
+  upstreams: ConfigUpstream[]
+  // The console only renders the four common segments; the rest is preserved verbatim,
+  // so the editable blocks are kept loose (the backend validates them per segment).
+  rerank: any
+  systemone: any
+  websearch: any
+}
+
+export interface ConfigUpstream {
+  name: string
+  base_url: string
+  type?: string
+  models?: string[]
+  model_aliases?: Record<string, string>
+  headers?: Record<string, string>
+  // Native number inputs bind through v-model.number, which yields a string ("") while a
+  // field is cleared; the console coerces these back to numbers before saving.
+  timeout?: number | string | null
+  priority?: number | string
+  vram_total_gb?: number | string | null
+  description?: string
+}
+
+/** Per-segment validation errors returned by PUT /config (HTTP 422). */
+export interface ConfigSaveError {
+  segments: Record<string, string>
 }

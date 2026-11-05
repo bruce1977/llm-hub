@@ -14,19 +14,21 @@ import type {
   RequestsResponse,
   RequestStats,
 } from '@/types/api'
-import { fmtClock, fmtInt, fmtMs, fmtPct, fromInputValue, hoursAgoInput, nowInputValue, statusBadge } from '@/utils/format'
+import { daysAgoStartInput, fmtClock, fmtInt, fmtMs, fmtPct, fromInputValue, statusBadge, todayEndInput } from '@/utils/format'
 
 const PAGE_SIZE = 15
 const STATUS_OPTIONS = ['2xx', '3xx', '4xx', '5xx']
+const METHOD_OPTIONS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
 
 const { t } = useI18n()
 
 const filters = reactive({
-  start: hoursAgoInput(24),
-  end: nowInputValue(),
+  start: daysAgoStartInput(7),
+  end: todayEndInput(),
   upstream: '',
   model: '',
   status: '',
+  method: '',
   path: '',
 })
 
@@ -35,17 +37,15 @@ const upstreamOptions = ref<string[]>([])
 // Installed models (and aliases) with the upstreams that can serve them; the 模型 filter
 // is derived from it, so choosing an upstream narrows the list to what that instance offers.
 interface ModelChoice {
-  name: string
+  value: string // resolved real model id used as the filter value
+  label: string // alias-priority display name
   upstreams: string[]
 }
 const modelChoices = ref<ModelChoice[]>([])
-const modelOptions = computed<string[]>(() => {
-  const names = new Set<string>()
-  for (const choice of modelChoices.value) {
-    if (filters.upstream && !choice.upstreams.includes(filters.upstream)) continue
-    names.add(choice.name)
-  }
-  return [...names].sort()
+const modelOptions = computed<ModelChoice[]>(() => {
+  return modelChoices.value
+    .filter((c) => !filters.upstream || c.upstreams.includes(filters.upstream))
+    .sort((a, b) => a.label.localeCompare(b.label))
 })
 const lastUpdated = ref('')
 const loadError = ref('')
@@ -82,6 +82,7 @@ function queryParams(targetPage = page.value): RequestsQuery {
     upstream: filters.upstream || undefined,
     model: filters.model || undefined,
     status: filters.status || undefined,
+    method: filters.method || undefined,
     path: filters.path.trim() || undefined,
     page: targetPage,
     page_size: PAGE_SIZE,
@@ -108,14 +109,44 @@ async function loadOptions() {
     const [overview, llm] = await Promise.all([api.overview(), api.modelsLlm()])
     upstreamOptions.value = (overview.data.upstreams ?? []).map((u) => u.name)
     const models = llm.data.models ?? []
-    const choices: ModelChoice[] = models.map((m) => ({ name: m.model, upstreams: [m.upstream] }))
-    // An alias without its own upstream resolves wherever its target lives, so it stays
-    // offered under exactly those upstreams.
-    for (const alias of llm.data.aliases ?? []) {
+    const aliases = llm.data.aliases ?? []
+    // Group by the resolved real model id. A `model_aliases` rename keeps the real id in
+    // `model` and exposes its short name via `display`, so the whole group (real id plus the
+    // alias a caller may send) collapses into one option whose label is the alias. A root
+    // `aliases:` entry is a model of its own and already appears here as its own row, so it
+    // is covered too; the `aliases` list is only a fallback for a name whose target row is
+    // missing from `models`.
+    const byReal = new Map<string, { label: string; aliasLike: boolean; upstreams: Set<string> }>()
+    for (const m of models) {
+      const entry = byReal.get(m.model)
+      if (entry) {
+        entry.upstreams.add(m.upstream)
+        if (m.alias && !entry.aliasLike) {
+          entry.label = m.display || m.model
+          entry.aliasLike = true
+        }
+      } else {
+        byReal.set(m.model, {
+          label: m.display || m.model,
+          aliasLike: !!m.alias,
+          upstreams: new Set([m.upstream]),
+        })
+      }
+    }
+    const choices: ModelChoice[] = []
+    const covered = new Set<string>()
+    for (const [real, info] of byReal) {
+      choices.push({ value: real, label: info.label, upstreams: [...info.upstreams] })
+      covered.add(real)
+      covered.add(info.label)
+    }
+    for (const alias of aliases) {
+      if (covered.has(alias.alias)) continue
       const home = alias.upstream
         ? [alias.upstream]
         : models.filter((m) => m.model === alias.target).map((m) => m.upstream)
-      choices.push({ name: alias.alias, upstreams: home })
+      choices.push({ value: alias.alias, label: alias.alias, upstreams: home })
+      covered.add(alias.alias)
     }
     modelChoices.value = choices
   } catch {
@@ -127,7 +158,7 @@ async function loadOptions() {
 watch(
   () => filters.upstream,
   () => {
-    if (filters.model && !modelOptions.value.includes(filters.model)) filters.model = ''
+    if (filters.model && !modelOptions.value.some((c) => c.value === filters.model)) filters.model = ''
   },
 )
 
@@ -137,11 +168,12 @@ function apply() {
 
 function reset() {
   Object.assign(filters, {
-    start: hoursAgoInput(24),
-    end: nowInputValue(),
+    start: daysAgoStartInput(7),
+    end: todayEndInput(),
     upstream: '',
     model: '',
     status: '',
+    method: '',
     path: '',
   })
   load(1)
@@ -184,11 +216,34 @@ onMounted(() => {
   <div class="filters">
     <div class="field">
       <label for="f-start">{{ t('requests.filters.start') }}</label>
-      <input id="f-start" v-model="filters.start" type="datetime-local" class="dt" />
+      <el-date-picker
+        id="f-start"
+        v-model="filters.start"
+        type="datetime"
+        format="YYYY-MM-DD HH:mm:ss"
+        value-format="YYYY-MM-DDTHH:mm:ss"
+        :clearable="false"
+        size="small"
+      />
     </div>
     <div class="field">
       <label for="f-end">{{ t('requests.filters.end') }}</label>
-      <input id="f-end" v-model="filters.end" type="datetime-local" class="dt" />
+      <el-date-picker
+        id="f-end"
+        v-model="filters.end"
+        type="datetime"
+        format="YYYY-MM-DD HH:mm:ss"
+        value-format="YYYY-MM-DDTHH:mm:ss"
+        :clearable="false"
+        size="small"
+      />
+    </div>
+    <div class="field">
+      <label for="f-method">{{ t('requests.filters.method') }}</label>
+      <select id="f-method" v-model="filters.method" class="sel">
+        <option value="">{{ t('requests.filters.all') }}</option>
+        <option v-for="m in METHOD_OPTIONS" :key="m" :value="m">{{ m }}</option>
+      </select>
     </div>
     <div class="field">
       <label for="f-upstream">{{ t('requests.filters.upstream') }}</label>
@@ -205,7 +260,7 @@ onMounted(() => {
       }}</label>
       <select id="f-model" v-model="filters.model" class="sel">
         <option value="">{{ t('requests.filters.all') }}</option>
-        <option v-for="name in modelOptions" :key="name" :value="name">{{ name }}</option>
+        <option v-for="c in modelOptions" :key="c.value" :value="c.value">{{ c.label }}</option>
       </select>
     </div>
     <div class="field">

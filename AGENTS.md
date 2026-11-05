@@ -7,9 +7,11 @@ LLM Hub is a FastAPI-based unified gateway that aggregates multiple Ollama insta
 - API key authentication
 - Rerank API implementation
 - Web search pass-through (OpenCode API Gateway upstream)
-- Model aliasing and parameter injection
+- Model aliasing and parameter injection (an entry under root `aliases:` is a model of its own with
+  its own pinned parameters; `upstreams[].model_aliases` only renames an existing model)
 - Config hot reload
-- Read-only management API (`/v1/management`) with a SQLite request log
+- Read-only management API (`/v1/management`) with a SQLite request log; the only actions that
+  actually reach out are the per-model speed test and the per-endpoint API testers
 - Vue 3 web console (`web/`, built into `app/web`, served at `/admin`) over that API
 
 ## Architecture
@@ -26,6 +28,7 @@ llm-hub/
 │   ├── management.py # Read-only management API (/v1/management) for the web console
 │   ├── bench.py      # Model speed test engine (Python port of bench_llm.mjs, no Node needed)
 │   ├── bench_store.py # bench_results table in llmhub.db (latest 3 rows per upstream+model)
+│   ├── api_test.py   # Server-side execution for the console's API testers (closed KINDS allowlist)
 │   ├── rerank.py     # Rerank API implementation (logprobs/embedding modes)
 │   ├── systemone.py  # System One decision API (proxied to laya-server or Ollama 0.40+)
 │   ├── websearch.py  # Web search API (proxied to an OpenCode API Gateway upstream)
@@ -42,9 +45,9 @@ llm-hub/
 │   ├── tsconfig.json         # strict, moduleResolution "bundler", @/* -> src/*
 │   └── vite.config.ts        # build.outDir = ../app/web (the bundle is committed, node_modules are not)
 ├── tests/
-│   ├── smoke_test.py        # Comprehensive mock tests (123)
+│   ├── smoke_test.py        # Comprehensive mock tests (135)
 │   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (63)
-│   ├── test_management.py   # Management API + request log + console serving tests (198)
+│   ├── test_management.py   # Management API + request log + console serving tests (297)
 │   ├── verify_security.py   # Security control tests (15)
 │   ├── test_api.py          # E2E tests against a live server (28)
 │   └── demo.py              # Demo script (requires real Ollama)
@@ -134,9 +137,9 @@ python tests/demo.py
 **Important:** E2E tests always use `data/config.yaml` from the project root (set via `CONFIG_PATH=./data/config.yaml`). This config points to the local Ollama instance at `127.0.0.1:11434`. Never hardcode paths in test commands.
 
 ### Test Structure
-- `smoke_test.py` — 123 mock tests (auth, routing, aliases, streaming, `/api/generate` forwarding, rerank, security, `/` system info, upstream types), no external deps
+- `smoke_test.py` — 135 mock tests (auth, routing, aliases, streaming, `/api/generate` forwarding, rerank, security, `/` system info, upstream types), no external deps
 - `test_gateway_new.py` — 63 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input + the documented `/api/generate` request/response schema)
-- `test_management.py` — 198 tests for admin auth (session cookie **or** gateway API key → 200; the admin password as `Bearer` / `X-API-Key` and a key in the query string → 401; wrong username → 401; `ADMIN_PASSWORD` unset → 503), the `/admin` static console (`/admin` → `/admin/` redirect, SPA fallback, immutable caching for `assets/`, `../` cannot escape the build, the tab icon served as `image/svg+xml` rather than falling back to the shell, 503 with a build hint when `app/web` is missing), upstream probes + device classification, the `upstreams/{name}` detail (declared `models` with aliases applied, `/api/ps` `running_models`), the config-driven `/models/llm` (only declared names, `display` / `alias` per row, a `qwen3:*` or `opencode/*` prefix expanded through discovery and flagged `wildcard`, an unresolvable pattern kept as its own row with `running: false`, runtime device/memory, dead upstream contributes only its declared names), hosted `opencode` rows (probe online ⇒ every declared model `running` with `device: "cloud"` and memory `null`, rows added to `/overview` `running_models` and the KPI, nothing added when offline), masked config projections (LLM / rerank / systemone / tools-websearch), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string, the `tokens_in` / `tokens_out` split from both usage formats and the `NULL` when a response reports no usage), the `kpi.tokens_today` total, filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade (including the declared type of the added columns)
+- `test_management.py` — 297 tests for admin auth (session cookie **or** gateway API key → 200; the admin password as `Bearer` / `X-API-Key` and a key in the query string → 401; wrong username → 401; `ADMIN_PASSWORD` unset → 503), the `/admin` static console (`/admin` → `/admin/` redirect, SPA fallback, immutable caching for `assets/`, `../` cannot escape the build, the tab icon served as `image/svg+xml` rather than falling back to the shell, 503 with a build hint when `app/web` is missing), upstream probes + device classification, the `upstreams/{name}` detail (declared `models` with renames applied plus the derived alias names, `/api/ps` `running_models`), the config-driven `/models/llm` (only declared names, `display` / `alias` / `derived` per row, a `model_aliases` rename replacing `display` without touching the target, a root `aliases:` entry becoming its own row right after its target — device inherited, memory `null`, `aliases[].kind` separating `rename` from `derived`, a `qwen3:*` or `opencode/*` prefix expanded through discovery and flagged `wildcard`, an unresolvable pattern kept as its own row with `running: false`, runtime device/memory, dead upstream contributes only its declared names), hosted `opencode` rows (probe online ⇒ every declared model `running` with `device: "cloud"` and memory `null`, rows added to `/overview` `running_models` and the KPI, nothing added when offline), `/overview` appending only **running** derived rows to `running_models` while `kpi.running_models` counts just the physical + hosted rows, masked config projections (LLM / rerank / systemone / tools-websearch), the `api_models` derivation and narrowing (names explicitly claimed by embed/rerank/systemone removed from generate/chat while a `websearch` claim does not hide a chat model or its alias, a tagless `tev1` claim matching a declared `tev1:latest`, alias and derived names accepted, `free_model` on websearch/systemone, an unserved name kept visible, the per-kind default and mask, a non-Ollama (`lmstudio`) model absent from the native `generate` / `embed_ollama` kinds while `chat` / `embed_openai` keep it, an explicit list served as written), the `/api-test` envelope (closed `kind` allowlist → 400, a missing `model` where the family needs one → 400, alias + `think` injection, `num_ctx` clamping, the envelope's requested/resolved model + upstream + injected params (flat keys, not nested), NDJSON and SSE assembly with `stream`/`content_type`/`ttft_ms`, an unreachable backend's **502** and a disabled capability's **404** arriving as data rather than as an error, the 128 KB `truncated` cap and the request-log row a tester call leaves), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string, an allowed `HEAD` forwarded but never written to the log, the `tokens_in` / `tokens_out` split from both usage formats and the `NULL` when a response reports no usage), the `kpi.tokens_today` total, filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade (including the declared type of the added columns)
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
 - `test_api.py` — 28 E2E tests against a real running server + Ollama + web search provider
 - `demo.py` — interactive demo (requires real Ollama)
@@ -356,8 +359,9 @@ Comments are allowed, which is why the format changed.
   `/admin/login|logout|ping` routes delegate to the same functions
 - `/v1/management` is exempt from `security.path_allowlist` (like `/admin`) but still subject
   to the method allowlist, client-IP allowlist and rate limit
-- All routes are read-only except the model speed test (it only writes `bench_results` in
-  `llmhub.db`, never `config.yaml`). Probes reuse `app.state.client` with a 5s timeout so one dead
+- All routes are read-only except two: the model speed test (it writes `bench_results` in
+  `llmhub.db`) and the API testers (they send one ordinary call, so they only add a `requests` row).
+  Neither touches `config.yaml`. Probes reuse `app.state.client` with a 5s timeout so one dead
   upstream cannot stall a view; `overview` / `upstreams` use `asyncio.gather` over upstreams
 - Speed test (`POST /bench`, `GET /bench/{job_id}`, `GET /bench/history`):
   `app/bench.py` mirrors `bench_llm.mjs` (1 warm-up + N streaming rounds, decode/prefill taken from
@@ -376,6 +380,55 @@ Comments are allowed, which is why the format changed.
   **Route order matters**: `/bench/history` must be registered *before* `/bench/{job_id}`, else the
   literal `history` segment is captured as a job id and every hover returns
   `404 任务不存在或已过期`
+- API testers (`GET /api-test/models`, `POST /api-test`, engine in `app/api_test.py`): the console
+  executes **server-side** because the management session cookie satisfies `require_admin` but is not
+  a caller API key — a browser-side fetch would be rejected by gateway auth. `KINDS` is a **closed
+  allowlist** of 7 entries (`generate`, `chat`, `embed_ollama`, `embed_openai`, `rerank`, `systemone`,
+  `websearch` → executor `proxy` / `rerank` / `systemone` / `websearch`, plus `family`,
+  `model_required`, `free_model`); an unknown `kind` is **400**, never a pass-through to a URL the
+  caller picked. `execute()` builds a minimal synthetic ASGI `Request` and calls the gateway's own
+  services, so alias + parameter injection, `num_ctx_overrides` clamping, the blocked-admin paths and
+  request-log capture behave exactly as for a real client. `_drain` consumes *and closes* the response
+  iterator so the proxy's streaming generator runs its `finally` and writes the log row. Bodies are
+  capped at `MAX_RESPONSE_BYTES = 128*1024` and the envelope reports `truncated`. A refusal the
+  endpoint itself produced (400 bad body, 404 unrouted or feature disabled, 413 oversized, 502/504
+  upstream, 503 missing provider) arrives as **envelope data** with its status, not as an error from
+  `/api-test`, so the tester shows what a real client would have seen; only the route's own guard
+  (unknown `kind`, a missing `model` where the family needs one) is a real HTTP error
+- `stream` in that envelope is the **transport the gateway chose** (`proxy._should_stream`, i.e.
+  `STREAM_BY_DEFAULT` when the caller omits the flag) — the same value the request-log `stream`
+  column carries; the body's `stream` key is never injected. Whether the answer really came back
+  chunked is what `content_type` says, so the console gates the streaming/TTFT chips on
+  `/ndjson|event-stream/i` instead of trusting `stream`
+- `api_models` (`ApiModelsConfig` in `config.py`: `generate` / `embed` / `rerank` / `systemone` /
+  `websearch`) narrows each family's selector and is a **display/config-derivation concern only** —
+  routing never consults it. Empty means derive (`rerank.models`, then `systemone.model`, else the
+  callable pool from `upstreams[].models` + aliases); a listed item may be a real id, a
+  `model_aliases` short name or a derived `aliases:` name and is matched through
+  `_pool_row_for_name`, so a name nothing serves stays visible with `unknown: true`. When
+  `api_models.generate` is left empty the derived pool drops every name **explicitly claimed** by
+  another family — `api_models.embed`, `api_models.rerank`, `api_models.systemone` and
+  `rerank.models`, plus each claim's resolved target — because that instance answers it as an
+  embedding / scoring / decision model rather than a chat one. `api_models.websearch` is
+  deliberately **not** a claim: that endpoint is a chat pass-through, so the model that answers
+  the synthesis prompt is a chat model first (this is what keeps a hosted provider's routing
+  model, e.g. `opencode/auto`, selectable for chat). `_claimed_names()` also ignores
+  fallbacks such as `systemone.model`: a deployment may
+  point System One at the model it chats with, and that model must stay selectable for chat. Claims
+  are compared through `_bare()`, which drops a trailing `:latest`, because Ollama and `api_models`
+  treat `tev1` and `tev1:latest` as one model. An explicit `api_models.generate` list is served as
+  written. `websearch` / `systemone` set `free_model: true` — `model` is optional there and the
+  provider resolves it, so the selector preselects nothing and the box accepts any name
+- Dialect: `/api/generate` and `/api/embed` are Ollama's **native** API (`Kind.native` in
+  `api_test.py`), while an `lmstudio` or `opencode` upstream answers only the `/v1` side. The
+  derived selector of a native kind therefore keeps `type: "ollama"` rows only (rows are dropped,
+  not the upstream: `/v1` kinds still offer them), because listing a hosted model there would be a
+  guaranteed upstream 404. An explicit `api_models.<family>` list is still served as written, so a
+  misconfiguration stays visible. `/v1/chat/completions` and `/v1/embeddings` are unfiltered —
+  Ollama serves those too
+- `/api-test/models` never leaks a secret: when a family signs with an extra key it returns the fixed
+  mask `••••••` next to the **name** of the environment variable (`api_key_env`), exactly like the
+  rerank / systemone / websearch config projections
 - Ollama device classification: `size_vram / size` → `gpu` (≥ 0.999) / `partial` / `cpu`;
   non-Ollama and unreachable upstreams report `device: null` at the API level, except a reachable
   hosted `opencode` upstream, whose rows report `device: "cloud"`
@@ -386,18 +439,35 @@ Comments are allowed, which is why the format changed.
   handler** because `main` already imports `management` at module scope; that call runs only for
   upstreams that actually declare a pattern. A pattern nothing matched stays visible as the pattern
   itself and is never reported as running
-- Every model row carries `model` (real upstream id), `display` (the configured alias when there is
-  one, else the declared name) and `alias` (`null` when unaliased), via `_alias_by_target()` — the
-  inverse of `Config.aliases` keyed by `(upstream, real id)`
+- **An entry under root `aliases:` is a model of its own; an entry under `upstreams[].model_aliases`
+  is only a display rename.** `Config._expand_upstream_aliases` folds the renames into
+  `Config.aliases` (so routing and `/v1/models` treat both kinds the same) and remembers which names
+  it generated in the `PrivateAttr` `_renamed_alias_names`; `Config.is_renamed_model(name)` and
+  `Config.derived_aliases()` (private attrs stay out of `model_dump()`) are what the management API
+  uses to tell the two apart. The **owner** of a derived model resolves exactly like `Config.resolve()`
+  — `get_upstream(alias.upstream)` → `find_upstream_for_model(alias.model)` →
+  `default_upstream_obj()`, so the console can never hide a callable alias
+- Every model row carries `model` (the name the caller sends), `display`, `alias` (`null` when
+  unaliased) and `derived`. A **rename** replaces `display` with the short name and leaves `alias`
+  holding it — `_alias_by_target()` only maps names `is_renamed_model()` accepts, so a root alias
+  never renames its target. A **derived** row is its own row: `alias` is `null`, and it carries
+  `target` / `params` / `description` plus `running` and `device` inherited from the target's
+  `/api/ps` entry, with `size_gib` / `vram_gib` = `null` so the VRAM gauge never double-counts
+  (`_derived_row()` / `_derived_rows()`; in `/models/llm` a derived row is inserted right after its
+  target). `/overview` counts the derived rows in the `running_models` **list** but keeps
+  `kpi.running_models` at the physical rows, so the KPI can't be inflated
+- `aliases` in `/models/llm` reports `kind: "rename" | "derived"` per entry, so the console can label
+  a display alias differently from a model that brings its own pinned `params`
 - An `opencode` (hosted) upstream has no `/api/ps`: while its health probe answers, every model it
   declares counts as online with `device: "cloud"` (it runs on the provider's infrastructure) and
   `device_ratio` / `size_gib` / `vram_gib` = `null`, which the console renders as `Cloud` and `-`;
   `_hosted_models()` builds those rows for both `/overview` and `upstreams/{name}` so the two views
   cannot disagree, and an offline provider contributes none
 - `upstreams/{name}` detail returns **503** with `"unreachable": true` when the health probe
-  fails; unknown names are **404**. Its `models` are the declared names (aliases applied, wildcards
-  expanded) and `running_models` the `/api/ps` runtime view (device, `size_gib`, `vram_gib`,
-  `num_ctx`, `display`, `alias`)
+  fails; unknown names are **404**. Its `models` are the renamed declared names followed by the
+  derived aliases owned by that upstream (wildcards expanded), and `running_models` is the `/api/ps`
+  runtime view (device, `size_gib`, `vram_gib`, `num_ctx`, `display`, `alias`, `derived`) plus hosted
+  and derived rows
 - `/models/llm` lists one row per declared name per upstream with `wildcard` marking the rows that
   came from expanding a pattern, plus `running` / `device` / `device_ratio` / `num_ctx` / `size_gib`
   / `vram_gib` and the `aliases` / `num_ctx_overrides` blocks
@@ -436,6 +506,10 @@ Comments are allowed, which is why the format changed.
 - `proxy.py` records every outcome: blocked (403) / oversized (413) / unrouted (404),
   streaming (captures ≤ 8 KB of body in the generator, writes after `aclose`), non-streaming,
   and connect/read/HTTP failures (502/504). `model` is the resolved target name.
+  **A `HEAD` request is forwarded but never recorded**: it carries no body and no answer and
+  monitors send it continuously, so `logging_on = self._logging_on(cfg) and method != "HEAD"`
+  is the single decision point — the row is skipped, not the forward. (Under the shipped
+  `allowed_http_methods: [GET, POST]` a HEAD never reaches the proxy at all, answering 405.)
   `request_log.extract_token_usage()` returns the **(input, output, total)** triple from either
   `usage.prompt_tokens` / `usage.completion_tokens` (total prefers `usage.total_tokens`, which can
   exceed the sum when it counts reasoning tokens) or Ollama's `prompt_eval_count` / `eval_count`;
@@ -478,7 +552,7 @@ Comments are allowed, which is why the format changed.
 - `index.html` is served `no-cache`, `assets/*` (content-hashed by Vite) `immutable`, so a rebuild
   lands on the next reload; ADMIN_CSP (`self` scripts/styles, `data:` images, `connect-src 'self'`)
   applies to every `/admin` path
-- Anything in `web/public/` (currently `favicon.svg`) is copied verbatim to `app/web/` and served by
+- Anything in `web/public/` (currently `favicon.svg`, `wechat-qr.jpg`) is copied verbatim to `app/web/` and served by
   the same `/admin/{asset_path}` route; Vite rewrites the `<link rel="icon" href="/favicon.svg">`
   to `/admin/favicon.svg` from `base`, and `FileResponse` guesses `image/svg+xml` - which both the
   CSP and an offline container accept
@@ -492,13 +566,20 @@ Comments are allowed, which is why the format changed.
 - Dashboard and Upstreams both poll at `POLL_MS = 60000` (one minute): every tick probes all upstreams
   with a 5 s budget each, so the old 5 s / 10 s cadence could keep the gateway busy back-to-back
 - Model names in the console come from `config.yaml`, not from the instance: rows are
-  `upstreams[].models` with the alias shown as `display` (hover/`title` keeps the real id) and a
-  `wildcard` chip on the rows an expanded `qwen3:*` / `opencode/*` produced. Hosted (`opencode`) rows
-  report `device: "cloud"` with `memory null`, which `deviceBadge` renders as a violet `Cloud` badge and
-  `fmtInt` / `memoryText()` as `-`, so views need no per-type branches. Device badges never show a
+  `upstreams[].models` with a `model_aliases` rename shown as `display` (hover/`title` keeps the real
+  id), a `derived` chip on a row declared under root `aliases:` (hover says which target it runs on),
+  and a `wildcard` chip on the rows an expanded `qwen3:*` / `opencode/*` produced. Hosted (`opencode`)
+  rows report `device: "cloud"` with `memory null`, which `deviceBadge` renders as a violet `Cloud`
+  badge and `fmtInt` / `memoryText()` as `-`, so views need no per-type branches — a derived row's
+  `-` memory uses the same path. Device badges never show a
   percentage - GPU / 部分 / CPU / Cloud only
+- The Models · LLM 别名与派生模型 table renders both kinds side by side (`kind` `显示别名` vs
+  `派生模型`) with the target, upstream, pinned `params` (`think=false` style) and description; the
+  speed test always benches `m.target ?? m.model` (the upstream knows nothing about alias names) and
+  passes `params.think` as `BenchStart.think`
 - The Requests 模型 dropdown follows the chosen 上游: `/models/llm` rows carry their upstream, and an
-  alias is offered under every upstream that serves its target (`ModelChoice.upstreams: string[]`)
+  alias is offered under every upstream that serves its target (`ModelChoice.upstreams: string[]`).
+  A derived alias is now *also* its own row, so the choices are deduped by name
 - Models · LLM is two tabs (`tab = 'models' | 'api'`, no router change, no extra fetch): 模型清单 holds the
   three config tables, API 用法 renders two `ApiDoc` blocks - `POST /api/generate` and
   `POST /v1/chat/completions` - whose parameter tables mirror `app/main.py`'s `openapi_extra` schema and
@@ -516,6 +597,64 @@ Comments are allowed, which is why the format changed.
   `type: "opencode"` upstream pointed at it (default `127.0.0.1:10000`), `websearch.upstream` pointed
   at that upstream, and that `model` names an opencode-port model (not an llm-hub-configured one)
   and may be omitted, in which case opencode-port uses its own default
+- Every `ApiDoc` block carries a 「测试」 button (`Test` in English) at the right end of its
+  **Request parameters** header; it opens the tester in a **popup** over the page, not inline below
+  the document. `ApiDoc.vue` mounts `ApiTester` on the first open and only toggles `v-show`
+  afterwards, so the model probe stays lazy while closing and reopening keeps what was typed and the
+  answer that came back. The modal reuses the bench window's `.modal-overlay` / `.modal` pattern
+  (z-index 100, `min(940px, 94vw)`, `max-height: 88vh`, scroll in the body). 7 windows across the 5
+  API-usage views: `generate`, `chat`, `embed_ollama`, `embed_openai`, `rerank`, `systemone`,
+  `websearch`. The view passes the `kind` and a `TestField[]` (`web/src/types/ui.ts`): `text` /
+  `textarea` / `number` / `bool` / `lines` / `json` / `select`, each with the tester's initial
+  value in `def`, a dot path (`options.temperature`) for nesting, and an empty input **omitting the
+  key entirely** so the endpoint answers with its own default. A `bool` **with** a `def` is a
+  documented flag and renders as a **checkbox** that always sends `true` / `false` (unchecked means
+  false, never "omit"); a `bool` without one stays a three-state select, so an optional field such
+  as System One's `stream` can still be left out
+- **Defaults are already in the form when the popup opens**: `defaultsOf()` seeds every field with
+  `field.def ?? ''`, so the form shows what the endpoint would have used anyway, flags start in the
+  right checkbox state and a select with no default still displays its "not set" option instead of
+  rendering nothing. 「恢复默认值」 puts those values back (it used to be called 「填入默认值」);
+  「清空」 blanks every field, unchecks every flag (which then sends `false`) and clears the model
+  selection, which is how a key gets left out of the body; 「查看请求体」 shows the JSON that will be
+  sent. A late-arriving `TestField[]` fills any still-empty field but never overwrites typing
+- The two LLM windows start with **`stream` off** even though both endpoints stream when the flag is
+  omitted: a streaming test hides the answer behind chunk assembly, so the window sends an explicit
+  `stream: false` and one Run shows a single JSON. The generate window also has a **`think`**
+  checkbox (Ollama's native top-level field, verified on 0.40: false → no `thinking`), defaulting to
+  false like the benchmark and the shipped `-nothink` aliases; the chat window exposes
+  **`reasoning_effort`** instead, because the OpenAI-compatible endpoint ignores `think` and Ollama
+  maps `none` to "no thinking"
+- The tester never fetches per-instance: its model choices, preselected default, `free_model`,
+  `enabled` and masked keys all come from `useApiTestContext()`
+  (`web/src/composables/apiTestContext.ts`), a **module-scope** ref holding one
+  `/api-test/models` payload for the whole console because that call probes every upstream —
+  five views and seven windows share it, and only the first mount or 「重新探测」 re-probes
+- Every window picks the model from a plain `<select>` (the tester uses no Element Plus form
+  controls at all), preset to `default_model`. `free_model` kinds (`systemone`, `websearch`) add one
+  entry, 「自定义模型…」, which swaps in an `<input>` + `<datalist>` for a name the list does not
+  carry; choosing a listed name again closes that box. It is a real dropdown on purpose — a
+  text box pre-filled with the default was what hid the other names, because Chromium filters a
+  datalist popup by the text already in the box.
+  **Every window can clear the model**: the `×` beside the field (or the select's empty option) drops
+  it, and the body then carries no `model` at all. A kind whose family requires `model` answers the
+  tester's own 「请先选择模型」 guard; no `model` is not "no model" server-side, e.g. System One
+  still injects `systemone.model`. 「恢复默认值」 re-selects `default_model` and 「清空」 clears it.
+  An option shows the **name only** — the alias (`display`) when one is configured, else the
+  declared id — with no upstream / device / running marker; the tooltip (`optionTitle`) carries the
+  routing detail (`realModel`, `derivedFrom`, the unserved warning) and the upstream name
+- `v-model` on a `type="number"` input hands back a **number**, and the tester's `type` attribute is
+  bound dynamically, so Vue's `vModelDynamic` applies `looseToNumber` even without `.number`.
+  `trimmed()` therefore coerces with `String(values.value[key] ?? '')` before trimming — otherwise
+  typing into `options.temperature` crashed the whole subtree with `.trim is not a function`
+- Results report the transport the gateway chose plus the observed `content_type`, so the
+  「流式」/「首字」 chips appear only when the body really came back as NDJSON / SSE
+  (`/ndjson|event-stream/i`) — a single JSON answer is never labelled streaming. `answer` is pulled
+  out of `body.response` / `choices[0].message|delta.content`, falling back to assembling the chunked
+  `text`, and a refusal from the gateway itself renders as a normal result line
+- The run button sends the body through `POST /api-test` **server-side** (the console's session
+  cookie is not a caller API key), so nothing in the tester can leak a gateway or provider key; the
+  masked `••••••` rows are read-only and the env-var name is the only clue about where the value lives
 - Embed / Rerank / System One / Web Search each open their 模型清单 tab with a **功能介绍** card
   (~200 characters) as the first card, answering "what is this for" before any config or table: embedding for
   semantic search / clustering / dedupe / RAG, rerank for precision after recall, System One for

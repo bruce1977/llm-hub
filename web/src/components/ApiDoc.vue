@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
+import ApiTester from '@/components/ApiTester.vue'
 import JsonPane from '@/components/JsonPane.vue'
-import type { ApiParam, ApiRequestSpec, ApiResponseSpec } from '@/types/ui'
+import type { ApiParam, ApiRequestSpec, ApiResponseSpec, TestSpec } from '@/types/ui'
 
 withDefaults(
   defineProps<{
@@ -12,22 +14,37 @@ withDefaults(
     request: ApiRequestSpec
     response: ApiResponseSpec
     note?: string
+    /** Live test window, opened from the button at the end of the parameters header. */
+    tester?: TestSpec
   }>(),
-  { title: '', tag: '', params: () => [], note: '' },
+  { title: '', tag: '', params: () => [], note: '', tester: undefined },
 )
 
 const { t } = useI18n()
+
+const testerOpen = ref(false)
+// Mounted on the first open and only hidden afterwards, so the model probe stays lazy while a
+// closed dialog never throws away what was typed or the answer that came back.
+const testerMounted = ref(false)
+
+function openTester(): void {
+  testerMounted.value = true
+  testerOpen.value = true
+}
 </script>
 
 <template>
   <div>
     <div class="view-title">{{ title || t('apiDoc.defaultTitle') }} <span v-if="tag" class="tag">{{ tag }}</span></div>
     <div class="api-doc">
-      <template v-if="params.length">
+      <template v-if="params.length || tester">
         <div class="card-h">
-          {{ t('apiDoc.params') }} <span class="tag">{{ request.method }} {{ request.path }}</span>
+          <span>{{ t('apiDoc.params') }} <span class="tag">{{ request.method }} {{ request.path }}</span></span>
+          <button v-if="tester" class="btn tester-open" type="button" @click="openTester">
+            {{ t('apiDoc.test') }}
+          </button>
         </div>
-        <table class="param-table">
+        <table v-if="params.length" class="param-table">
           <thead>
             <tr>
               <th>{{ t('apiDoc.param') }}</th>
@@ -77,5 +94,73 @@ const { t } = useI18n()
 
       <div v-if="note" class="api-note">{{ note }}</div>
     </div>
+
+    <div v-if="testerMounted" v-show="testerOpen" class="modal-overlay" @click.self="testerOpen = false">
+      <div class="modal" role="dialog" aria-modal="true" :aria-label="`${t('apiTester.title')} ${request.path}`">
+        <div class="modal-head">
+          <div>
+            <div class="modal-title">{{ t('apiTester.title') }}</div>
+            <div class="modal-sub mono">{{ request.method }} {{ request.path }}</div>
+          </div>
+          <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="testerOpen = false">✕</button>
+        </div>
+        <div class="modal-body">
+          <ApiTester :kind="tester!.kind" :fields="tester!.fields" />
+        </div>
+      </div>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.tester-open {
+  margin-left: auto;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  width: min(940px, 94vw);
+  max-height: 88vh;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.modal-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.modal-body {
+  padding: 16px;
+  overflow-y: auto;
+}
+</style>

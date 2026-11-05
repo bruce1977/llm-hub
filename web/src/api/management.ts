@@ -2,7 +2,11 @@ import type { AxiosResponse } from 'axios'
 
 import { http } from './client'
 import type {
+  ApiTestContext,
+  ApiTestKind,
+  ApiTestResult,
   AuthPing,
+  ConfigPayload,
   AuthResult,
   BenchHistory,
   BenchJob,
@@ -24,9 +28,10 @@ import type {
   UpstreamsResponse,
 } from '@/types/api'
 
-// One wrapper per management endpoint. Every route is a read-only GET except the three
-// auth routes; see docs/API.md "管理 API（Web 管理台）". The generics are what gives every
-// view a typed `data` - a renamed backend field becomes a compile error here first.
+// One wrapper per management endpoint. Every route is a read-only GET except the three auth
+// routes, the speed test and the API testers; see docs/API.md "管理 API（Web 管理台）".
+// The generics are what gives every view a typed `data` - a renamed backend field becomes a
+// compile error here first.
 export const api = {
   login: (username: string, password: string): Promise<AxiosResponse<AuthResult>> =>
     http.post<AuthResult>('/auth/login', { username, password }),
@@ -66,4 +71,20 @@ export const api = {
     http.get<BenchJob>(`/bench/${encodeURIComponent(jobId)}`),
   benchHistory: (upstream: string, model: string): Promise<AxiosResponse<BenchHistory>> =>
     http.get<BenchHistory>('/bench/history', { params: { upstream, model } }),
+
+  // Interactive API testers (the API 用法 tabs). apiTestModels reports, per endpoint kind, the
+  // models that answer it, the preselected default and the masked credentials; apiTestRun
+  // sends one live request through the gateway's own service. A generation can run for
+  // minutes, so this call gets its own timeout instead of the shared 20s.
+  apiTestModels: () => http.get<ApiTestContext>('/api-test/models'),
+  apiTestRun: (
+    kind: ApiTestKind,
+    body: Record<string, unknown>,
+  ): Promise<AxiosResponse<ApiTestResult>> =>
+    http.post<ApiTestResult>('/api-test', { kind, body }, { timeout: 600000 }),
+
+  // Settings console: read the live config and overwrite config.yaml (validated per segment).
+  configGet: (): Promise<AxiosResponse<ConfigPayload>> => http.get<ConfigPayload>('/config'),
+  configSave: (config: ConfigPayload): Promise<AxiosResponse<{ ok: boolean; reloaded: boolean }>> =>
+    http.put('/config', { config }, { timeout: 20000 }),
 }

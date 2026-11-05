@@ -82,6 +82,7 @@ function vramText(u: ProbeResult): string {
 interface ModelRow {
   name: string
   alias: string | null
+  derived: boolean
   running: RunningModel | null
   title?: string
 }
@@ -103,8 +104,9 @@ function modelRows(u: ProbeResult): ModelRow[] {
     return {
       name,
       alias: hit?.alias ?? null,
+      derived: hit?.derived ?? false,
       running: hit,
-      title: hit && hit.model !== hit.display ? t('common.realModel', { model: hit.model }) : undefined,
+      title: rowTitle(hit),
     }
   })
 
@@ -115,11 +117,20 @@ function modelRows(u: ProbeResult): ModelRow[] {
     rows.push({
       name: m.display,
       alias: m.alias,
+      derived: m.derived,
       running: m,
-      title: m.model !== m.display ? t('common.realModel', { model: m.model }) : undefined,
+      title: rowTitle(m),
     })
   }
   return rows
+}
+
+/** A derived model shares its target's instance, so the hover names that instance instead of a
+ *  real id it does not have; a renamed model still reveals the id behind the short name. */
+function rowTitle(m: RunningModel | null): string | undefined {
+  if (!m) return undefined
+  if (m.derived) return t('common.derivedFrom', { target: m.target ?? '' })
+  return m.model !== m.display ? t('common.realModel', { model: m.model }) : undefined
 }
 
 onMounted(() => {
@@ -209,6 +220,7 @@ onBeforeUnmount(() => {
                         <td class="mono" :title="row.title">
                           {{ row.name }}
                           <span v-if="row.alias" class="chip s2" :title="t('common.aliasTip')">alias</span>
+                          <span v-if="row.derived" class="chip s2" :title="t('common.derivedTip')">derived</span>
                         </td>
                         <td>
                           <span

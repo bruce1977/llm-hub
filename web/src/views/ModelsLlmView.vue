@@ -7,7 +7,7 @@ import { api } from '@/api/management'
 import ApiDoc from '@/components/ApiDoc.vue'
 import TopBar from '@/components/TopBar.vue'
 import type { BenchHistoryRecord, BenchJob, LlmModel, ModelsLlm } from '@/types/api'
-import type { ApiParam, ApiRequestSpec, ApiResponseSpec } from '@/types/ui'
+import type { ApiParam, ApiRequestSpec, ApiResponseSpec, TestField } from '@/types/ui'
 import { deviceBadge, fmtClock, fmtInt, memoryText } from '@/utils/format'
 
 type Tab = 'models' | 'api'
@@ -31,9 +31,35 @@ const models = computed<LlmModel[]>(() => {
     (m) =>
       m.model.toLowerCase().includes(needle) ||
       m.display.toLowerCase().includes(needle) ||
+      (m.target ?? '').toLowerCase().includes(needle) ||
       m.upstream.toLowerCase().includes(needle),
   )
 })
+
+/** A derived model is measured through the instance it actually runs on. */
+function realModel(m: LlmModel): string {
+  return m.target ?? m.model
+}
+
+function rowTitle(m: LlmModel): string | undefined {
+  if (m.derived) return t('common.derivedFrom', { target: m.target ?? '' })
+  return m.alias ? t('common.realModel', { model: m.model }) : undefined
+}
+
+/** `think: false` in the alias params is what the speed test should measure. */
+function benchThink(m: LlmModel): string | undefined {
+  const think = m.params?.think
+  if (typeof think !== 'boolean') return undefined
+  return think ? 'true' : 'false'
+}
+
+/** Pinned parameters rendered as `key=value` pairs, the way config.yaml reads. */
+function paramsText(params: Record<string, unknown> | null | undefined): string {
+  if (!params) return ''
+  const entries = Object.entries(params)
+  if (!entries.length) return ''
+  return entries.map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`).join(', ')
+}
 
 /** A hosted provider has no resident-model API: the probe answering is the only state. */
 function stateText(m: LlmModel): string {
@@ -61,6 +87,7 @@ const bench = ref<{
   open: boolean
   upstream: string
   model: string
+  think?: string
   job: BenchJob | null
   error: string
 }>({ open: false, upstream: '', model: '', job: null, error: '' })
@@ -87,11 +114,11 @@ async function pollBench() {
   }
 }
 
-async function runBench(upstream: string, model: string) {
+async function runBench(upstream: string, model: string, think?: string) {
   clearBenchTimer()
-  bench.value = { open: true, upstream, model, job: null, error: '' }
+  bench.value = { open: true, upstream, model, think, job: null, error: '' }
   try {
-    const res = await api.benchStart({ upstream, model })
+    const res = await api.benchStart({ upstream, model, think })
     bench.value.job = {
       job_id: res.data.job_id,
       upstream,
@@ -112,7 +139,11 @@ async function runBench(upstream: string, model: string) {
 }
 
 function startBench(m: LlmModel) {
-  return runBench(m.upstream, m.model)
+  return runBench(m.upstream, realModel(m), benchThink(m))
+}
+
+function rerunBench() {
+  return runBench(bench.value.upstream, bench.value.model, bench.value.think)
 }
 
 function closeBench() {
@@ -153,9 +184,10 @@ function onRowEnter(m: LlmModel, ev: MouseEvent) {
 }
 
 function showTip(m: LlmModel, ev: MouseEvent) {
-  const key = `${m.upstream}/${m.model}`
+  const model = realModel(m)
+  const key = `${m.upstream}/${model}`
   tip.value.upstream = m.upstream
-  tip.value.model = m.model
+  tip.value.model = model
   tip.value.x = ev.clientX + 14
   tip.value.y = ev.clientY + 14
   tip.value.show = true
@@ -168,17 +200,17 @@ function showTip(m: LlmModel, ev: MouseEvent) {
   tip.value.error = ''
   tip.value.records = []
   api
-    .benchHistory(m.upstream, m.model)
+    .benchHistory(m.upstream, model)
     .then((res) => {
       const recs = res.data.records || []
       tip.value.cache[key] = recs
-      if (tip.value.upstream === m.upstream && tip.value.model === m.model) {
+      if (tip.value.upstream === m.upstream && tip.value.model === model) {
         tip.value.records = recs
         tip.value.loading = false
       }
     })
     .catch((error) => {
-      if (tip.value.upstream === m.upstream && tip.value.model === m.model) {
+      if (tip.value.upstream === m.upstream && tip.value.model === model) {
         tip.value.loading = false
         tip.value.error = statusOf(error) === 401 ? '' : errorDetail(error)
       }
@@ -210,6 +242,7 @@ const generateParams = computed<ApiParam[]>(() => [
   { name: 'images', type: 'string[]', required: false, desc: t('modelsLlm.generateParams.images') },
   { name: 'format', type: '"json" | object', required: false, desc: t('modelsLlm.generateParams.format') },
   { name: 'stream', type: 'boolean', required: false, desc: t('modelsLlm.generateParams.stream') },
+  { name: 'think', type: 'boolean', required: false, desc: t('modelsLlm.generateParams.think') },
   { name: 'keep_alive', type: 'string | number', required: false, desc: t('modelsLlm.generateParams.keepAlive') },
   { name: 'logprobs', type: 'boolean', required: false, desc: t('modelsLlm.generateParams.logprobs') },
   { name: 'top_logprobs', type: 'integer', required: false, desc: t('modelsLlm.generateParams.topLogprobs') },
@@ -246,6 +279,7 @@ const chatParams = computed<ApiParam[]>(() => [
   { name: 'temperature', type: 'number', required: false, desc: t('modelsLlm.chatParams.temperature') },
   { name: 'max_tokens', type: 'integer', required: false, desc: t('modelsLlm.chatParams.maxTokens') },
   { name: 'stream', type: 'boolean', required: false, desc: t('modelsLlm.chatParams.stream') },
+  { name: 'reasoning_effort', type: 'string', required: false, desc: t('modelsLlm.chatParams.reasoningEffort') },
   { name: 'tools', type: 'array', required: false, desc: t('modelsLlm.chatParams.tools') },
 ])
 
@@ -284,6 +318,47 @@ const chatResponse = computed<ApiResponseSpec>(() => ({
     usage: { prompt_tokens: 25, completion_tokens: 100, total_tokens: 125 },
   },
 }))
+
+// The tester forms mirror the parameter tables above, minus `model` (the selector owns it).
+// `def` is the value the window starts with; a boolean that has one is a checkbox and is always
+// sent explicitly, while an input left empty is kept out of the body.
+const generateFields = computed<TestField[]>(() => [
+  { key: 'prompt', label: t('modelsLlm.generateParams.prompt'), type: 'textarea', required: true, def: 'Hello', wide: true },
+  { key: 'system', label: t('modelsLlm.generateParams.system'), type: 'textarea', wide: true },
+  { key: 'template', label: t('modelsLlm.generateParams.template'), type: 'text' },
+  { key: 'raw', label: t('modelsLlm.generateParams.raw'), type: 'bool', def: 'false' },
+  { key: 'images', label: t('modelsLlm.generateParams.images'), type: 'lines', hint: t('common.onePerLine') },
+  { key: 'format', label: t('modelsLlm.generateParams.format'), type: 'select', options: ['', 'json'] },
+  // The endpoint streams when `stream` is omitted, but a test window that streams by default
+  // hides the whole answer behind chunk assembly; it starts off so the first Run is one JSON.
+  { key: 'stream', label: t('modelsLlm.generateParams.stream'), type: 'bool', def: 'false', hint: t('modelsLlm.tester.streamHint') },
+  // Thinking is on by default for a thinking model; the window starts with it off, like the
+  // benchmark and the shipped `-nothink` aliases.
+  { key: 'think', label: t('modelsLlm.generateParams.think'), type: 'bool', def: 'false' },
+  { key: 'keep_alive', label: t('modelsLlm.generateParams.keepAlive'), type: 'text', def: '5m' },
+  { key: 'logprobs', label: t('modelsLlm.generateParams.logprobs'), type: 'bool', def: 'false' },
+  { key: 'top_logprobs', label: t('modelsLlm.generateParams.topLogprobs'), type: 'number' },
+  { key: 'options.temperature', label: t('modelsLlm.tester.temperature'), type: 'number' },
+  { key: 'options.top_p', label: t('modelsLlm.tester.topP'), type: 'number' },
+  { key: 'options.num_ctx', label: t('modelsLlm.tester.numCtx'), type: 'number' },
+  { key: 'options.num_predict', label: t('modelsLlm.tester.numPredict'), type: 'number' },
+])
+
+const chatFields = computed<TestField[]>(() => [
+  {
+    key: 'messages',
+    label: t('modelsLlm.chatParams.messages'),
+    type: 'json',
+    required: true,
+    def: '[{"role":"user","content":"Hello"}]',
+    wide: true,
+  },
+  { key: 'temperature', label: t('modelsLlm.chatParams.temperature'), type: 'number' },
+  { key: 'max_tokens', label: t('modelsLlm.chatParams.maxTokens'), type: 'number' },
+  { key: 'stream', label: t('modelsLlm.chatParams.stream'), type: 'bool', def: 'false', hint: t('modelsLlm.tester.streamHint') },
+  { key: 'reasoning_effort', label: t('modelsLlm.chatParams.reasoningEffort'), type: 'select', options: ['', 'none', 'low', 'medium', 'high'] },
+  { key: 'tools', label: t('modelsLlm.chatParams.tools'), type: 'json', wide: true },
+])
 
 async function load() {
   if (refreshing.value) return
@@ -389,10 +464,11 @@ onMounted(load)
               @mouseenter="onRowEnter(m, $event)"
               @mouseleave="onRowLeave"
             >
-              <td class="mono" :title="m.alias ? t('common.realModel', { model: m.model }) : undefined">
+              <td class="mono" :title="rowTitle(m)">
                 {{ m.display }}
                 <span v-if="m.wildcard" class="chip s2" :title="t('common.wildcardTip')">wildcard</span>
                 <span v-if="m.alias" class="chip s2" :title="t('common.aliasTip')">alias</span>
+                <span v-if="m.derived" class="chip s2" :title="t('common.derivedTip')">derived</span>
               </td>
               <td>{{ m.upstream }}</td>
               <td><span class="chip">{{ m.type }}</span></td>
@@ -415,27 +491,41 @@ onMounted(load)
     </div>
 
     <div>
-      <div class="view-title">{{ t('modelsLlm.aliases.title') }} <span class="tag">aliases</span></div>
+      <div class="view-title">
+        {{ t('modelsLlm.aliases.title') }}
+        <span class="tag">config.yaml · aliases + upstreams[].model_aliases</span>
+      </div>
       <div class="card tight">
         <table>
           <thead>
             <tr>
               <th>{{ t('modelsLlm.aliases.alias') }}</th>
+              <th>{{ t('modelsLlm.aliases.kind') }}</th>
               <th>{{ t('modelsLlm.aliases.target') }}</th>
               <th>{{ t('modelsLlm.aliases.upstream') }}</th>
+              <th>{{ t('modelsLlm.aliases.params') }}</th>
+              <th>{{ t('modelsLlm.aliases.description') }}</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="a in data.aliases" :key="a.alias">
               <td class="mono">{{ a.alias }}</td>
+              <td>
+                <span class="chip" :class="{ s2: a.kind === 'rename' }">{{
+                  a.kind === 'rename' ? t('modelsLlm.aliases.kindRename') : t('modelsLlm.aliases.kindDerived')
+                }}</span>
+              </td>
               <td class="mono">{{ a.target }}</td>
               <td>{{ a.upstream || '—' }}</td>
+              <td class="mono">{{ paramsText(a.params) || '—' }}</td>
+              <td>{{ a.description || '—' }}</td>
             </tr>
             <tr v-if="!data.aliases.length">
-              <td colspan="3" class="empty">{{ loaded ? t('modelsLlm.aliases.empty') : t('common.loading') }}</td>
+              <td colspan="6" class="empty">{{ loaded ? t('modelsLlm.aliases.empty') : t('common.loading') }}</td>
             </tr>
           </tbody>
         </table>
+        <div class="api-note">{{ t('modelsLlm.aliases.note') }}</div>
       </div>
     </div>
 
@@ -487,6 +577,7 @@ onMounted(load)
       :request="generateRequest"
       :response="generateResponse"
       :note="t('modelsLlm.docs.generateNote')"
+      :tester="{ kind: 'generate', fields: generateFields }"
     />
 
     <ApiDoc
@@ -496,6 +587,7 @@ onMounted(load)
       :request="chatRequest"
       :response="chatResponse"
       :note="t('modelsLlm.docs.chatNote')"
+      :tester="{ kind: 'chat', fields: chatFields }"
     />
   </template>
 
@@ -533,7 +625,7 @@ onMounted(load)
           <div class="bench-error">
             ⚠ {{ t('modelsLlm.benchModal.failed', { error: bench.job.error || t('modelsLlm.benchModal.unknownError') }) }}
           </div>
-          <button class="bench-btn wide" @click="runBench(bench.upstream, bench.model)">{{ t('modelsLlm.benchModal.rerun') }}</button>
+          <button class="bench-btn wide" @click="rerunBench()">{{ t('modelsLlm.benchModal.rerun') }}</button>
         </template>
 
         <template v-else-if="bench.job.result">
@@ -619,7 +711,7 @@ onMounted(load)
           </div>
 
           <div class="modal-actions">
-            <button class="bench-btn wide" @click="runBench(bench.upstream, bench.model)">{{ t('modelsLlm.benchModal.again') }}</button>
+            <button class="bench-btn wide" @click="rerunBench()">{{ t('modelsLlm.benchModal.again') }}</button>
           </div>
         </template>
       </div>

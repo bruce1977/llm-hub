@@ -28,11 +28,12 @@ security. The short version — what the project is, screenshots and a 60-second
 | **Rerank API** | `/v1/rerank` with generative (`logprobs`) and vector (`embedding`) scoring |
 | **Web search** | `POST /v1/tools/web-search` proxies keyword search to an OpenCode API Gateway upstream and returns the retrieved passages |
 | **Unified model list** | `/v1/models` aggregates models & aliases from all upstreams instead of proxying to one instance |
-| **Alias + param injection** | `qwen3.5:4b-nothink` → forwards `qwen3.5:4b` and force-injects `think: false` |
+| **Alias + param injection** | `qwen3.5:4b-nothink` → forwards `qwen3.5:4b` and force-injects `think: false`. Every entry under `aliases:` is a model of its own (the console lists it as a separate row); `upstreams[].model_aliases` only renames |
 | **Streaming pass-through** | NDJSON (`/api/chat`, `/api/generate`) and SSE (`/v1/chat/completions`) forwarded as-is |
-| **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview with today's request and token totals, the models `config.yaml` declares per upstream (aliases applied, prefix wildcards expanded through the upstream's model list) plus runtime device/memory, config projections (Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite), and the per-model speed test (start / poll / history); authenticated with the console session cookie or a gateway API key |
-| **Web console** | Vue 3 + TypeScript + Element Plus + ECharts single-page app served by the gateway itself at `/admin` (no node in the image): overview, upstreams, the configured model inventory (aliases, wildcards expanded, running device/memory), request details and charts, a per-model speed test, 简体中文 / English — no configuration writes in this release |
+| **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview with today's request and token totals, the models `config.yaml` declares per upstream (`model_aliases` renames applied, a root `aliases:` entry listed as its own model, prefix wildcards expanded through the upstream's model list) plus runtime device/memory, config projections (Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite), the per-model speed test (start / poll / history) and the per-endpoint API tester (usable models per family + live execution); authenticated with the console session cookie or a gateway API key |
+| **Web console** | Vue 3 + TypeScript + Element Plus + ECharts single-page app served by the gateway itself at `/admin` (no node in the image): overview, upstreams, the configured model inventory (display renames, derived models, wildcards expanded, running device/memory), request details and charts, a per-model speed test, an API tester popup behind a **Test** button on every documented endpoint, 简体中文 / English — no configuration writes in this release |
 | **Model speed test** | `测速` on **Models · LLM** runs the same prompt N times through the gateway and reports TTFT, decode tok/s and prefill tok/s — taken from the server's own timings (`eval_duration` / `prompt_eval_duration` / `predicted_ms`) when the upstream provides them, falling back to client-side measurement (flagged `timing_source`) otherwise. The latest 3 runs per upstream + model stay in SQLite and show up on hover |
+| **API tester** | Every `API usage` tab carries a **`Test` button** at the right end of each endpoint's *Request parameters* header, opening the tester in a popup (`/api/generate`, `/v1/chat/completions`, `/api/embed`, `/v1/embeddings`, `/v1/rerank`, `/v1/systemone`, `/v1/tools/web-search`): a model picker narrowed by `api_models` (the two native `/api` testers list models of `type: ollama` upstreams only) that lists **names/aliases only**, one input per documented parameter **pre-filled with its default**, a request-body preview, then the status, timings, the model the gateway really routed to with the parameters an alias injected, and the answer pulled out of JSON / NDJSON / SSE. The call runs server-side through the gateway's own service, so alias injection and the request log behave exactly as for an external client, and any extra API key appears only as a read-only `••••••` |
 | **Bilingual console** | Simplified Chinese (source) and English, switched from the account menu and remembered per browser via `localStorage`; missing keys fail the build (`MessageSchema`) instead of rendering raw ids |
 | **Config hot reload** | `config.yaml` changes take effect within ~1s, no restart required |
 | **Docker volume mount** | Config file mounted via `/data` |
@@ -53,7 +54,8 @@ llm-hub/
 │   ├── request_log.py # Request log (SQLite, async batched writes)
 │   ├── bench.py      # Model speed test: TTFT / decode / prefill measurement
 │   ├── bench_store.py # Speed-test history (shares llmhub.db, keeps 3 runs per model)
-│   ├── management.py # Web console API (/v1/management: read-only views + speed test)
+│   ├── api_test.py   # Engine behind the console's API testers (closed endpoint allowlist)
+│   ├── management.py # Web console API (/v1/management: read-only views + speed test + API testers)
 │   ├── websearch.py  # Web search proxy (OpenCode API Gateway upstream)
 │   └── web/          # Built console bundle (output of `npm run build`), served at /admin
 ├── web/
@@ -272,7 +274,9 @@ upstreams:
 - `models`: supports **prefix wildcards** — `"qwen3:*"` matches `qwen3:4b`, `qwen3:8b`, `qwen3:14b`.
   The wildcard is a literal prefix, so slash-separated ids need the slash form: `"opencode/*"`
   matches `opencode/big-pickle` ( `"opencode:*"` would match nothing)
-- `model_aliases`: maps a verbose upstream id to a short name (see the LM Studio section below)
+- `model_aliases`: a **display rename** — maps a verbose upstream id to a short name that is used
+  wherever that model is shown or called. It does not create a new model (see the LM Studio section
+  below; for a model with its own pinned parameters, declare it under the root `aliases` node)
 - `timeout`: overrides the global timeout; raise it for large models
 - `headers`: optional extra headers added when forwarding (e.g. when the upstream has its own auth).
   Model discovery (`/v1/models`, `/api/tags`, and the `/probe` health/model checks) sends them too,
@@ -317,6 +321,13 @@ aliases:
 Requesting `qwen3.5:4b-nothink` replaces `model` with `qwen3.5:4b` and **force-overwrites** the
 request body with the fields in `params` (the alias wins on name collisions).
 
+An entry here is a **model of its own**: `qwen3.5:4b` stays callable and still runs with thinking
+on, and the management console lists `qwen3.5:4b-nothink` as a separate model (its device comes
+from the instance its target is loaded on, its memory shows `-` because that instance is already
+counted under its own name). For a pure display rename with no parameters of its own, use
+`upstreams[].model_aliases` instead — that only changes the name a model is shown and called
+under, it does not add a model.
+
 ### `num_ctx_overrides` — pin context length per model (avoid Ollama re-spawning)
 
 Ollama creates a **separate instance** for each "model + `options.num_ctx`" combination (the KV
@@ -337,6 +348,53 @@ num_ctx_overrides:
 - **Hot-reloaded**: takes effect on new requests ~1 second after editing, no gateway restart needed.
 
 > Example use: pin a large-context model (e.g. 35B-pruned) to 64K so a client can't blow up VRAM with a bigger ctx; or clamp small models to 8K to stop different clients from triggering repeated KV-cache re-allocation on Ollama.
+
+### `api_models` — which models each API family may offer
+
+`upstreams[].models` says what an instance declares, not what role it plays: nothing there tells
+the console that `bge-m3` answers `/api/embed` while `qwen3:8b` answers `/api/generate`. This block
+is that missing statement - one optional list per API family, and the thing the model pickers on the
+`API usage` tabs read:
+
+```yaml
+api_models:
+  generate: []                       # POST /api/generate + POST /v1/chat/completions
+  embed: [bge-m3:latest]             # POST /api/embed + POST /v1/embeddings
+  rerank: []                         # POST /v1/rerank
+  systemone: []                      # POST /v1/systemone
+  websearch: []                      # POST /v1/tools/web-search
+```
+
+- A list may name a real model id, a `upstreams[].model_aliases` short name or a root `aliases:`
+  model. The alias stays the name that gets sent, so the gateway still injects its fixed parameters.
+- **An empty list means "derive", not "none"** - a config written before this block existed needs
+  no edit. `rerank` falls back to `rerank.models`, `systemone` to `systemone.model`, everything else
+  to the whole set of declared (and alias) names. Each picker says which of these it read
+  (`Choices come from api_models.embed` / `rerank.models` / `upstreams[].models`).
+- **Ollama-native endpoints only offer Ollama models.** `POST /api/generate` and `POST /api/embed`
+  are Ollama's own API; an `lmstudio` or `opencode` upstream answers only the `/v1` side, so the
+  derived picker behind those two testers keeps `type: "ollama"` rows only. The same models stay
+  selectable on `POST /v1/chat/completions` / `POST /v1/embeddings`, and a non-empty `api_models`
+  list is still served as written (a name that cannot answer then stays visible rather than
+  silently disappearing).
+- A name **explicitly claimed by another family** disappears from `generate` / `chat`:
+  `api_models.embed`, `rerank` and `systemone` all count, as does `rerank.models`, in
+  either spelling (alias or real id), so a chat picker never offers an embedding, scoring or
+  decision model. `api_models.websearch` is **not** a claim: that endpoint is a chat pass-through,
+  so the model answering the synthesis prompt stays a chat model - this is what keeps a hosted
+  provider's routing model (e.g. `opencode/auto`) selectable for chat. Comparison ignores a trailing
+  `:latest`, since Ollama treats `tev1` and `tev1:latest` as one model. A fallback such as
+  `systemone.model` is **not** a claim either: the same box may well answer decision requests, and
+  it must stay selectable for chat.
+- `websearch` lists the search provider's own models. Its tester's dropdown ends in a
+  「Custom model…」 entry for any name, because opencode-port resolves `model` itself (omitting it
+  uses the provider's default). `systemone` offers the same entry, since a laya-server backend takes
+  a routing enum (`auto` / `english` / `multilingual` / `typed-decisions`) rather than a model id.
+- A name nothing serves stays **visible** and marked `未被声明` / `Unserved`: a dead entry is a
+  misconfiguration to show, not to hide.
+- These lists only narrow what the console offers. **Routing is untouched** - the gateway still
+  accepts exactly the model names it accepted before, so this block cannot lock a caller out of a
+  model that config already declared.
 
 ## Integrating LM Studio
 
@@ -367,7 +425,8 @@ timeout: 600
 - `type: "lmstudio"`: the gateway discovers models & probes liveness via `/v1/models` (Ollama uses
   `/api/tags`, `/api/version`)
 - `model_aliases`: maps "exposed short name → LM Studio real id"; the key is the public name, the
-  value is the upstream's real id
+  value is the upstream's real id. It only renames that model for display and calling — the model
+  itself is unchanged, no new model is added
 
 **3. Access via the short name**
 
@@ -471,6 +530,10 @@ Feeds the console's "Requests" view: every call through the gateway becomes one 
   so the console can say "logging disabled" instead of showing an empty list that looks like no traffic
 - Database path and retention stay deployment-level environment variables: `REQUEST_LOG_DB`,
   `REQUEST_LOG_RETENTION_DAYS`
+- **`HEAD` is forwarded but never recorded**: it carries no body and no answer, and liveness
+  monitors send it continuously, so logging it would drown the real calls. Under the default
+  `allowed_http_methods: [GET, POST]` a HEAD never reaches the proxy at all (it answers `405`);
+  allow `HEAD` there and the request is forwarded normally, just without a row
 - Recorded columns: `ts` / `ts_end` / `duration_ms` / `ttfb_ms` (timing — `ts` and `ts_end` are
   second precision, so read `duration_ms` for sub-second cost), `method` / `path` /
   `query` / `requested_model` / `model` / `request_body` / `req_size` / `stream` / `client_ip`
@@ -489,8 +552,9 @@ gateway itself at **`http://localhost:8888/admin/`**, so the image needs no node
 and inside the container). Sign in as `admin`
 with the `ADMIN_PASSWORD` from `.env`; a successful login mints a 12h HttpOnly session cookie.
 The views — Dashboard, Upstreams, Requests, Models (LLM / Embed / Rerank / System One), Tools (Web Search),
-Settings and About — expose **no configuration writes** in this release; the one action is the
-per-model speed test on Models · LLM. A 401 from any management call
+Settings and About — expose **no configuration writes** in this release; the actions are the
+per-model speed test on Models · LLM and the API testers on every `API usage` tab, and neither
+touches `config.yaml`. A 401 from any management call
 signs the user out and returns to the login page. A 503 is never treated as an auth failure:
 it means an unreachable upstream, `ADMIN_PASSWORD` unset, or the frontend not built yet.
 The account chip sits at the bottom-left of the panel and opens the account menu: language
@@ -498,18 +562,56 @@ The account chip sits at the bottom-left of the panel and opens the account menu
 gone), About (project introduction, features, live version info, repository link and the WeChat QR)
 and sign-out.
 Models · LLM and the Upstreams row-expander list the models each upstream declares in
-`config.yaml` (`upstreams[].models`, shown under its alias when one is configured; a prefix
+`config.yaml` (`upstreams[].models`, shown under its `model_aliases` short name when one is
+configured, while every entry of the root `aliases:` node becomes a row of its own; a prefix
 wildcard such as `opencode/*` is expanded through the upstream's own model list into the concrete
 models it matches, and nothing else is listed). Ollama rows carry the running models' device and
-VRAM/memory; an OpenCode-style hosted upstream has no load state, so when its probe answers every
+VRAM/memory; a derived (`derived: true`) row inherits its target's device and reports `-` for memory,
+because the instance is already counted under its own name and the KPI never double-counts it;
+an OpenCode-style hosted upstream has no load state, so when its probe answers every
 declared model counts as online, its device reads **Cloud** and its memory `-`. Device badges only
 distinguish **GPU / 部分 / CPU / Cloud** and never show a percentage. Models · LLM is split into two tabs:
-**model inventory** (those tables) and **API usage**, which documents the two generation endpoints the
+**model inventory** (those tables, plus **Aliases & derived models** with name / kind / target /
+upstream / pinned params / description) and **API usage**, which documents the two generation endpoints the
 gateway supports today - `POST /api/generate` (Ollama native) and `POST /v1/chat/completions`
 (OpenAI-compatible) - with their parameter tables, request and response examples, and the note that
 both **stream by default** (omitting `stream` yields NDJSON and SSE respectively). Models · Embed
 (sits above Rerank) documents the two embedding pass-throughs - `POST /api/embed` (Ollama native) and
 `POST /v1/embeddings` (OpenAI-compatible) - and fetches no configuration because there is none.
+Each of those documents carries a **`Test` button** at the right end of its *Request parameters*
+header; it opens the **API tester** in a popup over the page (closing and reopening keeps what you
+typed and the last answer). Its model picker is narrowed by `api_models`; models on an `lmstudio` or
+`opencode` upstream appear only on the `/v1` testers, because `/api/generate` and `/api/embed` are
+Ollama's own API. Every option shows the **name only** - the alias (`display`) when one is
+configured, else the declared id - with the
+upstream and runtime state in the hover tooltip and an unserved name still listed and marked
+`Unserved`. One input per documented parameter, **already filled with its initial value when
+the popup opens**, plus `Restore defaults` / `Clear`, a `Show request body` preview, and the result -
+status, duration, first-token time for a real stream, the model the gateway actually routed to plus
+the parameters an alias injected, the answer pulled out of the JSON / NDJSON / SSE payload and the
+raw body. **The model is a real dropdown**, preset to the default and listing every candidate;
+`systemone` / `websearch` add a final 「Custom model…」 entry that swaps in a free-text box with
+the same suggestions, and re-picking a listed name closes it again. **It can be cleared**: the `×`
+next to the field (or the select's empty option) leaves it out of the body - a family that needs one
+answers the local 「pick a model first」 guard, while `systemone` / `websearch` let the endpoint
+decide (System One still injects `systemone.model`). `Restore defaults` re-selects `default_model`,
+and `Clear` clears the model too. A documented
+boolean is a **checkbox**: it always sends `true` / `false`, so an unchecked
+box means false rather than "omit"; everything left blank is **omitted** from the request rather
+than sent as an empty value, so the endpoint answers with its own default. The two LLM windows start
+with **`stream` off** (the endpoints stream when the flag is omitted, but one Run here should show a
+single JSON), and the generate window adds a **`think`** checkbox (off by default) while the chat
+window exposes the OpenAI-compatible **`reasoning_effort`** (`none` disables thinking on Ollama). `systemone` and `websearch` also let you type a name the
+list does not carry, because those two endpoints never resolve the model through the gateway.
+The call is executed **server-side** (`POST /v1/management/api-test`): the console's session cookie is
+deliberately not a caller API key, so the gateway rebuilds the request and hands it to the same
+service the public route uses - alias injection, `num_ctx` clamping and the request log all behave
+exactly as they would for an external client, and a refusal the endpoint itself produced (a `404`
+unrouted model or disabled feature, a `400` invalid body, a `502`/`504` upstream failure) comes back
+with its own status instead of being hidden. An endpoint whose feature is switched off keeps
+its tester and shows `Disabled`; a response is capped at 128 KB. Extra credentials (an upstream
+`Authorization` header, `systemone.api_key_env`, `websearch.api_key_env`) appear as a read-only
+`••••••` row naming the variable they came from - the value never leaves the server.
 The Requests model filter narrows
 to the selected
 upstream. Every refresh is visibly in progress (spinning button, top progress bar, dimmed tiles,
@@ -546,12 +648,14 @@ curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overv
 
 | Path | Purpose |
 |------|---------|
-| `GET /v1/management/overview` | KPIs, upstream summary, running models with GPU / partial / CPU classification |
-| `GET /v1/management/upstreams[/{name}]` | Instance health, VRAM usage, `/api/ps` running models (hosted providers: every declared model with `device: "cloud"` and memory `null`) and the models `config.yaml` declares for that upstream — aliases applied, prefix wildcards expanded through the upstream's model list |
-| `GET /v1/management/models/{llm,rerank,systemone}` | Per-upstream model inventory built from `config.yaml` declarations, with runtime device and memory where the instance reports them (LLM; hosted rows report `device: "cloud"`), plus read-only config projections (Rerank / System One); API keys always masked as `••••••` |
+| `GET /v1/management/overview` | KPIs, upstream summary, running models with GPU / partial / CPU classification; a model declared under the root `aliases:` is appended as its own row (`derived: true`, device inherited from its target, memory `null`) while `kpi.running_models` still counts only the physical + hosted rows |
+| `GET /v1/management/upstreams[/{name}]` | Instance health, VRAM usage, `/api/ps` running models (hosted providers: every declared model with `device: "cloud"` and memory `null`; a derived alias of that upstream is appended as its own row) and the models `config.yaml` declares for that upstream — `model_aliases` renames applied, prefix wildcards expanded through the upstream's model list, the root `aliases:` names last |
+| `GET /v1/management/models/{llm,rerank,systemone}` | Per-upstream model inventory built from `config.yaml` declarations, with runtime device and memory where the instance reports them (LLM; hosted rows report `device: "cloud"`; a root `aliases:` entry is its own row carrying `derived` / `target` / `params` / `description`, and `aliases[].kind` tells a `rename` from a `derived` model), plus read-only config projections (Rerank / System One); API keys always masked as `••••••` |
 | `GET /v1/management/tools/websearch` | Web search config projection, with `base_url` derived from the provider upstream |
 | `GET /v1/management/requests[/{id}]` | Request log with time/upstream/model/status/path filters, pagination and per-entry detail |
 | `GET /v1/management/stats/{timeseries,distribution,failures}` | Hourly/daily counts, P95 and error counts; grouped counts per upstream / model / ok-vs-error for the three pie charts; failure breakdown by status and upstream |
+| `GET /v1/management/api-test/models` | Per-family model choices for the API testers (`api_models` narrowed; the Ollama-native `generate` / `embed_ollama` kinds keep `type: "ollama"` rows only), each row carrying `display` / `alias` / `upstream` / `running` / `device` and the masked upstream key, plus `default_model`, `free_model`, `enabled` and the masked provider key with its env-var name; the whole payload probes every upstream, so the console caches it and only refetches on **Re-probe** |
+| `POST /v1/management/api-test` | `{kind, body}` — execute that request server-side through the endpoint's own gateway service and return `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` → `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`; a `kind` outside the allowlist or a missing model for a family that needs one is `400`, and a gateway refusal comes back as data, not as a hidden failure |
 | `POST /v1/management/bench` | Start a speed test: `{upstream, model, rounds?, max_tokens?, think?}` → `{job_id, status: "pending"}`. Runs on its own thread + event loop, so closing the browser does not cancel it |
 | `GET /v1/management/bench/{job_id}` | `pending` / `running` (with `{completed, total, warmup}`) / `done` (full per-round payload) / `failed` (+ `error`) |
 | `GET /v1/management/bench/history?upstream=&model=` | The latest records kept for that upstream + model (3 by default) — the data behind the hover panel |

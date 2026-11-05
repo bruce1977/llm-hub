@@ -8,7 +8,7 @@ import ApiDoc from '@/components/ApiDoc.vue'
 import ConfigCard from '@/components/ConfigCard.vue'
 import TopBar from '@/components/TopBar.vue'
 import type { LlmModel, ToolsWebSearch } from '@/types/api'
-import type { ApiParam, ConfigRow } from '@/types/ui'
+import type { ApiParam, ConfigRow, TestField } from '@/types/ui'
 import { deviceBadge, fmtClock } from '@/utils/format'
 
 type Tab = 'models' | 'api'
@@ -36,6 +36,12 @@ function stateText(m: LlmModel): string {
   return m.running ? t('common.running') : t('common.notLoaded')
 }
 
+/** A derived model is a name of its own, so the hover points at the model it runs on. */
+function rowTitle(m: LlmModel): string | undefined {
+  if (m.derived) return t('common.derivedFrom', { target: m.target ?? '' })
+  return m.alias ? t('common.realModel', { model: m.model }) : undefined
+}
+
 const params = computed<ApiParam[]>(() => [
   { name: 'query', type: 'string', required: true, desc: t('webSearch.params.query') },
   {
@@ -50,6 +56,24 @@ const params = computed<ApiParam[]>(() => [
   { name: 'recency', type: 'string', required: false, desc: t('webSearch.params.recency') },
   { name: 'synthesize', type: 'boolean', required: false, desc: t('webSearch.params.synthesize') },
   { name: 'include_sources', type: 'boolean', required: false, desc: t('webSearch.params.includeSources') },
+])
+
+// The provider receives the body unchanged, so every documented field is editable here. The
+// selector may also take a typed name, because `model` is an opencode-port model, not one of
+// the gateway's configured routes - and it may stay empty, which lets the provider choose.
+const testFields = computed<TestField[]>(() => [
+  { key: 'query', label: t('webSearch.params.query'), type: 'text', required: true, def: 'llm-hub gateway usage' },
+  { key: 'top_k', label: t('webSearch.params.topK'), type: 'number', def: '5' },
+  { key: 'max_chars_per_page', label: t('webSearch.params.maxCharsPerPage'), type: 'number' },
+  { key: 'locale', label: t('webSearch.params.locale'), type: 'text', def: 'zh-CN' },
+  {
+    key: 'recency',
+    label: t('webSearch.params.recency'),
+    type: 'select',
+    options: ['', 'day', 'week', 'month', 'year'],
+  },
+  { key: 'synthesize', label: t('webSearch.params.synthesize'), type: 'bool', def: 'false' },
+  { key: 'include_sources', label: t('webSearch.params.includeSources'), type: 'bool' },
 ])
 
 const requestExample = {
@@ -217,10 +241,11 @@ onMounted(load)
           </thead>
           <tbody>
             <tr v-for="m in models" :key="`${m.upstream}/${m.model}`">
-              <td class="mono" :title="m.alias ? t('common.realModel', { model: m.model }) : undefined">
+              <td class="mono" :title="rowTitle(m)">
                 {{ m.display }}
                 <span v-if="m.wildcard" class="chip s2" :title="t('common.wildcardTip')">wildcard</span>
                 <span v-if="m.alias" class="chip s2" :title="t('common.aliasTip')">alias</span>
+                <span v-if="m.derived" class="chip s2" :title="t('common.derivedTip')">derived</span>
               </td>
               <td>{{ m.upstream }}</td>
               <td><span class="chip">{{ m.type }}</span></td>
@@ -274,6 +299,7 @@ onMounted(load)
           body: responseExample,
         }"
         :note="t('webSearch.docs.note')"
+        :tester="{ kind: 'websearch', fields: testFields }"
       />
     </template>
   </template>

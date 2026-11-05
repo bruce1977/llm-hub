@@ -195,7 +195,9 @@ class ProxyService:
                 body = None
 
         path_clean = path.strip("/")
-        logging_on = self._logging_on(cfg)
+        # A HEAD carries no body and no answer, and monitors send it continuously, so it is
+        # forwarded but never recorded - the log is for calls, not for liveness probes.
+        logging_on = self._logging_on(cfg) and method != "HEAD"
         req_text, req_trunc = sanitize_body(raw_body) if logging_on else (None, False)
         requested = (body or {}).get("model")
         meta: dict[str, Any] = {

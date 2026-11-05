@@ -51,7 +51,7 @@ BATCH_SIZE = 100
 _DISTRIBUTION_KEYS = {
     "upstream": "COALESCE(upstream, '-')",
     "model": "COALESCE(model, '-')",
-    "status": "CASE WHEN status >= 400 THEN 'error' ELSE 'ok' END",
+    "status": "CASE WHEN status >= 500 THEN 'error' ELSE 'ok' END",
 }
 
 _SENSITIVE_KEYS = {
@@ -361,6 +361,7 @@ class RequestLog:
         model: str | None,
         status: str | None,
         path: str | None,
+        method: str | None = None,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -374,11 +375,17 @@ class RequestLog:
             clauses.append("upstream = ?")
             params.append(upstream)
         if model:
-            clauses.append("model = ?")
+            # Match both the resolved real model id and the alias the client actually sent,
+            # so a `model_aliases` rename and its real target are filtered as one group.
+            clauses.append("(model = ? OR requested_model = ?)")
+            params.append(model)
             params.append(model)
         if path:
             clauses.append("path LIKE ?")
             params.append(f"%{path}%")
+        if method:
+            clauses.append("method = ?")
+            params.append(method)
         if status:
             ranges = {"2xx": (200, 299), "3xx": (300, 399), "4xx": (400, 499), "5xx": (500, 599)}
             low, high = ranges[status]
@@ -406,6 +413,7 @@ class RequestLog:
         model: str | None = None,
         status: str | None = None,
         path: str | None = None,
+        method: str | None = None,
         page: int = 1,
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> dict[str, Any]:
@@ -417,6 +425,7 @@ class RequestLog:
             model=model,
             status=status,
             path=path,
+            method=method,
             page=page,
             page_size=page_size,
         )
@@ -430,15 +439,16 @@ class RequestLog:
         model: str | None,
         status: str | None,
         path: str | None,
+        method: str | None = None,
         page: int,
         page_size: int,
     ) -> dict[str, Any]:
-        where, params = self._where(start, end, upstream, model, status, path)
+        where, params = self._where(start, end, upstream, model, status, path, method)
         error_clause = " AND " if where else " WHERE "
         with self._db() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM requests{where}", params).fetchone()[0]
             errors = conn.execute(
-                f"SELECT COUNT(*) FROM requests{where}{error_clause}status >= 400", params
+                f"SELECT COUNT(*) FROM requests{where}{error_clause}status >= 500", params
             ).fetchone()[0]
             stats = {
                 "count": total,
@@ -481,7 +491,7 @@ class RequestLog:
         sql = f"""
             WITH base AS (
                 SELECT strftime('{fmt}', ts) AS bucket, duration_ms,
-                       CASE WHEN status >= 400 THEN 1 ELSE 0 END AS is_err
+                       CASE WHEN status >= 500 THEN 1 ELSE 0 END AS is_err
                 FROM requests WHERE ts >= ? AND ts <= ?
             ), ranked AS (
                 SELECT bucket, duration_ms, is_err,
@@ -532,7 +542,7 @@ class RequestLog:
     def _failures_sync(self, start: str, end: str) -> dict[str, Any]:
         where = " WHERE ts >= ? AND ts <= ?"
         params = (start, end)
-        error_where = f"{where} AND status >= 400"
+        error_where = f"{where} AND status >= 500"
         with self._db() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM requests{where}", params).fetchone()[0]
             errors = conn.execute(f"SELECT COUNT(*) FROM requests{error_where}", params).fetchone()[0]
@@ -583,7 +593,7 @@ class RequestLog:
         with self._db() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM requests{where}", params).fetchone()[0]
             errors = conn.execute(
-                f"SELECT COUNT(*) FROM requests{where}{error_clause}status >= 400", params
+                f"SELECT COUNT(*) FROM requests{where}{error_clause}status >= 500", params
             ).fetchone()[0]
             p95 = self._percentile(conn, where, params, total, 95)
             row = conn.execute(f"SELECT {token_sum} FROM requests{where}", params).fetchone()

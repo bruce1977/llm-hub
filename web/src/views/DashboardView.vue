@@ -21,6 +21,7 @@ import type {
   TimeseriesPoint,
 } from '@/types/api'
 import {
+  daysAgoStartInput,
   deviceBadge,
   fmtBucket,
   fmtClock,
@@ -29,8 +30,7 @@ import {
   fmtMs,
   fmtPct,
   fromInputValue,
-  hoursAgoInput,
-  nowInputValue,
+  todayEndInput,
 } from '@/utils/format'
 
 const POLL_MS = 60000
@@ -45,7 +45,7 @@ const pies = ref<{
   status: DistributionItem[]
 }>({ upstream: [], model: [], status: [] })
 const bucket = ref<Bucket>('hour')
-const range = reactive({ start: hoursAgoInput(24), end: nowInputValue() })
+const range = reactive({ start: daysAgoStartInput(7), end: todayEndInput() })
 const lastUpdated = ref('')
 const loadError = ref('')
 // `refreshing` drives the header ring and the chart veil; `loaded` separates "never had
@@ -57,6 +57,11 @@ let timer: ReturnType<typeof setInterval> | null = null
 const kpi = computed<Partial<Kpi>>(() => overview.value?.kpi ?? {})
 const upstreams = computed<ProbeResult[]>(() => overview.value?.upstreams ?? [])
 const running = computed<RunningModel[]>(() => overview.value?.running_models ?? [])
+
+function runningTitle(m: RunningModel): string | undefined {
+  if (m.derived) return t('common.derivedFrom', { target: m.target ?? '' })
+  return m.alias ? t('common.realModel', { model: m.model }) : undefined
+}
 const logState = computed<RequestLogState | null>(() => overview.value?.request_log ?? null)
 const onlineNames = computed(() =>
   upstreams.value
@@ -274,9 +279,23 @@ onBeforeUnmount(() => {
   >
     <template #actions>
       <div class="range-pick">
-        <input v-model="range.start" type="datetime-local" class="dt" />
+        <el-date-picker
+          v-model="range.start"
+          type="datetime"
+          format="YYYY-MM-DD HH:mm:ss"
+          value-format="YYYY-MM-DDTHH:mm:ss"
+          :clearable="false"
+          size="small"
+        />
         <span class="arrow">→</span>
-        <input v-model="range.end" type="datetime-local" class="dt" />
+        <el-date-picker
+          v-model="range.end"
+          type="datetime"
+          format="YYYY-MM-DD HH:mm:ss"
+          value-format="YYYY-MM-DDTHH:mm:ss"
+          :clearable="false"
+          size="small"
+        />
         <button class="apply" @click="refresh()">{{ t('common.apply') }}</button>
       </div>
     </template>
@@ -377,9 +396,10 @@ onBeforeUnmount(() => {
         </thead>
         <tbody>
           <tr v-for="m in running" :key="`${m.upstream}/${m.model}`">
-            <td class="mono" :title="m.alias ? t('common.realModel', { model: m.model }) : undefined">
+            <td class="mono" :title="runningTitle(m)">
               {{ m.display }}
               <span v-if="m.alias" class="chip s2" :title="t('common.aliasTip')">alias</span>
+              <span v-if="m.derived" class="chip s2" :title="t('common.derivedTip')">derived</span>
             </td>
             <td>{{ m.upstream }}</td>
             <td><span class="badge" :class="deviceBadge(m.device, m.device_ratio).cls">{{ deviceBadge(m.device, m.device_ratio).text }}</span></td>

@@ -688,6 +688,9 @@ data: [DONE]
 
 ## 别名参数注入
 
+> 根 `aliases:` 的每一项都是**一个独立模型**（有自己的固化参数），Web 管理台会把它单独列成一行；
+> 只想给某个已有模型改个短名、不带参数，用 `upstreams[].model_aliases`。
+
 ### 测试 18: 使用禁用思考的别名
 
 **请求:**
@@ -1222,10 +1225,11 @@ curl -b cookie.txt http://localhost:8000/v1/management/upstreams/ollama
 - `tokens_today` 是今天（UTC）已记录请求的 token 合计，优先取 `tokens`，缺失时回退 `tokens_in + tokens_out`；
   没有 usage 的行（如流式响应）不计入
 - `upstreams/{name}`：名字不存在 -> `404`；探测失败 -> `503` 且响应体带 `"unreachable": true`；
-  可达时额外返回 `models`（该上游在 `config.yaml` 声明的模型，配了别名的以别名显示，前缀通配用
-  `main.fetch_upstream_models()` 展开成命中的具体模型）与 `running_models`（Ollama 为 `/api/ps`
-  的运行态，含设备、显存/占用与别名；`opencode` 类型探测有效时列出它声明的全部模型，设备与显存为
-  `null`）
+  可达时额外返回 `models`（该上游在 `config.yaml` 声明的模型，`model_aliases` 短名作为显示名，前缀通配用
+  `main.fetch_upstream_models()` 展开成命中的具体模型，末尾追加归属于该上游的根 `aliases:` 派生模型名）与
+  `running_models`（Ollama 为 `/api/ps` 的运行态，含设备、显存/占用与别名；`opencode` 类型探测有效时列出
+  它声明的全部模型，设备与显存为 `null`；派生模型行 `derived: true`，设备沿用目标模型、`size_gib`/`vram_gib`
+  为 `null`，只在目标驻留或上游为可达的托管 provider 时才出现）
 
 ### 测试 36: 配置投影与凭据脱敏
 
@@ -1239,11 +1243,18 @@ curl -b cookie.txt http://localhost:8000/v1/management/models/systemone
 - `models/llm`：行只来自 `config.yaml` 的 `upstreams[].models`——声明的普通名字原样成行（实例里装了
   但没声明的模型不列，网关本来就路由不到它们），前缀通配（`qwen3:*`、`opencode/*`）复用
   `main.fetch_upstream_models()`（60s 缓存）展开成命中的具体模型并标 `wildcard: true`；展开不到任何
-  模型时保留通配本身成一行且 `running: false`。`models[]` 每项含 `model`（真实 id）、`display`
-  （配置了别名则是别名，否则即声明名）、`alias`、`upstream`、`type`、`wildcard`、`running`、`device`、
-  `device_ratio`、`num_ctx`、`size_gib`、`vram_gib`；只有驻留行才有设备与内存，`opencode` 上游探测有效
-  即其声明的模型全部 `running: true`、`device: "cloud"`、内存为 `null`，离线上游只贡献声明名且 `running: false`。
-  另返回 `aliases[]`（别名 / 目标 / 上游）与 `num_ctx_overrides`
+  模型时保留通配本身成一行且 `running: false`。根 `aliases:` 的派生模型是**独立一行**，紧跟在它的目标
+  模型之后（目标未被任何上游声明时排在末尾）。`models[]` 每项含 `model`（真实 id，派生行则是别名名）、
+  `display`（`model_aliases` 短名，否则即声明名）、`alias`、`derived`、`upstream`、`type`、`wildcard`、
+  `running`、`device`、`device_ratio`、`num_ctx`、`size_gib`、`vram_gib`，派生行另带 `target` / `params` /
+  `description`；只有驻留行才有设备与内存，`opencode` 上游探测有效
+  即其声明的模型全部 `running: true`、`device: "cloud"`、内存为 `null`，离线上游只贡献声明名且 `running: false`；
+  派生行的设备沿用目标模型的运行态、`size_gib`/`vram_gib` 恒为 `null`。
+  另返回 `aliases[]`（别名 / `kind`（`rename` 或 `derived`）/ 目标 / 上游 / `params` / `description`）与
+  `num_ctx_overrides`
+- `overview`：`running_models` 列表在驻留模型与托管模型之后追加根 `aliases:` 的派生行，而
+  `kpi.running_models` 只数前者，所以「列表比 KPI 多几行」是设计——派生模型与目标共用同一个实例，
+  计入 KPI 或显存都会重复计数
 - `models/rerank`：`enabled`、`endpoint`、`mode`、`upstream_api`（`auto` / `generate` / `chat`）、
   `on_error`（`score_zero` / `fail`）、`models[]`、`scoring`、`limits`，外加可直接复制的
   `request_example` / `response_example`
@@ -1391,6 +1402,10 @@ curl -b cookie.txt http://localhost:8000/v1/management/overview
 - 改回 `true` 后，越过约 1 秒的热加载窗口，下一条请求即入库（无需重启容器）
 - 自动化用例里直接调用 `ConfigManager.reload()` 跳过该窗口；对真实服务需等待或先发一次探测请求
 - 旧版本留下的 `llmhub.db` 在启动时自动 `ALTER TABLE ADD COLUMN` 补上新列，历史行不受影响
+- **`HEAD` 只转发不记录**：把 `HEAD` 加进 `security.allowed_http_methods` 后
+  `curl -I -H "X-API-Key: ..." http://localhost:8000/api/version` 正常返回 `200`，但
+  `/requests` 里没有这一行（同样的 `GET` 会有一行）。默认白名单只有 `GET` / `POST` 时
+  HEAD 直接 `405`，根本到不了代理
 
 ### 测试 40: Web Search 配置投影
 
@@ -1479,4 +1494,123 @@ curl -i http://localhost:8000/v1/management/overview
 - `/admin` 与 `/v1/management` 一样豁免 `security.path_allowlist`，但仍受方法白名单约束
   （`DELETE /admin/` -> `405`）
 - 前端只在 **401** 时登出并跳回登录页；`503` 视为业务答复（上游不可达 / 密码未配置 / 未构建）
+
+### 测试 42: 接口测试窗口（`api-test`）与 `api_models`
+
+管理台每个「API 用法」标签页里，「请求参数」标题右侧的**测试**按钮会打开浮层里的测试窗口，
+请求交给网关自己的服务执行（实现在 `app/api_test.py`，路由在 `app/management.py`）。
+
+```bash
+# 1. 每类 API 能选哪些模型、默认值、是否需要额外密钥
+curl -b cookie.txt http://localhost:8000/v1/management/api-test/models
+
+# 2. 用根 `aliases:` 里的派生模型发一笔 /api/generate（qwen3:8b-nothink → qwen3:8b + think:false）
+curl -b cookie.txt http://localhost:8000/v1/management/api-test \
+  -H "Content-Type: application/json" \
+  -d '{"kind": "generate", "body": {"model": "qwen3:8b-nothink", "prompt": "hi", "stream": true}}'
+
+# 3. 白名单之外的 kind
+curl -b cookie.txt http://localhost:8000/v1/management/api-test \
+  -H "Content-Type: application/json" -d '{"kind": "delete", "body": {}}'
+```
+
+**`/api-test/models` 响应 (200 OK，节选):**
+
+```json
+{
+  "kinds": {
+    "generate": {
+      "kind": "generate", "method": "POST", "endpoint": "/api/generate",
+      "family": "generate", "model_required": true, "free_model": false,
+      "enabled": true, "source": "upstreams[].models",
+      "models": [
+        { "model": "qwen3:8b", "display": "q35", "alias": "q35", "upstream": "ollama-gpu",
+          "type": "ollama", "running": true, "device": "gpu", "api_key": null, "unknown": false },
+        { "model": "qwen3.5:4b-nothink", "display": "qwen3.5:4b-nothink", "derived": true,
+          "target": "qwen3.5:4b", "running": true, "device": "gpu", "unknown": false }
+      ],
+      "default_model": "qwen3:8b", "api_key": null, "api_key_env": null
+    },
+    "websearch": {
+      "kind": "websearch", "endpoint": "/v1/tools/web-search", "family": "websearch",
+      "model_required": false, "free_model": true, "enabled": true,
+      "source": "upstreams[].models (search provider)",
+      "default_model": null, "api_key": "••••••", "api_key_env": "OPENCODE_API_KEY"
+    }
+  },
+  "max_response_bytes": 131072
+}
+```
+
+**`POST /api-test` 响应 (200 OK，节选):**
+
+```json
+{
+  "kind": "generate", "method": "POST", "endpoint": "/api/generate", "stream": true,
+  "requested_model": "qwen3:8b-nothink", "model": "qwen3:8b", "upstream": "ollama-gpu",
+  "injected": { "think": false },
+  "status": 200, "ok": true, "duration_ms": 812, "ttft_ms": 260,
+  "content_type": "application/x-ndjson",
+  "body": null, "text": "{\"model\":\"qwen3:8b\",\"response\":\"h\"}\n...",
+  "truncated": false, "error": null
+}
+```
+
+**断言:**
+
+- `KINDS` 是**封闭白名单**：`generate` / `chat` / `embed_ollama` / `embed_openai` / `rerank` /
+  `systemone` / `websearch`。其它 `kind` → **400** 并列出可选值，绝不会变成一个任意 URL 的转发器
+- `model_required` 的家族没给 `model`（或给了空白串）→ 路由层 **400** `'…' needs a model; pick one
+  in the selector.`；`systemone` / `websearch` 的 `model` 可省略，所以它们 `model_required: false`
+  且 `free_model: true`（前端选择框允许直接输入配置里没有的名字）
+- 请求走的是网关自己的服务：别名解析与参数注入（`injected`）、`num_ctx_overrides` 收敛、被屏蔽的
+  管理路径、请求明细落库都与真实客户端一致；`requested_model` / `model` / `upstream` 把「实际发出去
+  的是什么」摊开写清楚，而不是让调用方猜
+- `stream` 是**网关选定的传输方式**（省略 `stream` 时即 `STREAM_BY_DEFAULT` 的结果），与请求明细里
+  的 `stream` 列同一个值，网关不会往请求体里注入这个字段；响应到底真是分块回来的，看
+  `content_type`（`application/x-ndjson` / `text/event-stream`），前端只在它命中时才显示流式与首
+  token 徽标
+- 端点自己给出的拒绝答复（如上游不可达的 **502**、功能已停用的 **404**）作为**结果数据**返回，
+  信封里带着它的 `status` 与 `body`，而不是让 `/api-test` 报错——测试窗口显示的正是外部客户端会看到
+  的东西
+- 响应体上限 `max_response_bytes = 128 KB`，超出时 `truncated: true`；流式响应读完即关闭生成器，
+  所以下游那一笔的日志行照常写入
+- 凭据不外泄：需要额外签名的家族只返回固定掩码 `••••••` 与变量名 `api_key_env`；被代理调用的上游
+  如果是请求头签名，掩码逐模型行给（`models[].api_key`），值永远不出服务器
+- `api_models.<family>` 决定选项：留空按 `rerank.models` → `systemone.model` → 可调用池的顺序推导，
+  `source` 回报这次用了哪个来源；`models[].display` 有别名显示别名、没有就显示配置名，但选择框里
+  **只显示这个名字**，上游/设备/运行状态放在悬停提示；写了没有任何上游服务的名字时该行保留并标
+  `unknown: true`（配置错误要显示出来而不是被藏掉）
+- `api_models.generate` 为空时，被**其它家族显式认领**的名字（连同解析后的目标名）不会出现在
+  generate/chat 里：`api_models.embed` / `rerank` / `systemone` 与 `rerank.models` 都算，空字符串
+  条目不算认领；匹配忽略结尾的 `:latest`（`systemone: ["tev1"]` 能挡住声明的 `tev1:latest`）。
+  `api_models.websearch` **不算认领**——搜索端点本质是聊天透传，托管 provider 的路由模型
+  （`opencode/auto`）与它的别名必须继续出现在 chat 里（`test_management.py` 用
+  `websearch: ["qwen3:8b"]` 断言 `qwen3:8b`、`q35` 仍在，同时 websearch 家族自己的列表照常是
+  `qwen3:8b`）。兜底来源（如 `systemone.model`）同样不算认领。显式写出来的
+  `api_models.generate` 原样使用
+- `/api/generate` 与 `/api/embed` 是 **Ollama 原生方言**，`lmstudio` / `opencode` 上游只实现 `/v1`
+  一侧，所以这两个家族按空列表推导时只保留 `type: "ollama"` 的行：`opencode` 模型出现在
+  `chat` / `embed_openai` 的选择框里，但不会出现在 `generate` / `embed_ollama` 里（否则一发就是
+  上游 404）。`test_management.py` 用一个 `type: "lmstudio"`、`models: ["lm-model"]` 的上游断言
+  两个方向；显式 `api_models` 列表仍按原样返回，写错的名字作为可见的配置问题保留
+- 表单**一打开就带着初始值**：有 `def` 的字段直接填入，`select` 没有默认值时显示「（未设置）」
+  而不是空白；「恢复默认值」重新填入、「清空」清空全部字段与模型选择。**有 `def` 的布尔参数
+  渲染为复选框，勾选/不勾选都显式发送 `true` / `false`**（不勾选 ≠ 不发送），没有 `def` 的布尔
+  仍是三态下拉（System One 的可选 `stream` 因此还能留空）。两个 LLM 窗口的 `stream` 默认 `false`，
+  请求体预览里能直接看到 `"stream": false`；generate 窗口的 `think` 默认 `false`，chat 窗口的
+  `reasoning_effort` 默认不设置（`none` 在 Ollama 上关闭思考）。其余清空的字段不会进入请求体
+- **模型用真正的下拉框选择**：打开时选中 `default_model`，选项即该家族的候选列表；`free_model`
+  家族（System One / Web Search）在下拉末尾多一项「自定义模型…」，选中后在下方出现手输输入框
+  （自动聚焦、带 `<datalist>` 候选），再选回列表里的名字就收起。旧版把默认值填在输入框里，
+  Chromium 按框内文字过滤 datalist，其它候选根本看不见
+- **模型可以清除**：字段旁的 ×（或 select 里的空白项）把它清掉后，请求体预览里没有 `model`；
+  `model_required` 的家族在发送前被本地拦下（「请先选择模型」），`free_model` 家族则把请求
+  发出去交给端点决定；「恢复默认值」重新选中 `default_model`，「清空」也清掉模型
+- System One 配置投影里的 `request_example` 用 **object** 形式的 `choice.criteria`——Ollama 0.40+
+  收到数组会回 **400**（`"criteria" must be a non-empty object`），laya-server 两种都接受，所以
+  object 是两个后端都能直接跑通的写法
+- 五个页面共用 `useApiTestContext()` 的模块级缓存，`/api-test/models` 一次探测所有上游，所以切换
+  标签页不会反复压上游；只有首次进入与点击「重新探测」才会再取一次
+
 

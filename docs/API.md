@@ -655,6 +655,7 @@ curl http://localhost:8888/v1/chat/completions \
 | `temperature` | float | ❌ | 温度参数 (0-2) |
 | `max_tokens` | integer | ❌ | 最大生成 token 数 |
 | `stream` | boolean | ❌ | 是否流式返回 |
+| `reasoning_effort` | string | ❌ | OpenAI 兼容的思考强度（`none` / `low` / `medium` / `high`）；Ollama 用 `none` 关闭思考，不传由后端决定 |
 | `tools` | array | ❌ | 工具定义列表 |
 
 **响应 (200 OK)：**
@@ -753,6 +754,7 @@ curl http://localhost:8888/api/chat \
 | `images` | array | ❌ | 视觉模型的 base64 图片列表 |
 | `format` | `"json"` / object | ❌ | 结构化输出：`json` 或直接给 JSON schema |
 | `stream` | boolean | ❌ | **缺省即流式**（与 Ollama 一致，返回 NDJSON）；`false` 返回单个 JSON 对象 |
+| `think` | boolean | ❌ | Ollama 原生思考开关：`false` 关闭思考（响应不含 `thinking`），缺省由模型决定 |
 | `keep_alive` | string/number | ❌ | 模型驻留时长，如 `"3m"` |
 | `logprobs` / `top_logprobs` | boolean / int(1-20) | ❌ | 逐 token 对数概率及其候选数 |
 | `options` | object | ❌ | `temperature` / `top_p` / `num_predict` / `num_ctx` / `seed` / `stop` …；`num_ctx` 可能被 `num_ctx_overrides` 覆盖 |
@@ -908,10 +910,10 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 | `POST` | `/v1/management/auth/login` | Body `{"password": "..."}`；成功 `200` 并下发 Cookie，密码错误 `401` |
 | `POST` | `/v1/management/auth/logout` | 清除会话 Cookie |
 | `GET` | `/v1/management/auth/ping` | 受保护心跳，返回 `{"ok": true, "admin": true}` |
-| `GET` | `/v1/management/overview` | KPI（含今日请求数与今日 token 合计 `tokens_today`）、上游摘要、可用模型清单（Ollama 取 `/api/ps` 的驻留模型；OpenCode 这类托管上游没有 `/api/ps`，探测成功时把它声明的模型一并计入，设备为 `"cloud"`、显存为 `null`），每行含 `model` / `display`（配置了别名时用别名）/ `alias`；另有 `request_log` 开关与库信息 |
+| `GET` | `/v1/management/overview` | KPI（含今日请求数与今日 token 合计 `tokens_today`）、上游摘要、可用模型清单（Ollama 取 `/api/ps` 的驻留模型；OpenCode 这类托管上游没有 `/api/ps`，探测成功时把它声明的模型一并计入，设备为 `"cloud"`、显存为 `null`；根 `aliases:` 的派生模型再追加在末尾，`derived: true`、设备沿用目标模型、显存为 `null`，`kpi.running_models` 不重复计它们），每行含 `model` / `display`（`model_aliases` 短名）/ `alias`；另有 `request_log` 开关与库信息 |
 | `GET` | `/v1/management/upstreams` | 上游实例列表（状态 / 已加载数 / 显存 / 探测延迟） |
-| `GET` | `/v1/management/upstreams/{name}` | 单实例详情：`models` 取自 `config.yaml` 的 `upstreams[].models`（有别名时以别名显示），前缀通配（如 `opencode/*`）用与路由同一个发现结果展开成具体模型；`running_models` 是 `/api/ps` 的运行中模型（含设备与显存/占用），托管上游则列出它声明的模型（设备为 `"cloud"`、显存为 `null`）；不可达返回 `503` 且带 `"unreachable": true` |
-| `GET` | `/v1/management/models/llm` | 逐上游的模型清单，来源是 `config.yaml` 的 `upstreams[].models`（实例上装了但没声明的模型不列出，因为它们本来就走不通网关）；前缀通配按发现结果展开。每行 `model`（真实 id）/ `display`（别名，无别名时即声明名）/ `alias` / `wildcard`（由通配展开而来）/ `running` / `device` / `device_ratio` / `num_ctx` / `size_gib` / `vram_gib`；OpenCode 上游探测有效即全部 `running: true`，设备为 `"cloud"` 且显存为 `null`。另有 `aliases`（别名 / 目标 / 上游）与 `num_ctx_overrides` |
+| `GET` | `/v1/management/upstreams/{name}` | 单实例详情：`models` 取自 `config.yaml` 的 `upstreams[].models`（`model_aliases` 短名作为显示名），前缀通配（如 `opencode/*`）用与路由同一个发现结果展开成具体模型，末尾追加归属于该上游的根 `aliases:` 派生模型名；`running_models` 是 `/api/ps` 的运行中模型（含设备与显存/占用），托管上游则列出它声明的模型（设备为 `"cloud"`、显存为 `null`），派生模型行 `derived: true`（设备沿用目标模型、显存 `null`）；不可达返回 `503` 且带 `"unreachable": true` |
+| `GET` | `/v1/management/models/llm` | 逐上游的模型清单，来源是 `config.yaml` 的 `upstreams[].models`（实例上装了但没声明的模型不列出，因为它们本来就走不通网关）；前缀通配按发现结果展开，根 `aliases:` 的派生模型作为独立一行紧跟其目标模型。每行 `model`（真实 id，派生行是别名名）/ `display`（`model_aliases` 短名，无则即声明名）/ `alias` / `derived` / `wildcard`（由通配展开而来）/ `running` / `device` / `device_ratio` / `num_ctx` / `size_gib` / `vram_gib`，派生行另带 `target` / `params` / `description` 且显存为 `null`；OpenCode 上游探测有效即全部 `running: true`，设备为 `"cloud"` 且显存为 `null`。另有 `aliases`（别名 / `kind`：`rename` 只改名、`derived` 是带固化参数的独立模型 / 目标 / 上游 / `params` / `description`）与 `num_ctx_overrides` |
 | `GET` | `/v1/management/models/rerank` | Rerank 配置投影（`api_key` 一律掩码为 `••••••`），含 `upstream_api` / `on_error` 与请求/响应示例 |
 | `GET` | `/v1/management/models/systemone` | System One 配置投影（同样掩码），含请求/SSE 示例 |
 | `GET` | `/v1/management/tools/websearch` | Web Search 配置投影：`enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url`（由 provider upstream 派生）/ `api_key_env` / `api_key`（掩码）/ `timeout` / `provider_configured` |
@@ -920,6 +922,8 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 | `GET` | `/v1/management/stats/timeseries` | 时序聚合：`bucket=hour\|day`，每桶 `count` / `errors` / `p95` |
 | `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count}]}`；`status` 只分 `ok`(<400) / `error`(≥400)，未命中上游的行计入 `-` |
 | `GET` | `/v1/management/stats/failures` | 失败统计：`by_code` / `by_upstream` / `samples` |
+| `GET` | `/v1/management/api-test/models` | 每个 API 家族的可用模型、默认值与掩码密钥：`kinds` 以 `generate` / `chat` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch` 为键，每键含 `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source`（选项来自哪个配置项）/ `models[]`（`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key`（掩码）/ `unknown`）/ `default_model` / `api_key`（掩码）/ `api_key_env`；顶层另有 `max_response_bytes`。`api_models` 为空时按配置推导；`/api/...` 原生端点（`generate`、`embed_ollama`）只列 `type: "ollama"` 上游的模型，`/v1/...` 端点（`chat`、`embed_openai`）也列 `lmstudio` / `opencode` 的模型；显式 `api_models` 列表按原样返回。一次探测所有上游，所以前端整站共用一份缓存，只在首次打开与点击「重新探测」时取 |
+| `POST` | `/v1/management/api-test` | Body `{"kind": "generate", "body": {...}}`；服务端用网关自己的服务发出这一笔请求，返回信封 `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`。`kind` 不在白名单、或需要模型的家族没给 `model` → `400` |
 | `POST` | `/v1/management/bench` | 启动一次模型测速任务，Body `{"upstream": "...", "model": "...", "rounds"?: 4, "max_tokens"?: 500, "think"?: "auto"}`，立即返回 `{"job_id": "...", "status": "pending"}`；任务在后台跑 |
 | `GET` | `/v1/management/bench/history` | 该 `upstream` + `model` 最近的 **3** 份测速记录（`?upstream=&model=`），按时间倒序，每行含 `decode_tok_s` / `decode_sd` / `prefill_tok_s` / `ttft_ms` / `timing_source` 与完整 `payload`。**注册顺序在 `/bench/{job_id}` 之前**，否则 "history" 会被当成 job_id |
 | `GET` | `/v1/management/bench/{job_id}` | 轮询任务状态：`status` 为 `pending` / `running` / `done` / `failed`，`progress` 为 `{completed, total, warmup}`，完成时 `result` 含各轮明细与 `steady` 汇总，失败时 `error` 给出原因 |
@@ -929,7 +933,7 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 | 码 | 场景 |
 |----|------|
 | `200` | 正常 |
-| `400` | 时间格式非法、`start > end`、`page`/`page_size`/`status`/`bucket`/`group_by` 取值非法 |
+| `400` | 时间格式非法、`start > end`、`page`/`page_size`/`status`/`bucket`/`group_by` 取值非法、`api-test` 的 `kind` 不在白名单或该家族要求模型却没给 `model` |
 | `401` | 既无有效会话 Cookie 也无网关 API Key；或登录密码、用户名错误；或把 `ADMIN_PASSWORD` 当成请求头凭据 |
 | `404` | `upstream` 名称或请求记录 `id` 不存在 |
 | `503` | 未配置 `ADMIN_PASSWORD`；探测的上游不可达（`upstreams/{name}`）；`/admin` 的前端尚未构建（`app/web` 缺失） |
@@ -981,6 +985,9 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 - 旧库自动升级：启动时比对 `PRAGMA table_info(requests)`，缺失的列用 `ALTER TABLE ADD COLUMN` 补齐。
 - 写入通过有界内存队列异步批量落盘，不阻塞转发主链路；队列满时丢弃并告警。
 - 请求/响应体截断至 8 KB，`authorization`、`api_key`、`token`、`password` 等字段在落库前替换为 `***`。
+- **`HEAD` 请求只转发、不记录**：它没有请求体也没有响应体，且监控探活会持续发送，记下来只会淹没真实
+  调用。转发路径照旧，写入判定只在 `logging_on = self._logging_on(cfg) and method != "HEAD"` 一处。
+  （按默认的 `allowed_http_methods: [GET, POST]`，HEAD 根本到不了代理，直接 `405`。）
 
 **模型测速（bench，实现在 `app/bench.py` + `app/bench_store.py`）：**
 
@@ -1010,9 +1017,53 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 任务跑在**独立线程 + 独立事件循环**里，不占用 `POST /bench` 那个请求的生命周期；结果行先入写队列再置 `done`，
 `/bench/history` 读之前会先 flush 队列，所以「状态刚变 done 就查历史」也能读到记录。
 
+**接口测试（api-test，实现在 `app/api_test.py`）：**
+
+管理台每个 API 文档块的「请求参数」标题右侧都有一个**测试**按钮，点开是浮层里的测试窗口
+（不是嵌在文档下方），但浏览器不能直接调业务端点：`/api/generate`、
+`/v1/rerank` 这些路径校验的是**调用方** API Key，而管理台的会话 Cookie 故意不是（见
+`admin_auth.require_admin`）。所以请求在**服务端**执行——`POST /v1/management/api-test` 把
+页面填好的 body 重建成一个真实的 ASGI `Request`，交给网关处理该端点用的**同一个服务**
+（`ProxyService.forward` / `RerankService.handle` / `SystemOneService.handle` /
+`WebSearchService.handle`）。别名解析、固化参数注入、`num_ctx_overrides` 收窄、被封禁的
+路径、请求明细入库全都与外部调用者一致，页面显示的就是 API 真实行为。
+
+- `KINDS` 是**封闭白名单**（7 个 kind 映射到 `proxy` / `rerank` / `systemone` / `websearch`
+  四类执行器），每个 kind 的上游仍由正常路由决定，因此这一组路由不会被改写成访问任意地址的代理。
+- 模型选择框按 `api_models` 的家族收窄（见 USAGE 的配置参考）：每个选项**只列名字或别名**，
+  上游、设备与运行状态放在悬停提示里；被其它家族显式认领的名字不再出现在 generate/chat 里
+  （`api_models.embed` / `rerank` / `systemone` 与 `rerank.models`，比较时忽略 `:latest`）。
+  `api_models.websearch` 不算认领——搜索端点本质是聊天透传，托管 provider 的路由模型
+  （如 `opencode/auto`）必须继续可选；`systemone.model` 这类兜底同样不算。
+  `free_model`（`systemone` 的 laya-server 枚举、`websearch` 的 opencode-port 模型 id）的下拉
+  末尾多一项「自定义模型…」，选中后换成可手输的输入框，因为这两个端点本就不经网关解析模型；
+  再选回列表里的名字即可收起。测试窗口一打开就带着各参数的初始值，
+  「恢复默认值」重新填入，「清空」则把每一项置空。**模型同样可以清除**：字段旁的 ×（或下拉的
+  空白项）清空后请求体不带 `model`——需要模型的家族由窗口先拦下提示「请先选择模型」，
+  `systemone` / `websearch` 则交给端点决定（System One 仍按配置注入 `systemone.model`）。
+  「恢复默认值」会重新选中 `default_model`，「清空」也一并清掉模型。**有文档默认值的布尔参数渲染为复选框**，
+  勾选与否都会显式发送 `true` / `false`；其余空值不会出现在请求体里，端点于是使用自己的默认。
+  两个 LLM 窗口的 `stream` 初始为 `false`（端点缺省流式，测试窗口先要单个 JSON）；generate
+  另有 `think` 复选框（默认关闭，Ollama 原生顶层字段），chat 提供 OpenAI 兼容的
+  `reasoning_effort`（Ollama 用 `none` 关闭思考）。
+- 凭据永远不外泄：上游 `headers` 里的 key 与 `systemone.api_key_env` /
+  `websearch.api_key_env` 所指环境变量一律回报为 `••••••`，页面据此显示只读掩码行。
+- 响应最多回传 `max_response_bytes`（128 KB）并在 `truncated` 里标注——测试窗口是看回答的，
+  不是下载回答的。流式响应逐块收集，`ttft_ms` 是首块到达时刻；`_drain` 会关闭迭代器，
+  代理的生成器正是在 `aclose` 时写库，所以测试过的调用同样出现在「请求明细」里。
+- 信封里的 `stream` 是**网关选择的传输方式**，与请求明细的 `stream` 列同源：调用方没写
+  `stream` 时按 `proxy.STREAM_BY_DEFAULT` 决定。响应是否真的分块到达要看 `content_type`
+  是不是 `application/x-ndjson` / `text/event-stream`——管理台就是据此决定「流式」标签与
+  「首字」耗时是否显示，避免把一整个 JSON 对象说成流。
+- 网关与上游的拒绝答复不会被吞：`400`（请求体不合法）、`404`（模型路由不到 / 功能已停用）、
+  `413`（超大）、`503`（找不到 provider / provider 未部署）、`502`·`504`（上游连不上或超时）都原样
+  装进信封（`ok: false`、`error: "HTTP 404"`），页面与真实调用者看到同一件事。只有路由层自己的
+  拒绝才走 HTTP 状态（`kind` 不在白名单、该家族没给 `model` → `400`）。
+
 **网关边界：** `/v1/management` 与 `/admin` 一样不受 `security.path_allowlist` 限制（它使用
 独立的会话认证），但仍受 HTTP 方法白名单、客户端 IP 白名单与速率限制约束。管理台只读，
-不提供任何修改 `config.yaml` 的写接口；测速接口是本组里唯一的写操作，也只写 `llmhub.db`。
+不提供任何修改 `config.yaml` 的写接口。两组成员会**真的向外发请求**：测速（`/bench`）额外写
+`bench_results` 表，接口测试（`/api-test`）只像一次普通调用那样写请求明细，两者都不碰配置。
 
 ---
 
@@ -1180,6 +1231,11 @@ curl http://localhost:8888/api/delete \
 ## 别名参数注入
 
 通过配置别名，可以自动替换模型名称并注入参数。
+
+> 根 `aliases:` 声明的每一项都是**一个独立模型**：目标模型仍然可以直接调用、也仍按它自己的默认参数运行，
+> 而别名带自己的固化参数。Web 管理台因此把它单独列成一行（设备沿用目标模型所在实例，显存显示 `-`，
+> KPI 的运行中模型数不重复计数）。若只想给已有模型换一个短名、不注入任何参数，用
+> `upstreams[].model_aliases`——那只改显示名与调用名，不会新增模型。
 
 **配置示例：**
 

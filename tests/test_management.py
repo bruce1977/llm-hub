@@ -70,6 +70,13 @@ class MockHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self):
+        path = self.path.split("?")[0]
+        MOCK_STORE.append({"method": "HEAD", "path": path, "auth": self.headers.get("authorization")})
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         path = self.path.split("?")[0]
         MOCK_STORE.append({"method": "GET", "path": path, "auth": self.headers.get("authorization")})
@@ -157,6 +164,50 @@ class MockHandler(BaseHTTPRequestHandler):
                         "usage": {"prompt_tokens": 4, "completion_tokens": 8, "total_tokens": 12},
                     }
                 )
+        elif path.endswith("/api/generate"):
+            # `raw` marks the reranker's scoring prompt: answer it with the yes token the
+            # scoring parser looks for, so the rerank test path stays deterministic.
+            # `__huge__` is the oversized-response probe the tester truncation check uses.
+            if body.get("prompt") == "__huge__":
+                answer = "x" * 300000
+            else:
+                answer = "yes" if body.get("raw") else "hello"
+            if body.get("stream"):
+                chunks = [
+                    {"model": body.get("model"), "response": answer[:1], "done": False},
+                    {
+                        "model": body.get("model"),
+                        "response": answer[1:],
+                        "done": True,
+                        "prompt_eval_count": 4,
+                        "eval_count": 3,
+                    },
+                ]
+                payload = "".join(json.dumps(c) + "\n" for c in chunks).encode()
+                self._send(payload, content_type="application/x-ndjson")
+            else:
+                self._send(
+                    {
+                        "model": body.get("model"),
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "response": answer,
+                        "done": True,
+                        "prompt_eval_count": 4,
+                        "eval_count": 3,
+                        "_echo": body,
+                    }
+                )
+        elif path.endswith("/api/embed"):
+            self._send({"model": body.get("model"), "embeddings": [[0.1, 0.2]], "embed_dimension": 2})
+        elif path.endswith("/v1/embeddings"):
+            self._send(
+                {
+                    "object": "list",
+                    "model": body.get("model"),
+                    "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+                    "usage": {"prompt_tokens": 3, "total_tokens": 3},
+                }
+            )
         else:
             self._send({"error": "not found"}, status=404)
 
@@ -179,6 +230,10 @@ _CONFIG = {
             "type": "ollama",
             "base_url": f"http://127.0.0.1:{MOCK_PORT}",
             "models": ["qwen3:8b", "qwen3-reranker:4b", "qwen3:*", "gone:1b"],
+            # A pure display rename: `q8` replaces "qwen3:8b" wherever that model is shown,
+            # and the real id stays callable. Contrast with root `aliases` below, which is a
+            # model of its own.
+            "model_aliases": {"q8": "qwen3:8b"},
             "headers": {"Authorization": "Bearer upstream-secret"},
             "description": "mock instance",
             "vram_total_gb": 24.0,
@@ -193,11 +248,13 @@ _CONFIG = {
     ],
     "default_upstream": "mock-ollama",
     "aliases": {
+        # Declared under root `aliases` with its own parameters, so the console lists it as a
+        # second model instead of renaming `qwen3:8b`.
         "q35": {
             "model": "qwen3:8b",
             "upstream": "mock-ollama",
             "params": {"think": False},
-            "description": "short name for qwen3:8b",
+            "description": "qwen3:8b with thinking disabled",
         }
     },
     "num_ctx_overrides": {"qwen3:8b": 8192},
@@ -251,6 +308,14 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def run() -> int:
+    def patch_config(**blocks) -> None:
+        with open(_CONFIG_PATH, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        raw.update(blocks)
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh, ensure_ascii=False)
+        client.app.state.manager.reload()
+
     with TestClient(main.app) as client:
         # ------------------------------------------------------------ auth ---
         print("[1] admin auth")
@@ -291,29 +356,55 @@ def run() -> int:
         data = r.json()
         kpi = data.get("kpi", {})
         check("one upstream online of two", kpi.get("upstreams_online") == 1 and kpi.get("upstreams_total") == 2, str(kpi))
-        check("four running models", kpi.get("running_models") == 4, str(kpi))
+        # The derived `q35` row is listed next to its target but never counted: it runs inside
+        # the instance already counted as qwen3:8b, so neither the KPI nor the VRAM double-counts.
+        check("four running models, derived row not counted", kpi.get("running_models") == 4, str(kpi))
         check("vram used = 14.0 GiB", kpi.get("vram_used_gib") == 14.0, str(kpi))
         check("vram total = 32.0 GiB", kpi.get("vram_total_gib") == 32.0, str(kpi))
         devices = {m["model"]: m["device"] for m in data.get("running_models", [])}
         check("device classification gpu/partial/cpu", devices == {
             "qwen3:8b": "gpu",
+            "q35": "gpu",
             "qwen3:4b": "cpu",
             "qwen3-reranker:4b": "partial",
             "tiny:cpu": "cpu",
         }, str(devices))
+        check(
+            "derived model inherits its target's device",
+            devices.get("q35") == devices.get("qwen3:8b"),
+            str(devices),
+        )
         up = {i["name"]: i for i in data.get("upstreams", [])}
         check("mock upstream online", up["mock-ollama"]["status"] == "online", str(up.get("mock-ollama")))
         check("dead upstream offline with error", up["dead-ollama"]["status"] == "offline" and up["dead-ollama"]["error"])
         by_running = {m["model"]: m for m in data.get("running_models", [])}
         check(
-            "running model is displayed under its alias",
-            by_running["qwen3:8b"]["display"] == "q35" and by_running["qwen3:8b"]["alias"] == "q35",
+            "running model is displayed under its model_aliases rename",
+            by_running["qwen3:8b"]["display"] == "q8" and by_running["qwen3:8b"]["alias"] == "q8",
             str(by_running.get("qwen3:8b")),
         )
         check(
             "resident model without an alias keeps its id",
             by_running["tiny:cpu"]["display"] == "tiny:cpu" and by_running["tiny:cpu"]["alias"] is None,
             str(by_running.get("tiny:cpu")),
+        )
+        check(
+            "derived model is its own running row",
+            by_running["q35"]["display"] == "q35"
+            and by_running["q35"]["alias"] is None
+            and by_running["q35"]["derived"] is True
+            and by_running["q35"]["target"] == "qwen3:8b",
+            str(by_running.get("q35")),
+        )
+        check(
+            "derived row shows no memory of its own",
+            by_running["q35"]["size_gib"] is None and by_running["q35"]["vram_gib"] is None,
+            str(by_running.get("q35")),
+        )
+        check(
+            "a root alias never renames its target",
+            by_running["qwen3:8b"]["display"] != "q35" and by_running["qwen3:8b"]["derived"] is False,
+            str(by_running.get("qwen3:8b")),
         )
 
         print("[3] upstream listing / detail")
@@ -324,8 +415,8 @@ def run() -> int:
         check("upstream detail -> 200", r.status_code == 200, f"got {r.status_code}")
         detail = r.json()
         check(
-            "models come from config, with the wildcard expanded",
-            detail.get("models") == ["q35", "qwen3-reranker:4b", "gone:1b", "qwen3:4b"],
+            "models come from config, wildcard expanded, derived model appended",
+            detail.get("models") == ["q8", "qwen3-reranker:4b", "gone:1b", "qwen3:4b", "q35"],
             str(detail.get("models")),
         )
         check(
@@ -338,7 +429,14 @@ def run() -> int:
         check(
             "detail carries the per-instance runtime",
             [m["model"] for m in detail.get("running_models", [])]
-            == ["qwen3:8b", "qwen3:4b", "qwen3-reranker:4b", "tiny:cpu"],
+            == ["qwen3:8b", "qwen3:4b", "qwen3-reranker:4b", "tiny:cpu", "q35"],
+            str(detail.get("running_models")),
+        )
+        check(
+            "detail runtime renames but does not rename away",
+            detail["running_models"][0]["display"] == "q8"
+            and detail["running_models"][-1]["display"] == "q35"
+            and detail["running_models"][-1]["derived"] is True,
             str(detail.get("running_models")),
         )
         r = client.get("/v1/management/upstreams/dead-ollama")
@@ -380,10 +478,35 @@ def run() -> int:
             str(models.get("qwen3:4b")),
         )
         check(
-            "alias is displayed instead of the real id",
-            models.get("qwen3:8b", {}).get("display") == "q35"
-            and models["qwen3:8b"]["alias"] == "q35",
+            "model_aliases rename replaces the displayed id",
+            models.get("qwen3:8b", {}).get("display") == "q8"
+            and models["qwen3:8b"]["alias"] == "q8"
+            and models["qwen3:8b"]["derived"] is False,
             str(models.get("qwen3:8b")),
+        )
+        check(
+            "root alias is its own model row",
+            models.get("q35", {}).get("display") == "q35"
+            and models["q35"]["alias"] is None
+            and models["q35"]["derived"] is True
+            and models["q35"]["target"] == "qwen3:8b"
+            and models["q35"]["params"] == {"think": False},
+            str(models.get("q35")),
+        )
+        check(
+            "derived row inherits the target runtime but claims no memory",
+            models.get("q35", {}).get("running") is True
+            and models["q35"]["device"] == "gpu"
+            and models["q35"]["num_ctx"] == 8192
+            and models["q35"]["size_gib"] is None
+            and models["q35"]["vram_gib"] is None,
+            str(models.get("q35")),
+        )
+        check(
+            "derived row follows its target upstream, listed after it",
+            [m["model"] for m in llm.get("models", []) if m["upstream"] == "mock-ollama"][0:2]
+            == ["qwen3:8b", "q35"],
+            str([m["model"] for m in llm.get("models", []) if m["upstream"] == "mock-ollama"]),
         )
         check(
             "unaliased model displays its declared name",
@@ -419,6 +542,15 @@ def run() -> int:
             str([m for m in llm.get("models", []) if m["upstream"] == "dead-ollama"]),
         )
         check("aliases list includes q35", any(a["alias"] == "q35" and a["target"] == "qwen3:8b" for a in llm.get("aliases", [])))
+        by_alias = {a["alias"]: a for a in llm.get("aliases", [])}
+        check(
+            "alias projection marks the two kinds",
+            by_alias["q35"]["kind"] == "derived"
+            and by_alias["q35"]["params"] == {"think": False}
+            and by_alias["q8"]["kind"] == "rename"
+            and by_alias["q8"]["params"] == {},
+            str(by_alias),
+        )
         check("num_ctx_overrides echoed", llm.get("num_ctx_overrides", {}).get("qwen3:8b") == 8192)
 
         # ------------------------------- opencode: hosted API, no runtime telemetry ---
@@ -637,6 +769,14 @@ def run() -> int:
         )
         check("upstream failure -> 502", r.status_code == 502, f"got {r.status_code}")
 
+        # Liveness probes are forwarded but never recorded; HEAD has to be allowed for this one.
+        try:
+            patch_config(security={**_CONFIG["security"], "allowed_http_methods": ["GET", "POST", "HEAD"]})
+            r = client.head("/api/chat", headers=GW)
+            check("an allowed HEAD is still forwarded", r.status_code == 200, f"got {r.status_code}")
+        finally:
+            patch_config(security=_CONFIG["security"])
+
         # The log writer is asynchronous; /requests flushes before querying.
         r = client.get("/v1/management/requests")
         check("GET /requests -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
@@ -667,6 +807,8 @@ def run() -> int:
         check("failed call logged with upstream", any(
             r["status"] == 502 and r["upstream"] == "dead-ollama" for r in rows
         ))
+        check("a HEAD probe never lands in the log", not any(r["method"] == "HEAD" for r in rows),
+              str({r["method"] for r in rows}))
         check("unknown request id -> 404", client.get("/v1/management/requests/999999").status_code == 404)
 
         # ------------------------------------------------------- filtering ---
@@ -902,15 +1044,219 @@ def run() -> int:
         r = client.get("/v1/management/bench/history", params={"upstream": "mock-ollama", "model": "qwen3:8b"})
         check("bench history echoes the requested key", r.json().get("model") == "qwen3:8b", r.text[:160])
 
-    print("[10] tools/websearch projection")
+        # ----------------------------------------------- interactive API testers ---
+        print("[10] api-test context and live execution")
+        # A separate client: the shared one still holds the session cookie from the login tests.
+        anon = TestClient(main.app)
+        check("context without credentials -> 401", anon.get("/v1/management/api-test/models").status_code == 401)
+        check("execution without credentials -> 401", anon.post("/v1/management/api-test", json={"kind": "generate", "body": {}}).status_code == 401)
+        r = anon.get("/v1/management/api-test/models", headers={"Authorization": "Bearer admin-secret-pw"})
+        check("the admin password is not a request credential here either", r.status_code == 401, f"got {r.status_code}")
+        r = anon.get("/v1/management/api-test/models", headers=GW)
+        check("context with a gateway API key -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
+        ctx = r.json()
+        kinds = ctx["kinds"]
+        check(
+            "one context block per documented endpoint",
+            set(kinds) == {"generate", "chat", "embed_ollama", "embed_openai", "rerank", "systemone", "websearch"},
+            str(sorted(kinds)),
+        )
+        check("context publishes the response cap", ctx["max_response_bytes"] == 128 * 1024, str(ctx.get("max_response_bytes")))
+        check("generate serves the documented path", kinds["generate"]["endpoint"] == "/api/generate")
+        check("chat shares the generate family", kinds["chat"]["family"] == "generate" and kinds["chat"]["endpoint"] == "/v1/chat/completions")
+        gen_rows = {m["model"]: m for m in kinds["generate"]["models"]}
+        check(
+            "the chat selector comes from the declared pool",
+            {"qwen3:8b", "qwen3:4b", "q35", "gone:1b"} <= set(gen_rows),
+            str(sorted(gen_rows)),
+        )
+        check("the reranker is never offered for chat", "qwen3-reranker:4b" not in gen_rows, str(sorted(gen_rows)))
+        check("an unresolvable wildcard pattern is not a selectable model", not any(m.endswith("*") for m in gen_rows))
+        check("a model_aliases rename is what the selector shows", gen_rows["qwen3:8b"]["display"] == "q8", str(gen_rows["qwen3:8b"]))
+        check("an unaliased model shows its configured name", gen_rows["qwen3:4b"]["display"] == "qwen3:4b")
+        check("a derived alias is selectable as itself", gen_rows["q35"]["derived"] is True and gen_rows["q35"]["target"] == "qwen3:8b")
+        check("every row reports whether its upstream signs", gen_rows["qwen3:8b"]["api_key"] == MASK, str(gen_rows["qwen3:8b"]))
+        check("the first choice is preselected", kinds["generate"]["default_model"] == "qwen3:8b", str(kinds["generate"]["default_model"]))
+        check("a proxied kind is always enabled", kinds["generate"]["enabled"] is True)
+        check("generation requires a model, a free name is not invented", kinds["generate"]["model_required"] is True and kinds["generate"]["free_model"] is False)
+        rr = kinds["rerank"]
+        check("rerank falls back to rerank.models", rr["source"] == "rerank.models" and [m["model"] for m in rr["models"]] == ["qwen3-reranker:4b"], str(rr))
+        check("rerank takes its endpoint from config", rr["endpoint"] == "/v1/rerank", str(rr.get("endpoint")))
+        so = kinds["systemone"]
+        check("systemone preselects systemone.model", so["default_model"] == "qwen3:8b" and so["source"] == "systemone.model", str(so))
+        check("systemone masks the env key and names the variable", so["api_key"] == MASK and so["api_key_env"] == "SYSTEMONE_SERVER_API_KEY", str(so))
+        check("systemone accepts a laya routing enum", so["free_model"] is True and so["model_required"] is False)
+        check("systemone follows the enabled switch", so["enabled"] is True)
+        ws = kinds["websearch"]
+        check("web search leaves the model to the provider", ws["model_required"] is False and ws["default_model"] is None, str(ws))
+        check("a disabled capability says so instead of hiding the tester", ws["enabled"] is False)
+        check("an unconfigured provider key is shown as absent", ws["api_key"] is None, str(ws))
+        check(
+            "the context never carries a credential value",
+            "upstream-secret" not in r.text and "systemone-secret" not in r.text,
+        )
 
-    def patch_config(**blocks) -> None:
-        with open(_CONFIG_PATH, encoding="utf-8") as fh:
-            raw = json.load(fh)
-        raw.update(blocks)
-        with open(_CONFIG_PATH, "w", encoding="utf-8") as fh:
-            json.dump(raw, fh, ensure_ascii=False)
-        client.app.state.manager.reload()
+        try:
+            patch_config(api_models={"generate": ["q8", "qwen3:4b", "not:declared"]})
+            narrowed = client.get("/v1/management/api-test/models").json()["kinds"]
+            check("api_models.generate replaces the derived pool", [m["model"] for m in narrowed["generate"]["models"]] == ["q8", "qwen3:4b", "not:declared"], str(narrowed["generate"]["models"]))
+            check("the narrowing reports its source", narrowed["generate"]["source"] == "api_models.generate")
+            check("an alias in the list stays the sendable name", narrowed["generate"]["models"][0]["target"] == "qwen3:8b", str(narrowed["generate"]["models"][0]))
+            check("a name nothing serves stays visible and flagged", narrowed["generate"]["models"][2]["unknown"] is True, str(narrowed["generate"]["models"][2]))
+            check("the same list feeds every kind of that family", narrowed["chat"]["models"] == narrowed["generate"]["models"])
+
+            patch_config(api_models={"embed": ["q8"]})
+            claimed = client.get("/v1/management/api-test/models").json()["kinds"]
+            check("embed lists the name it was given", [m["model"] for m in claimed["embed_ollama"]["models"]] == ["q8"], str(claimed["embed_ollama"]["models"]))
+            check("claiming an alias hides its real model from the chat selector",
+                  "qwen3:8b" not in {m["model"] for m in claimed["generate"]["models"]}
+                  and "q35" not in {m["model"] for m in claimed["generate"]["models"]},
+                  str(sorted(m["model"] for m in claimed["generate"]["models"])))
+            check("both embed endpoints share the embed family", claimed["embed_openai"]["models"] == claimed["embed_ollama"]["models"])
+
+            patch_config(api_models={"systemone": ["qwen3:4b"], "websearch": ["qwen3:8b"]})
+            others = client.get("/v1/management/api-test/models").json()["kinds"]
+            chat_names = {m["model"] for m in others["generate"]["models"]}
+            check("a name systemone claims is not offered for chat", "qwen3:4b" not in chat_names, str(sorted(chat_names)))
+            # Web search is a chat pass-through: the provider's model answers the synthesis
+            # prompt, so claiming it must not remove it (or its alias) from the chat selector.
+            check("a web search claim does not hide a chat model",
+                  {"qwen3:8b", "q35"} <= chat_names, str(sorted(chat_names)))
+            check("web search still lists the names it was given",
+                  {m["model"] for m in others["websearch"]["models"]} == {"qwen3:8b"},
+                  str(others["websearch"]["models"]))
+
+            # Ollama reads `tagged` and `tagged:latest` as one model, so a tagless entry in
+            # api_models still claims the declared name.
+            upstreams = [{**upstream, "models": [*upstream["models"]]} for upstream in _CONFIG["upstreams"]]
+            upstreams[0]["models"].append("tagged:latest")
+            patch_config(upstreams=upstreams, api_models={"systemone": ["tagged"]})
+            shorthand = client.get("/v1/management/api-test/models").json()["kinds"]
+            check("a tagless claim matches the declared :latest model",
+                  "tagged:latest" not in {m["model"] for m in shorthand["generate"]["models"]},
+                  str(sorted(m["model"] for m in shorthand["generate"]["models"])))
+
+            # `/api/generate` and `/api/embed` are Ollama's native dialect: an LM Studio or
+            # opencode upstream answers only the /v1 side, so a tester for the native path
+            # must not offer its models. The OpenAI-compatible testers keep them.
+            openai_up = {
+                "name": "mock-openai",
+                "type": "lmstudio",
+                "base_url": f"http://127.0.0.1:{MOCK_PORT}",
+                "models": ["lm-model"],
+            }
+            patch_config(upstreams=[*_CONFIG["upstreams"], openai_up])
+            dialect = client.get("/v1/management/api-test/models").json()["kinds"]
+            check("the native generate tester offers only Ollama upstreams",
+                  "lm-model" not in {m["model"] for m in dialect["generate"]["models"]},
+                  str(sorted(m["model"] for m in dialect["generate"]["models"])))
+            check("the OpenAI chat tester still offers a non-Ollama model",
+                  "lm-model" in {m["model"] for m in dialect["chat"]["models"]},
+                  str(sorted(m["model"] for m in dialect["chat"]["models"])))
+            check("native embeddings follow the same dialect rule",
+                  "lm-model" not in {m["model"] for m in dialect["embed_ollama"]["models"]}
+                  and "lm-model" in {m["model"] for m in dialect["embed_openai"]["models"]},
+                  str([m["model"] for m in dialect["embed_ollama"]["models"]]))
+            patch_config(api_models={"generate": ["lm-model", "q8"]}, upstreams=[*_CONFIG["upstreams"], openai_up])
+            written = client.get("/v1/management/api-test/models").json()["kinds"]
+            check("an explicit api_models.generate list is still served as written",
+                  [m["model"] for m in written["generate"]["models"]] == ["lm-model", "q8"],
+                  str([m["model"] for m in written["generate"]["models"]]))
+            patch_config(upstreams=_CONFIG["upstreams"])
+        finally:
+            patch_config(api_models={"generate": [], "embed": [], "rerank": [], "systemone": [], "websearch": []})
+
+        r = client.post("/v1/management/api-test", json={"kind": "api/pull", "body": {}})
+        check("a kind outside the allowlist -> 400", r.status_code == 400, f"got {r.status_code}")
+        check("the refusal names the accepted kinds", "generate" in r.json().get("detail", ""), r.text[:160])
+        r = client.post("/v1/management/api-test", json={"kind": "generate", "body": {"prompt": "ping", "stream": False}})
+        check("a generation test with no model -> 400", r.status_code == 400, f"got {r.status_code}: {r.text[:120]}")
+
+        r = client.post("/v1/management/api-test", json={"kind": "generate", "body": {"model": "qwen3:4b", "prompt": "ping", "stream": False}})
+        res = r.json()
+        check("non-streaming generation answers 200", r.status_code == 200 and res.get("ok") is True and res.get("status") == 200, str(res)[:200])
+        check("the envelope names the endpoint and transport", res.get("endpoint") == "/api/generate" and res.get("stream") is False, str(res)[:160])
+        check("the response is parsed as JSON", (res.get("body") or {}).get("_echo", {}).get("prompt") == "ping", str(res)[:200])
+        check("the raw text is kept beside it", '"_echo"' in res.get("text", ""), res.get("text", "")[:120])
+        check("routing preview resolves a plain name", res.get("model") == "qwen3:4b" and res.get("upstream") == "mock-ollama" and res.get("injected") is None, str(res)[:200])
+        check("duration is measured, first byte is not (non-stream)", isinstance(res.get("duration_ms"), int) and res.get("ttft_ms") is None, str(res)[:160])
+        check("the upstream content type is reported", res.get("content_type") == "application/json", str(res.get("content_type")))
+        check("nothing was truncated", res.get("truncated") is False)
+
+        r = client.post("/v1/management/api-test", json={"kind": "generate", "body": {"model": "q35", "prompt": "ping", "stream": False}})
+        res = r.json()
+        check("a derived alias reports the model it runs on", res.get("requested_model") == "q35" and res.get("model") == "qwen3:8b", str(res)[:200])
+        check("the alias's fixed parameters are injected", res.get("injected") == {"think": False}, str(res)[:200])
+        forwarded = (res.get("body") or {}).get("_echo") or {}
+        check("the upstream really received the rewritten body", forwarded.get("model") == "qwen3:8b" and forwarded.get("think") is False, str(forwarded)[:200])
+        check("num_ctx clamping applies to a test call too", (forwarded.get("options") or {}).get("num_ctx") == 8192, str(forwarded)[:200])
+
+        r = client.post("/v1/management/api-test", json={"kind": "generate", "body": {"model": "qwen3:4b", "prompt": "go"}})
+        res = r.json()
+        check("omitting stream follows the gateway default (NDJSON)", res.get("stream") is True, str(res)[:160])
+        r = client.post(
+            "/v1/management/api-test",
+            json={"kind": "generate", "body": {"model": "qwen3:4b", "prompt": "go", "stream": True}},
+        )
+        res = r.json()
+        check("the streamed chunks are assembled into the text", '"response"' in res.get("text", "") and res.get("body") is None, str(res)[:200])
+        check("first-byte timing lands for a stream", isinstance(res.get("ttft_ms"), int), str(res.get("ttft_ms")))
+        check("the NDJSON content type is reported", res.get("content_type") == "application/x-ndjson", str(res.get("content_type")))
+
+        r = client.post(
+            "/v1/management/api-test",
+            json={"kind": "chat", "body": {"model": "qwen3:4b", "messages": [{"role": "user", "content": "hi"}]}},
+        )
+        res = r.json()
+        check("an OpenAI chat test is answered", res.get("ok") is True and (res.get("body") or {}).get("choices"), str(res)[:200])
+        check("chat is reported as streaming by default, like the proxy", res.get("stream") is True, str(res)[:160])
+        r = client.post(
+            "/v1/management/api-test",
+            json={"kind": "chat", "body": {"model": "qwen3:4b", "messages": [{"role": "user", "content": "hi"}], "stream": True}},
+        )
+        res = r.json()
+        check("SSE chunks are captured for chat", res.get("stream") is True and "data:" in res.get("text", ""), str(res)[:200])
+
+        r = client.post("/v1/management/api-test", json={"kind": "embed_ollama", "body": {"model": "qwen3:4b", "input": "hi"}})
+        res = r.json()
+        check("native embed test", res.get("ok") is True and (res.get("body") or {}).get("embeddings"), str(res)[:200])
+        r = client.post("/v1/management/api-test", json={"kind": "embed_openai", "body": {"model": "qwen3:4b", "input": "hi"}})
+        res = r.json()
+        check("OpenAI embeddings test", res.get("ok") is True and (res.get("body") or {}).get("data"), str(res)[:200])
+
+        r = client.post(
+            "/v1/management/api-test",
+            json={"kind": "rerank", "body": {"model": "qwen3-reranker:4b", "query": "keep_alive", "documents": ["doc one"], "top_n": 1}},
+        )
+        res = r.json()
+        check("rerank test runs through the gateway's own scorer", res.get("ok") is True and (res.get("body") or {}).get("results"), str(res)[:200])
+        check("the rerank envelope reports the configured endpoint", res.get("endpoint") == "/v1/rerank", str(res.get("endpoint")))
+
+        r = client.post(
+            "/v1/management/api-test",
+            json={"kind": "systemone", "body": {"state": {"message": "hi"}, "questions": {"a": {"type": "noul", "instructions": "x"}}}},
+        )
+        res = r.json()
+        check("an unreachable backend comes back as the gateway's 502, not a crash", res.get("status") == 502 and res.get("ok") is False, str(res)[:200])
+        check("the refusal text explains which backend failed", "laya.example" in res.get("text", ""), res.get("text", "")[:160])
+        r = client.post("/v1/management/api-test", json={"kind": "websearch", "body": {"query": "hi"}})
+        res = r.json()
+        check("a disabled capability answers 404 inside the envelope", res.get("status") == 404 and res.get("error") == "HTTP 404", str(res)[:200])
+
+        r = client.post("/v1/management/api-test", json={"kind": "generate", "body": {"model": "qwen3:4b", "prompt": "__huge__", "stream": False}})
+        res = r.json()
+        check("an oversized response is cut at the cap", res.get("truncated") is True and len(res.get("text", "")) == 128 * 1024, str(len(res.get("text", ""))))
+
+        logged = client.get("/v1/management/requests", params={"path": "api/generate"}).json().get("rows", [])
+        check(
+            "a tester call is written to the request log like any caller",
+            any(row.get("upstream") == "mock-ollama" and row.get("model") in {"qwen3:4b", "qwen3:8b"} for row in logged),
+            str(logged[:2]),
+        )
+        check("the test call itself never needed a caller API key", any(row.get("status") == 200 for row in logged), str(logged[:2]))
+
+    print("[11] tools/websearch projection")
+
 
     ws = client.get("/v1/management/tools/websearch").json()
     check("GET /tools/websearch -> 200", client.get("/v1/management/tools/websearch").status_code == 200)
@@ -952,7 +1298,7 @@ def run() -> int:
         patch_config(websearch={"enabled": False})
 
     # -------------------------------------------- legacy database upgrade ---
-    print("[11] schema migration on an existing database")
+    print("[12] schema migration on an existing database")
     legacy_db = os.path.join(_TMP_DIR, "legacy.db")
     with sqlite3.connect(legacy_db) as conn:
         conn.execute(
@@ -986,7 +1332,7 @@ def run() -> int:
     )
 
     # ------------------------------------------------ console static surface ---
-    print("[12] web console static serving")
+    print("[13] web console static serving")
     dist = main.CONSOLE_DIST
     if (dist / "index.html").is_file():
         r = client.get("/admin", follow_redirects=False)

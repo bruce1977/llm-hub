@@ -27,11 +27,12 @@
 | **Rerank API** | 提供 `/v1/rerank`，支持生成式（`logprobs`）与向量（`embedding`）两种打分 |
 | **联网检索** | `POST /v1/tools/web-search`，把 OpenCode API Gateway 的关键词网页检索收敛到统一入口 |
 | **统一模型列表** | `/v1/models` 聚合配置中所有实例与别名，而非代理到单个实例 |
-| **别名 + 参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并强制注入 `think: false` |
+| **别名 + 参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并强制注入 `think: false`；`aliases` 里的每一项都是一个独立模型（管理台单独成行），`model_aliases` 只改名 |
 | **流式透传** | NDJSON（`/api/chat`、`/api/generate`）与 SSE（`/v1/chat/completions`）原样转发 |
-| **管理 API** | `/v1/management/*`：上游/显存总览（含今日请求数与今日 token 合计）、config.yaml 各上游**声明**的模型清单（别名优先显示，前缀通配按上游模型列表展开）与运行态设备/显存内存、配置投影（Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点）以及每模型测速（启动 / 轮询 / 历史），凭据为管理台会话 Cookie 或网关 API Key |
-| **Web 管理台** | Vue 3 + TypeScript + Element Plus + ECharts 单页应用，构建后由网关在 `/admin` 直接提供（镜像内不含 node）：总览、上游、模型清单（配置声明 + 通配展开 + 运行态）、请求明细与图表、每模型测速，界面支持简体中文 / English，本期不提供写配置接口 |
+| **管理 API** | `/v1/management/*`：上游/显存总览（含今日请求数与今日 token 合计）、config.yaml 各上游**声明**的模型清单（`model_aliases` 短名优先显示，根 `aliases:` 的派生模型独立成行，前缀通配按上游模型列表展开）与运行态设备/显存内存、配置投影（Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点）、每模型测速（启动 / 轮询 / 历史）与每端点的接口测试（按家族给出可用模型并服务端执行），凭据为管理台会话 Cookie 或网关 API Key |
+| **Web 管理台** | Vue 3 + TypeScript + Element Plus + ECharts 单页应用，构建后由网关在 `/admin` 直接提供（镜像内不含 node）：总览、上游、模型清单（配置声明 + 通配展开 + 运行态）、请求明细与图表、每模型测速、每个 API 文档参数表右上角**测试**按钮打开的浮层测试窗口，界面支持简体中文 / English，本期不提供写配置接口 |
 | **模型测速** | Models · LLM 的 `测速` 按钮用同一段提示词跑 N 轮，给出 TTFT、decode tok/s、prefill tok/s：上游自己报了 `eval_duration` / `prompt_eval_duration` / `predicted_ms` 就用服务端计时（`timing_source: server`），否则退回客户端计时并标记；每个「上游 + 模型」保留最近 3 次，悬停即可查历史 |
+| **接口测试** | 每个 `API 用法` 标签页里，每个端点「请求参数」标题右侧都有一个**测试**按钮，点开是浮层测试窗口（`/api/generate`、`/v1/chat/completions`、`/api/embed`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、`/v1/tools/web-search`）：模型选择框按 `api_models` 收窄（`/api/...` 原生端点只列 `type: ollama` 上游的模型）且只列名字/别名，文档里的参数基本都能填并**一打开就带着默认值**，可预览将要发送的请求体，结果给出状态码、耗时、实际路由到的模型与别名注入的参数、从 JSON / NDJSON / SSE 抽出的回答。请求由**服务端**用网关自己的服务发出，别名注入与请求明细入库跟外部调用完全一致；需要额外密钥的端点只显示只读 `••••••` |
 | **中英双语** | 简体中文（源语言）与英文，账户菜单切换、按浏览器记忆（`localStorage`）；漏翻的键会让构建失败（`MessageSchema`），不会把原始 key 渲染到界面 |
 | **配置热重载** | 修改 `config.yaml` 约 1 秒内自动生效，无需重启容器 |
 | **Docker 外挂** | 配置文件通过 `/data` 卷挂载 |
@@ -52,7 +53,8 @@ llm-hub/
 │   ├── request_log.py # 请求明细 SQLite 埋点（异步批量写入）
 │   ├── bench.py      # 模型测速：TTFT / decode / prefill 采集
 │   ├── bench_store.py # 测速历史（与请求明细共用 llmhub.db，每模型保留 3 份）
-│   ├── management.py # Web 管理台 API（/v1/management：只读视图 + 测速）
+│   ├── api_test.py   # 管理台接口测试的执行引擎（封闭的端点白名单）
+│   ├── management.py # Web 管理台 API（/v1/management：只读视图 + 测速 + 接口测试）
 │   ├── websearch.py  # 联网检索代理（OpenCode API Gateway 上游）
 │   └── web/          # 管理台构建产物（`npm run build` 的输出），网关在 /admin 提供服务
 ├── web/
@@ -253,7 +255,8 @@ upstreams:
 - `models`：**支持前缀通配**，`"qwen3:*"` 可命中 `qwen3:4b`、`qwen3:8b`、`qwen3:14b`。
   通配是**字面前缀**，斜杠分隔的 id 要写成斜杠形式：`"opencode/*"` 才能命中 `opencode/big-pickle`
   （写成 `"opencode:*"` 会一个都匹配不到）
-- `model_aliases`：把该实例中冗长的模型 id 映射成短名（见下方 LM Studio 章节）
+- `model_aliases`：**仅改名**——把该实例中冗长的模型 id 映射成短名，此后该模型的展示名与调用名都用短名；
+  它不会新增模型（见下方 LM Studio 章节；需要带独立固化参数的新模型，写在根节点 `aliases` 下）
 - `timeout`：覆盖全局超时，大模型建议调大
 - `headers`：可选，转发到该实例时附加的自定义请求头（如上游自身也有鉴权）。模型发现
   （`/v1/models`、`/api/tags`、`/probe` 的健康与模型列表探测）同样会带上这些头，因此需要鉴权的
@@ -295,6 +298,11 @@ aliases:
 请求 `qwen3.5:4b-nothink` 时，网关会把 `model` 替换为 `qwen3.5:4b`，
 并将 `params` 中的字段**强制覆盖**进请求体（同名参数以别名为准）。
 
+这里的每一项都是**一个独立的模型**：`qwen3.5:4b` 依然可以直接调用、也依然带思考运行，
+Web 管理台会把 `qwen3.5:4b-nothink` 作为另一条模型列出来（它的设备类型取自目标模型所在实例，
+显存显示 `-`，因为那份显存已经计在目标模型名下）。若只是想把名字改短、不带任何独立参数，
+请用 `upstreams[].model_aliases`——它只改变一个模型的展示名和调用名，不会新增模型。
+
 ### `num_ctx_overrides` —— 按模型名固定上下文长度（避免 Ollama 反复创建）
 
 Ollama 会为「模型 + `options.num_ctx`」的每种组合创建**独立实例**（KV cache 一次性预分配），
@@ -315,6 +323,47 @@ num_ctx_overrides:
 
 > 用途示例：大上下文模型（如 35B-pruned）固定 64K 上下文，避免客户端误传更大的 ctx 撑爆显存；
 > 或把小模型统一钳到 8K，防止不同客户端请求触发 Ollama 反复重分配 KV cache。
+
+### `api_models` —— 每类 API 可以选哪些模型
+
+`upstreams[].models` 说的是某个实例**声明**了什么，不是它**承担什么职责**：配置里没有任何地方
+告诉管理台 `bge-m3` 是回答 `/api/embed` 的、`qwen3:8b` 是回答 `/api/generate` 的。这个节点就是
+那句缺失的说明——每类 API 一个可选列表，`API 用法` 标签页里那些模型选择框读的就是它：
+
+```yaml
+api_models:
+  generate: []                       # POST /api/generate + POST /v1/chat/completions
+  embed: [bge-m3:latest]             # POST /api/embed + POST /v1/embeddings
+  rerank: []                         # POST /v1/rerank
+  systemone: []                      # POST /v1/systemone
+  websearch: []                      # POST /v1/tools/web-search
+```
+
+- 列表里可以写真实模型 id、`upstreams[].model_aliases` 短名，或根 `aliases:` 的派生模型名。
+  发出去的就是别名本身，所以网关照样会注入它携带的固化参数。
+- **空列表的含义是「自己推」，不是「没有」**——这个节点之前的配置文件一个字都不用改。
+  `rerank` 回落到 `rerank.models`，`systemone` 回落到 `systemone.model`，其余就是全部声明名
+  （含别名与通配展开）。每个选择框下方都会写明它读的是哪一处
+  （`选项来自 api_models.embed` / `rerank.models` / `upstreams[].models`）。
+- **Ollama 原生端点只列 Ollama 模型**：`POST /api/generate` 与 `POST /api/embed` 是 Ollama
+  自己的接口，`lmstudio` / `opencode` 上游只实现了 `/v1` 那一侧，所以这两个测试窗口按空列表
+  推导时只保留 `type: "ollama"` 的行；同样的模型在 `POST /v1/chat/completions` /
+  `POST /v1/embeddings` 的窗口里照常可选。非空的 `api_models` 列表仍按原样展示——写错的名字
+  会作为可见的配置问题留在下拉里，而不是悄悄消失。
+- 被**其它家族显式认领**的名字会从 `generate` / `chat` 里消失：`api_models` 的 `embed` /
+  `rerank` / `systemone` 与 `rerank.models` 都算，两种写法（真实 id 或别名）都算，
+  聊天选择框因此绝不会把嵌入、打分或决策模型递给用户选。`api_models.websearch` **不算认领**——
+  搜索端点本质上是聊天透传，回答综合提示词的模型本来就该能聊天，托管 provider 的路由模型
+  （如 `opencode/auto`）因此仍会出现在**聊天**选择框里。比较时忽略 `:latest`——Ollama 把
+  `tev1` 与 `tev1:latest` 当成同一个模型。`systemone.model` 这类**兜底**同样不算认领：同一台机器
+  完全可以拿聊天模型回答决策请求，它必须继续可选。
+- `websearch` 列的是搜索 provider 自己的模型；测试窗口的下拉末尾有「自定义模型…」，可以手输任意
+  名字，因为 opencode-port 会自己解析 `model`（不传就用 provider 的默认值）。`systemone` 同样有
+  这一项——laya-server 后端要的是路由枚举（`auto` / `english` / `multilingual` /
+  `typed-decisions`），不是模型 id。
+- 没有任何上游服务的名字依然**会显示出来**并标注 `未被声明`：配错了应当给你看见，而不是藏起来。
+- 这些列表**只收窄管理台提供的选项**，路由逻辑完全不变——网关照旧接受它原本就接受的模型名，
+  所以这个节点不可能把调用方锁在某个已声明的模型之外。
 
 ## 集成 LM Studio
 
@@ -342,7 +391,8 @@ timeout: 600
 ```
 
 - `type: "lmstudio"`：网关改用 `/v1/models` 去发现模型列表与探测存活（Ollama 用的是 `/api/tags`、`/api/version`）
-- `model_aliases`：建立「对外短名 → LM Studio 真实 id」的映射，键是对外暴露的名字，值是上游真实 id
+- `model_aliases`：建立「对外短名 → LM Studio 真实 id」的映射，键是对外暴露的名字，值是上游真实 id。
+  它只负责改名——该模型本身不变，也不会因此多出一个小写形式的 `qwen3.5:9b` 新模型
 
 **3. 用短名直接访问**
 
@@ -444,6 +494,9 @@ request_log:
   （请求参数）、`status` / `upstream` / `response_body` / `res_size` / `tokens_in` / `tokens_out` /
   `tokens` / `error`（响应结果，token 按输入/输出分两列存，`tokens` 是总量）；
   响应体各截断 8 KB，凭据字段写盘前替换为 `***`；旧库启动时自动 `ALTER TABLE` 补列
+- **`HEAD` 请求只转发、不记录**：它没有请求体也没有响应体，监控探活又会持续发送，记下来只会
+  淹没真实调用。默认 `allowed_http_methods: [GET, POST]` 下 HEAD 会直接收到 `405`；
+  若把它加进白名单，请求仍会正常转发，只是不写明细
 
 ## Web 管理台
 
@@ -453,23 +506,49 @@ request_log:
 `app/web` 与模块同级，本地和镜像里的解析路径因此是同一个）。
 登录用户名固定为 `admin`，密码来自环境变量 `ADMIN_PASSWORD`，登录成功后签发 12 小时
 HttpOnly 会话 Cookie；页面包括 Dashboard、Upstreams、Requests、Models（LLM / Embed / Rerank / System One）、
-Tools（Web Search）、Settings 与 About，本期**不提供任何写配置接口**，唯一的“动作”是
-Models · LLM 上的每模型测速。
+Tools（Web Search）、Settings 与 About，本期**不提供任何写配置接口**，“动作”只有两处：
+Models · LLM 上的每模型测速，以及每个 `API 用法` 标签页里的接口测试窗口——两者都只写数据库，不碰 `config.yaml`。
 任何管理接口返回 401 时前端会自动登出并跳回登录页；503 不当作鉴权失败，它分别代表
 上游不可达、`ADMIN_PASSWORD` 未设置或前端尚未构建。
 账户卡固定在面板左下角，点击弹出账户菜单：语言（简体中文 / English，按浏览器记忆）、深色/浅色切换、
 设置入口（原侧栏入口已移除）、关于（项目简介、主要功能、动态版本信息、GitHub 地址与公众号二维码，同样不占侧栏位）与退出登录。
 
 Models · LLM 表格与 Upstreams 的行展开列出的是**该上游在 config.yaml 里声明**的模型
-（`upstreams[].models`，配了别名的以别名显示；`opencode/*` 这类前缀通配按与路由同一个发现结果
-展开成命中的具体模型，实例里装了但没声明的模型不出现）。运行中的 Ollama 模型给出设备与显存/占用；
-`opencode` 类型的托管上游没有加载状态，探测一旦有效其声明的模型全部算在线，设备显示 **Cloud**、显存显示「-」。
+（`upstreams[].models`，`model_aliases` 的短名作为显示名、根 `aliases:` 的每一项单独成行；`opencode/*`
+这类前缀通配按与路由同一个发现结果展开成命中的具体模型，实例里装了但没声明的模型不出现）。
+运行中的 Ollama 模型给出设备与显存/占用；派生模型行设备沿用它的目标模型、显存显示「-」（同一个实例只计一次，
+KPI「运行中模型数」也不重复计数）；`opencode` 类型的托管上游没有加载状态，探测一旦有效其声明的模型全部算在线，设备显示 **Cloud**、显存显示「-」。
 设备徽标只区分 **GPU / 部分 / CPU / Cloud**，不再显示占用百分比。
-Models · LLM 分两个 Tab：**模型清单**（上述表格）与 **API 用法**，后者给出当前支持的两个生成端点
+Models · LLM 分两个 Tab：**模型清单**（上述表格，另有**别名与派生模型**表：名称 / 类型（显示别名 vs 派生模型）/ 目标模型 / 上游 / 固化参数 / 说明）与 **API 用法**，后者给出当前支持的两个生成端点
 `POST /api/generate`（Ollama 原生）与 `POST /v1/chat/completions`（OpenAI 兼容）的参数表与请求 / 响应示例，
 并标注两者都**缺省即流式**（不写 `stream` 时分别走 NDJSON 与 SSE）。
 Models · Embed（位于 Rerank 上方）说明两个嵌入端点 `POST /api/embed`（Ollama 原生）与
 `POST /v1/embeddings`（OpenAI 兼容）的字段与示例；两端都是原样透传，页面不读取任何配置。
+每一份 API 文档的「请求参数」标题右侧都有一个**测试**按钮，点开后是浮层里的**接口测试窗口**
+（关掉再开，填过的内容和上一次的答复都还在）：模型选择框按 `api_models` 收窄；`lmstudio` /
+`opencode` 上游的模型只出现在 `/v1` 的测试窗口里，因为 `/api/generate` 与 `/api/embed` 是 Ollama
+自己的接口。每个选项**只显示名字或别名**（有别名用别名，否则用配置里的声明名），上游与运行状态放在悬停提示里，没人服务的名字
+仍列出来并标注「未被声明」；文档里写到的参数基本都能填，**打开时已按初始值填好**，
+「恢复默认值」重新填入、「清空」把表单与模型选择清空，「查看请求体」给出将要发送的 JSON；
+**模型是真正的下拉框**：打开时选中默认模型，列表就是全部候选；`systemone` / `websearch`
+在列表末尾多一项「自定义模型…」，选中后换成可手输的输入框（带候选提示），再选回列表里的
+名字即可收起。**模型可以清除**：字段旁的 ×（或下拉里的空白项）把它清空后，请求体里就不带
+`model`——需要模型的家族会先被本地拦下并提示「请先选择模型」，`systemone` / `websearch`
+则交给端点决定（System One 仍会按配置注入 `systemone.model`）。「恢复默认值」会重新选中
+`default_model`，「清空」同样清掉模型；
+结果是状态码、耗时、真正流式返回时的首字时间、网关实际路由到的模型与别名注入的参数、
+从 JSON / NDJSON / SSE 里抽出的回答，以及原始响应。**有文档默认值的布尔参数是复选框**，
+勾选/不勾选都会显式发送 `true` / `false`（不勾选就是 false，而不是「不发」）；其余留空的参数
+**直接不发**，让端点用自己的默认值回答。两个 LLM 窗口的 `stream` **默认关闭**（端点本身缺省流式，
+但测试窗口先让它返回单个 JSON）；generate 窗口另有 `think` 复选框（默认关闭），chat 窗口提供
+OpenAI 兼容的 `reasoning_effort`（`none` 在 Ollama 上关闭思考）。
+`systemone` 与 `websearch` 还允许填列表之外的名字，因为这两个端点本来就不经网关解析模型。
+请求是在**服务端**发出的（`POST /v1/management/api-test`）：管理台的会话 Cookie 故意不是调用方 API Key，
+所以网关会把表单重建为一个真实请求，交给该端点用的同一个服务——别名注入、`num_ctx` 钳制、请求明细入库
+与外部调用完全一致；端点自己给出的拒绝（404 模型路由不到 / 功能已停用、400 请求体不合法、
+502 / 504 上游失败）也带着原状态码出现在结果里，不会被抹平。功能开关关掉的端点依然显示测试窗口，只多一个「未启用」徽标；响应最多回传 128 KB。
+需要额外密钥的端点（上游 `Authorization` 头、`systemone.api_key_env`、`websearch.api_key_env`）
+在表单里是一行只读的 `••••••`，旁边标出它来自哪个环境变量——值永远不出服务器。
 Requests 页的模型下拉会随所选
 上游收敛。每次刷新都有可见的进行中状态（`↻` 旋转、顶栏底部进度条、KPI 卡降透明度、图表蒙纱），
 不再是静默换数字。页签图标来自 `web/public/favicon.svg`，Vite 原样复制进 `app/web`，
@@ -504,12 +583,14 @@ curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overv
 
 | 路径 | 说明 |
 |------|------|
-| `GET /v1/management/overview` | KPI、上游摘要、运行中模型（Ollama 驻留模型带 GPU / 部分 / 纯 CPU 判定，`opencode` 托管模型带别名一并列出，设备为 `"cloud"`、显存为 `null`） |
-| `GET /v1/management/upstreams[/{name}]` | 实例健康、显存占用、运行中模型（Ollama 取 `/api/ps`，托管上游按探测有效性整批算在线），以及该上游在 config.yaml 中**声明**的模型（别名优先，前缀通配按上游模型列表展开） |
-| `GET /v1/management/models/{llm,rerank,systemone}` | LLM 为按 `upstreams[].models` 声明生成的模型清单（`display`/`alias` 表达别名、`wildcard` 标记通配展开的模型，含运行态设备与显存/占用；托管上游设备为 `"cloud"`），Rerank / System One 为配置只读投影（API Key 一律掩码为 `••••••`） |
+| `GET /v1/management/overview` | KPI、上游摘要、运行中模型（Ollama 驻留模型带 GPU / 部分 / 纯 CPU 判定，`opencode` 托管模型设备为 `"cloud"`、显存为 `null`，根 `aliases:` 的派生模型追加在末尾：`derived: true`、设备沿用目标模型、显存 `null`，`kpi.running_models` 不重复计数） |
+| `GET /v1/management/upstreams[/{name}]` | 实例健康、显存占用、运行中模型（Ollama 取 `/api/ps`，托管上游按探测有效性整批算在线，另追加归属该上游的派生模型行），以及该上游在 config.yaml 中**声明**的模型（`model_aliases` 短名优先、前缀通配按上游模型列表展开，末尾是根 `aliases:` 声明的派生模型名） |
+| `GET /v1/management/models/{llm,rerank,systemone}` | LLM 为按 `upstreams[].models` 声明生成的模型清单（`display`/`alias` 表达 `model_aliases` 短名、`derived`/`target`/`params`/`description` 表达根 `aliases:` 的派生模型、`wildcard` 标记通配展开的模型，含运行态设备与显存/占用；托管上游设备为 `"cloud"`），`aliases[]` 每项带 `kind`（`rename` / `derived`），Rerank / System One 为配置只读投影（API Key 一律掩码为 `••••••`） |
 | `GET /v1/management/tools/websearch` | Web Search 配置投影，`base_url` 由 provider 上游派生 |
 | `GET /v1/management/requests[/{id}]` | 请求明细（按时间/上游/模型/状态/路径筛选、分页、详情抽屉） |
 | `GET /v1/management/stats/{timeseries,distribution,failures}` | 时序聚合（每小时/每天的请求数、P95、错误数）、分组占比（上游 / 模型 / 成功失败，驱动三张实心饼图）与失败明细统计 |
+| `GET /v1/management/api-test/models` | 接口测试的按家族可用模型（按 `api_models` 收窄；Ollama 原生的 `generate` / `embed_ollama` 只保留 `type: "ollama"` 的行）：每行带 `display` / `alias` / `upstream` / `running` / `device` 与掩码后的上游密钥，外加 `default_model` / `free_model` / `enabled` 和掩码后的 provider 密钥及其环境变量名；这份数据要探测所有上游，前端整站共用一份缓存，只在首次打开与点击「重新探测」时取 |
+| `POST /v1/management/api-test` | `{kind, body}`——在服务端用该端点自己的网关服务发出这一笔请求，返回 `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` → `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`；`kind` 不在白名单、或需要模型的家族没给 `model` 时是 `400`，而网关自己的拒绝（403 / 404 / 413 / 上游 4xx）作为数据返回，不会被抹平 |
 | `POST /v1/management/bench` | 启动测速：`{upstream, model, rounds?, max_tokens?, think?}` → `{job_id, status: "pending"}`。任务跑在独立线程 + 独立事件循环上，关掉浏览器也不会中断 |
 | `GET /v1/management/bench/{job_id}` | `pending` / `running`（带 `{completed, total, warmup}`）/ `done`（含逐轮完整数据）/ `failed`（附 `error`） |
 | `GET /v1/management/bench/history?upstream=&model=` | 该「上游 + 模型」保留的历史记录（默认 3 份），即悬停浮层的数据源 |

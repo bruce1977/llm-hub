@@ -471,7 +471,11 @@
             <thead><tr><th>模型</th><th>上游</th><th>设备</th><th>上下文</th></tr></thead>
             <tbody>
               <tr>
-                <td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td>
+                <td class="mono" title="实际模型: qwen3.6:35b-pruned">q35-35b <span class="chip s2" title="model_aliases 为它配置的显示别名" style="margin-left:6px;">alias</span></td><td>Ollama-Arc-B65</td>
+                <td><span class="badge gpu">● GPU</span></td><td class="mono">65536</td>
+              </tr>
+              <tr>
+                <td class="mono" title="运行在 qwen3.6:35b-pruned 上">q35-35b-nothink <span class="chip s2" title="aliases 节点声明的模型，带独立的固化参数" style="margin-left:6px;">derived</span></td><td>Ollama-Arc-B65</td>
                 <td><span class="badge gpu">● GPU</span></td><td class="mono">65536</td>
               </tr>
               <tr>
@@ -484,6 +488,10 @@
               </tr>
             </tbody>
           </table>
+          <div style="font-size:11.5px;color:var(--text-dim);padding:6px 10px 4px;">
+            派生模型（<code>aliases</code> 声明）与它的目标模型共用同一个实例：设备沿用目标模型、显存计入目标模型那一行，
+            KPI「运行中模型」只统计真实模型，不会因为派生行而重复计数。
+          </div>
         </div>
       </div>
 
@@ -604,7 +612,7 @@
       <!-- ===================== MODELS · LLM ===================== -->
       <section class="view" id="view-models-llm">
         <div class="topbar">
-          <div><h1>Models · LLM</h1><div class="sub">LLM 模型配置（只读投影自 config.json）</div></div>
+          <div><h1>Models · LLM</h1><div class="sub">LLM 模型配置（只读投影自 config.yaml）</div></div>
           <div class="actions">
             <span class="refresh">最后更新 10:17:24</span>
             <button class="toggle" data-theme-btn onclick="toggleTheme()"><span class="ti">☀</span><span class="tt">浅色</span></button>
@@ -617,6 +625,7 @@
               <thead><tr><th>模型名</th><th>上游</th><th>类型</th><th>别名</th><th>num_ctx</th><th>运行态</th></tr></thead>
               <tbody>
                 <tr><td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td><td><span class="chip">ollama</span></td><td class="mono">q35-35b</td><td class="mono">65536</td><td><span class="badge ok">● 运行中</span></td></tr>
+                <tr><td class="mono">q35-35b-nothink <span class="chip s2" title="aliases 节点声明的模型，带独立的固化参数" style="margin-left:6px;">derived</span></td><td>Ollama-Arc-B65</td><td><span class="chip">ollama</span></td><td class="mono">—</td><td class="mono">65536</td><td><span class="badge ok">● 运行中</span></td></tr>
                 <tr><td class="mono">qwen3.5:9b</td><td>Ollama-Arc-B65</td><td><span class="chip">ollama</span></td><td class="mono">q35-9b</td><td class="mono">16384</td><td><span class="badge ok">● 运行中</span></td></tr>
                 <tr><td class="mono">llama-3.1-8b-instruct</td><td>LM-Studio-local</td><td><span class="chip">lmstudio</span></td><td class="mono">—</td><td class="mono">—</td><td><span class="badge cpu">● 未加载</span></td></tr>
                 <tr><td class="mono">deepseek-r1:14b</td><td>Ollama-Backup</td><td><span class="chip">ollama</span></td><td class="mono">ds14</td><td class="mono">32768</td><td><span class="badge err">● 上游离线</span></td></tr>
@@ -625,16 +634,21 @@
           </div>
         </div>
         <div>
-          <div class="view-title">别名映射 <span class="tag">aliases</span></div>
+          <div class="view-title">别名与派生模型 <span class="tag">aliases</span></div>
           <div class="card" style="padding:4px 6px;">
             <table>
-              <thead><tr><th>别名</th><th>目标模型</th><th>上游</th></tr></thead>
+              <thead><tr><th>名称</th><th>类型</th><th>目标模型</th><th>上游</th><th>固化参数</th><th>说明</th></tr></thead>
               <tbody>
-                <tr><td class="mono">q35-35b</td><td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td></tr>
-                <tr><td class="mono">q35-9b</td><td class="mono">qwen3.5:9b</td><td>Ollama-Arc-B65</td></tr>
-                <tr><td class="mono">ds14</td><td class="mono">deepseek-r1:14b</td><td>Ollama-Backup</td></tr>
+                <tr><td class="mono">q35-35b</td><td><span class="chip">显示别名</span></td><td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td><td class="mono">—</td><td>短名，替代实例里冗长的 id</td></tr>
+                <tr><td class="mono">q35-35b-nothink</td><td><span class="chip s2">派生模型</span></td><td class="mono">qwen3.6:35b-pruned</td><td>Ollama-Arc-B65</td><td class="mono">think=false</td><td>关掉思考，响应更快</td></tr>
+                <tr><td class="mono">q35-9b</td><td><span class="chip">显示别名</span></td><td class="mono">qwen3.5:9b</td><td>Ollama-Arc-B65</td><td class="mono">—</td><td>短名</td></tr>
+                <tr><td class="mono">ds14</td><td><span class="chip">显示别名</span></td><td class="mono">deepseek-r1:14b</td><td>Ollama-Backup</td><td class="mono">—</td><td>短名</td></tr>
               </tbody>
             </table>
+            <div style="font-size:11.5px;color:var(--text-dim);padding:6px 10px 4px;">
+              <code>upstreams[].model_aliases</code> 只是给已有模型换个显示名；写在根 <code>aliases:</code> 下的每一项都是
+              一个独立模型，带自己的固化参数，因此它单独占一行。
+            </div>
           </div>
         </div>
         <div class="foot">llm-hub 管理台 · Models · LLM（只读视图风格稿）</div>
@@ -1048,7 +1062,7 @@
           <div class="card-h">主要功能 <span class="tag">features</span></div>
           <div class="feat-grid">
             <div class="feat"><span class="fico">⛁</span><div><div class="ft">多上游聚合路由</div><div class="fd">按模型名精确匹配、前缀通配（qwen3:* / opencode/*）、优先级选择与宽松回退</div></div></div>
-            <div class="feat"><span class="fico">✦</span><div><div class="ft">别名与参数注入</div><div class="fd">aliases 统一对外命名，options 注入推理参数，num_ctx_overrides 固化上下文长度</div></div></div>
+            <div class="feat"><span class="fico">✦</span><div><div class="ft">别名与参数注入</div><div class="fd">model_aliases 给实例里的模型换短名，aliases 派生出带独立固化参数的新模型，num_ctx_overrides 固化上下文长度</div></div></div>
             <div class="feat"><span class="fico">◍</span><div><div class="ft">嵌入与重排</div><div class="fd">/api/embed、/v1/embeddings 原样透传；/v1/rerank 支持 logprobs 与 embedding 两种打分</div></div></div>
             <div class="feat"><span class="fico">◈</span><div><div class="ft">System One 决策</div><div class="fd">noul / choice / score 判定接口，兼容 laya-server 与 Ollama 0.40+ 后端</div></div></div>
             <div class="feat"><span class="fico">◎</span><div><div class="ft">Web 搜索</div><div class="fd">转发到 opencode-port 抓取网页段落与来源，可选由模型综合生成答案</div></div></div>

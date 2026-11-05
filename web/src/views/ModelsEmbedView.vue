@@ -5,7 +5,7 @@ import { useI18n } from 'vue-i18n'
 import ApiDoc from '@/components/ApiDoc.vue'
 import ConfigCard from '@/components/ConfigCard.vue'
 import TopBar from '@/components/TopBar.vue'
-import type { ApiParam, ApiRequestSpec, ApiResponseSpec, ConfigRow } from '@/types/ui'
+import type { ApiParam, ApiRequestSpec, ApiResponseSpec, ConfigRow, TestField } from '@/types/ui'
 
 type Tab = 'models' | 'api'
 
@@ -111,6 +111,44 @@ const openaiResponse = computed<ApiResponseSpec>(() => ({
     usage: { prompt_tokens: 12, total_tokens: 12 },
   },
 }))
+
+// Both testers mirror the parameter tables above minus `model`, which the selector owns. A
+// blank input is omitted, so the endpoint answers with its own default.
+const ollamaFields = computed<TestField[]>(() => [
+  {
+    key: 'input',
+    label: t('modelsEmbed.params.input'),
+    type: 'lines',
+    required: true,
+    def: 'Hello\nWorld',
+    wide: true,
+    hint: t('common.onePerLine'),
+  },
+  { key: 'truncate', label: t('modelsEmbed.params.truncate'), type: 'bool', def: 'true' },
+  { key: 'keep_alive', label: t('modelsEmbed.params.keepAlive'), type: 'text', def: '5m' },
+  { key: 'options', label: t('modelsEmbed.params.options'), type: 'json', wide: true },
+])
+
+const openaiFields = computed<TestField[]>(() => [
+  {
+    key: 'input',
+    label: t('modelsEmbed.params.input'),
+    type: 'lines',
+    required: true,
+    def: 'Hello\nWorld',
+    wide: true,
+    hint: t('common.onePerLine'),
+  },
+  {
+    key: 'encoding_format',
+    label: t('modelsEmbed.params.encodingFormat'),
+    type: 'select',
+    options: ['', 'float', 'base64'],
+    def: 'float',
+  },
+  { key: 'dimensions', label: t('modelsEmbed.params.dimensions'), type: 'number' },
+  { key: 'user', label: t('modelsEmbed.params.user'), type: 'text' },
+])
 </script>
 
 <template>
@@ -228,6 +266,7 @@ const openaiResponse = computed<ApiResponseSpec>(() => ({
       :request="ollamaRequest"
       :response="ollamaResponse"
       :note="t('modelsEmbed.docs.ollamaNote')"
+      :tester="{ kind: 'embed_ollama', fields: ollamaFields }"
     />
 
     <ApiDoc
@@ -237,6 +276,7 @@ const openaiResponse = computed<ApiResponseSpec>(() => ({
       :request="openaiRequest"
       :response="openaiResponse"
       :note="t('modelsEmbed.docs.openaiNote')"
+      :tester="{ kind: 'embed_openai', fields: openaiFields }"
     />
   </template>
 

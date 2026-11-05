@@ -8,7 +8,7 @@ import ApiDoc from '@/components/ApiDoc.vue'
 import ConfigCard from '@/components/ConfigCard.vue'
 import TopBar from '@/components/TopBar.vue'
 import type { ModelsRerank } from '@/types/api'
-import type { ApiParam, ConfigRow } from '@/types/ui'
+import type { ApiParam, ConfigRow, TestField } from '@/types/ui'
 import { fmtClock } from '@/utils/format'
 
 type Tab = 'models' | 'api'
@@ -61,6 +61,30 @@ const params = computed<ApiParam[]>(() => [
   { name: 'top_n', type: 'integer', required: false, desc: t('modelsRerank.params.topN') },
   { name: 'return_documents', type: 'boolean', required: false, desc: t('modelsRerank.params.returnDocuments') },
   { name: 'options', type: 'object', required: false, desc: t('modelsRerank.params.options') },
+])
+
+// The tester form mirrors the table above minus `model` (the selector owns it). A blank input
+// is left out, so the scorer keeps its configured default.
+const testFields = computed<TestField[]>(() => [
+  {
+    key: 'query',
+    label: t('modelsRerank.params.query'),
+    type: 'text',
+    required: true,
+    def: 'Which document talks about vectors?',
+  },
+  {
+    key: 'documents',
+    label: t('modelsRerank.params.documents'),
+    type: 'lines',
+    required: true,
+    def: 'Vectors power semantic search.\nThe capital of France is Paris.',
+    wide: true,
+    hint: t('common.onePerLine'),
+  },
+  { key: 'top_n', label: t('modelsRerank.params.topN'), type: 'number' },
+  { key: 'return_documents', label: t('modelsRerank.params.returnDocuments'), type: 'bool', def: 'false' },
+  { key: 'options', label: t('modelsRerank.params.options'), type: 'json', wide: true },
 ])
 
 async function load() {
@@ -183,6 +207,7 @@ onMounted(load)
           body: cfg.response_example,
         }"
         :note="t('modelsRerank.docs.note')"
+        :tester="{ kind: 'rerank', fields: testFields }"
       />
     </template>
   </template>

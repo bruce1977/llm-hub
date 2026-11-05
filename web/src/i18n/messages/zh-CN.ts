@@ -2,8 +2,8 @@
  * 简体中文（默认语言）。所有界面文案的源语言都在这里。
  *
  * 命名约定：按页面/组件分命名空间（shell / nav / common / dashboard / upstreams / requests /
- * modelsLlm / modelsEmbed / modelsRerank / modelsSystemOne / webSearch / about / login），
- * 键名用英文小驼峰，插值沿用 vue-i18n 的 `{name}` 语法。
+ * modelsLlm / modelsEmbed / modelsRerank / modelsSystemOne / webSearch / apiDoc / apiTester /
+ * about / login），键名用英文小驼峰，插值沿用 vue-i18n 的 `{name}` 语法。
  */
 const zhCN = {
   /** 侧栏菜单文案与页面标题共用一套名字，避免两处翻译漂移。 */
@@ -66,13 +66,19 @@ const zhCN = {
     notLoaded: '未加载',
     timeout: '超时',
     devicePartial: '● 部分',
-    aliasTip: 'config.yaml 为该模型配置了别名',
+    aliasTip: 'model_aliases 为它配置的显示别名',
     wildcardTip: '由前缀通配声明覆盖',
     realModel: '真实模型：{model}',
+    derivedTip: 'aliases 节点声明的模型，带独立的固化参数',
+    derivedFrom: '运行在 {target} 上',
     foot: 'llm-hub 管理台 · {page}',
     footReadOnly: 'llm-hub 管理台 · {page}（只读视图）',
     timeoutError: '请求超时，请稍后重试。',
     requestFailed: '请求失败。',
+    onePerLine: '每行一个',
+    add: '添加',
+    remove: '移除',
+    cancel: '取消',
   },
 
   topbar: {
@@ -89,6 +95,48 @@ const zhCN = {
     type: '类型',
     required: '必填',
     desc: '说明',
+    test: '测试',
+  },
+
+  apiTester: {
+    title: '接口测试',
+    disabled: '未启用',
+    running: '请求中…',
+    reprobe: '重新探测',
+    probing: '探测中…',
+    probeFailed: '模型列表读取失败：{detail}',
+    model: '模型',
+    pickModel: '请选择模型',
+    modelOrType: '选择或输入模型名',
+    customModel: '自定义模型…',
+    clearModel: '清除模型选择',
+    unservedTip: '这个名字没有在 config.yaml 里声明，网关不会路由到它',
+    fromSource: '可选模型来自 {source}',
+    requiredTag: '· 必选',
+    credentials: '附加密钥',
+    providerKey: '服务商密钥',
+    upstreamKey: '{upstream} 的密钥',
+    noKey: '这条请求不需要额外密钥。',
+    keyNote: '密钥只保存在服务端，页面只显示掩码。',
+    badNumber: '请输入数字。',
+    badJson: '不是合法的 JSON。',
+    unset: '不设置',
+    defaultIs: '默认：{value}',
+    withDefault: '{value}（默认）',
+    fixProblems: '请先修正标红的输入项。',
+    needModel: '请先选择模型。',
+    send: '发送测试',
+    restoreDefaults: '恢复默认值',
+    clear: '清空',
+    preview: '查看请求体',
+    duration: '耗时 {value}',
+    ttft: '首字 {value}',
+    stream: '流式',
+    routedTo: '实际路由：{route}',
+    injected: '注入参数 {params}',
+    answer: '回答',
+    rawBody: '响应内容',
+    truncated: '响应较大，只回传了前 {size} KB。',
   },
 
   dashboard: {
@@ -169,6 +217,7 @@ const zhCN = {
       modelWithUpstream: '模型 · {upstream}',
       status: '状态',
       path: '路径 / 关键字',
+      method: '请求方法',
       all: '全部',
       apply: '应用筛选',
     },
@@ -227,7 +276,7 @@ const zhCN = {
   },
 
   modelsLlm: {
-    sub: '配置文件 upstreams[].models 声明的模型 · 有别名时以别名显示 · 运行态来自 /api/ps',
+    sub: '配置文件 upstreams[].models 声明的模型 · model_aliases 短名优先显示 · aliases 每项独立成行 · 运行态来自 /api/ps',
     tabs: {
       models: '模型清单',
       api: 'API 用法',
@@ -253,11 +302,17 @@ const zhCN = {
     bench: '测速',
     emptyModels: '没有匹配的模型（检查 config.yaml 的 upstreams[].models）',
     aliases: {
-      title: '别名映射',
-      alias: '别名',
+      title: '别名与派生模型',
+      alias: '名称',
+      kind: '类型',
+      kindRename: '显示别名',
+      kindDerived: '派生模型',
       target: '目标模型',
+      params: '固化参数',
+      description: '说明',
       upstream: '上游',
       empty: '未配置别名',
+      note: '「显示别名」来自 upstreams[].model_aliases，只是给模型换个叫法，原名称照样能用；「派生模型」来自 aliases 节点，带自己的固化参数，是一个可以单独调用的新模型。',
     },
     overrides: {
       title: '上下文固化',
@@ -286,6 +341,7 @@ const zhCN = {
       images: 'base64 图片，供视觉模型使用',
       format: '结构化输出：字面量 json 或一份 JSON Schema',
       stream: '缺省即 true（NDJSON）；false 时返回单个 JSON 对象',
+      think: '思考开关（Ollama 原生 think 字段）；思考模型默认开启，测试窗口默认关闭',
       keepAlive: '模型驻留时长，如 "3m"、0（立即卸载）',
       logprobs: '返回逐 token 的对数概率',
       topLogprobs: '每个位置返回的候选数（1-20，需配合 logprobs）',
@@ -297,7 +353,18 @@ const zhCN = {
       temperature: '采样温度（0-2）',
       maxTokens: '最大生成 token 数',
       stream: '缺省即 true（SSE）；false 时返回单个 JSON 对象',
+      reasoningEffort: '思考强度（OpenAI 兼容）：none 关闭思考（Ollama），不设置则由后端决定',
       tools: '工具定义列表；function.arguments 必须是 JSON 字符串',
+    },
+    /** Descriptions for the nested parameters the tester splits out on its own - the table
+     *  above documents `options` as a single object. The input's own label already shows the
+     *  dotted key, so these stay short. */
+    tester: {
+      temperature: '采样温度',
+      topP: '核采样',
+      numCtx: '上下文长度（仍会被 num_ctx_overrides 裁剪）',
+      numPredict: '最多生成 token 数',
+      streamHint: '测试窗口默认关闭：不勾选会显式发送 false，勾选发送 true',
     },
     responses: {
       generateNote: 'stream 缺省或为 true：每行一个 JSON 对象，最后一行 done: true',
@@ -489,6 +556,10 @@ const zhCN = {
       criteria: 'choice / score 的候选标签：choice 用 object、score 用 2–10 项数组，两家后端均通过校验',
       model: '取值见「模型清单」Tab；缺省时由网关按配置注入，laya-server 只接受枚举，Ollama 需真实模型名',
     },
+    /** The tester's own labels - the parameter table above has no `stream` row. */
+    tester: {
+      stream: '逐块返回决策结果',
+    },
     docs: {
       responseNote: '透传 · 决策结果由 System One 后端返回',
       note: '请求体与响应体均原样透传给 System One 后端（laya-server 或 Ollama 0.40+）；网关只做调用方 API Key 鉴权，并用 api_key_env 指向的环境变量密钥签名上游调用。',
@@ -564,7 +635,7 @@ const zhCN = {
       },
       aliases: {
         title: '别名与参数注入',
-        desc: 'aliases 统一对外命名，options 注入推理参数，num_ctx_overrides 固化上下文长度',
+        desc: 'model_aliases 给实例里的模型换短名，aliases 派生出带独立固化参数的新模型，num_ctx_overrides 固化上下文长度',
       },
       embed: {
         title: '嵌入与重排',
@@ -648,15 +719,59 @@ const zhCN = {
   },
 
   settings: {
-    sub: '管理台设置',
-    comingSoon: '此模块即将开放',
-    desc: '只读视图阶段不开放配置写入口。以下能力将在后续版本按需开放：',
-    upcoming: {
-      apiKeys: 'API Keys 管理',
-      rerank: 'Rerank 配置',
-      security: 'Security 规则',
-      playground: 'Playground 调试',
-      upstreams: '上游增删改',
+    sub: '管理台设置 · 分 Tab 配置 config.yaml',
+    save: '保存配置',
+    saveOk: '配置已保存并热重载',
+    saveValidationFailed: '以下配置段校验未通过',
+    saveConfirmTitle: '确认覆盖 config.yaml？',
+    saveConfirmBody:
+      '此操作将以「完整配置对象」覆盖整个 config.yaml。本页编辑的 4 个段（Upstream / Rerank / System One / Web Search）会被写入；未在此页开放的高级段（server / auth / security / aliases 等）将按当前文件原样保留，不会丢失。',
+    saveConfirmYes: '覆盖保存',
+    addUpstream: '添加上游',
+    noUpstreams: '暂无上游，点击「添加上游」新增一个。',
+    tagPlaceholder: '输入后回车添加',
+    upstreamAuto: '自动（第一个 opencode 上游）',
+    noOpencodeUpstream: '未找到 type=opencode 的上游，Web Search 将不可用；请先在 Upstream 页添加一个。',
+    upstreamMissing: '不存在或不是 opencode 类型',
+    tabs: {
+      upstream: 'Upstream',
+      rerank: 'Rerank',
+      systemone: 'System One',
+      websearch: 'Web Search',
+    },
+    fields: {
+      name: '名称',
+      base_url: '地址',
+      type: '类型',
+      models: '模型',
+      model: '模型名',
+      model_aliases: '模型别名',
+      timeout: '超时(秒)',
+      priority: '优先级',
+      description: '说明',
+      enabled: '启用',
+      endpoint: '端点',
+      mode: '模式',
+      instruction: '指令',
+      yes_token: 'Yes 词',
+      no_token: 'No 词',
+      temperature: '温度',
+      top_logprobs: 'Top Logprobs',
+      max_tokens: '最大 Token',
+      token_scan_depth: 'Token 扫描深度',
+      stop: '停止词',
+      keep_alive: '保活',
+      normalize: '归一化',
+      return_documents: '返回文档',
+      on_error: '出错处理',
+      upstream_api: '上游 API',
+      max_concurrency: '最大并发',
+      disable_thinking: '禁用思考',
+      options: '选项',
+      backend: '后端地址',
+      upstream: '上游',
+      api_key_env: 'API Key 环境变量',
+      path: '路径',
     },
   },
 }

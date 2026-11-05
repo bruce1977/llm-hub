@@ -9,7 +9,7 @@ import ConfigCard from '@/components/ConfigCard.vue'
 import JsonPane from '@/components/JsonPane.vue'
 import TopBar from '@/components/TopBar.vue'
 import type { ModelsSystemOne } from '@/types/api'
-import type { ApiParam, ConfigRow } from '@/types/ui'
+import type { ApiParam, ConfigRow, TestField } from '@/types/ui'
 import { fmtClock } from '@/utils/format'
 
 type Tab = 'models' | 'api'
@@ -53,6 +53,37 @@ const params = computed<ApiParam[]>(() => [
   { name: 'questions[].criteria', type: 'string[] | object', required: false, desc: t('modelsSystemOne.params.criteria') },
   { name: 'model', type: 'string', required: false, desc: t('modelsSystemOne.params.model') },
 ])
+
+// The body is passed through untouched, so the tester starts from the documented example the
+// projection returns - one click sends a request either backend accepts. `model` comes from the
+// selector, which may also take a name typed by hand (laya wants an enum, Ollama a real model).
+function jsonOf(value: unknown): string {
+  return value === undefined ? '' : JSON.stringify(value)
+}
+
+const testFields = computed<TestField[]>(() => {
+  const example: Record<string, unknown> = cfg.value?.request_example ?? {}
+  return [
+    {
+      key: 'state',
+      label: t('modelsSystemOne.params.state'),
+      type: 'json',
+      required: true,
+      def: jsonOf(example.state),
+      wide: true,
+    },
+    {
+      key: 'questions',
+      label: t('modelsSystemOne.params.questions'),
+      type: 'json',
+      required: true,
+      def: jsonOf(example.questions),
+      wide: true,
+      hint: t('modelsSystemOne.params.questionType'),
+    },
+    { key: 'stream', label: t('modelsSystemOne.tester.stream'), type: 'bool' },
+  ]
+})
 
 const rows = computed<ConfigRow[]>(() => {
   const c = cfg.value
@@ -198,6 +229,7 @@ onMounted(load)
           body: responseExample,
         }"
         :note="t('modelsSystemOne.docs.note')"
+        :tester="{ kind: 'systemone', fields: testFields }"
       />
 
       <div class="card">

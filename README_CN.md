@@ -32,9 +32,9 @@ clients                              llm-hub                                 bac
 | **按模型路由** | 请求体里的 `model` 决定去哪个上游，客户端不用记端口。同一模型多处部署时按 `priority` 最小者优先。 |
 | **一层统一鉴权** | 多 Key 并存、常量时间比较、兼容 `Bearer` / `X-API-Key`。Key 只来自环境变量或密钥文件，不落 `config.yaml`。 |
 | **补齐 Ollama 缺的接口** | `POST /v1/rerank`（logprobs 或向量打分）与 `POST /v1/tools/web-search`，都路由到能提供服务的那个上游。 |
-| **别名与参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并注入 `think: false`；还可按模型固定 `num_ctx`，避免 Ollama 反复重建。 |
+| **别名与参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并注入 `think: false`；`aliases` 里的每一项都是一个独立模型，管理台单独列成一行，`model_aliases` 只负责改名。还可按模型固定 `num_ctx`，避免 Ollama 反复重建。 |
 | **流式原样透传** | NDJSON（`/api/chat`、`/api/generate`）与 SSE（`/v1/chat/completions`）不改写，计时字段一并保留。 |
-| **管理台 + 观测** | `/admin` 上的 Vue 控制台、SQLite 请求明细、每模型**测速**（TTFT、decode / prefill 速度、保留最近 3 次），界面支持中文 / English。 |
+| **管理台 + 观测** | `/admin` 上的 Vue 控制台、SQLite 请求明细、每模型**测速**（TTFT、decode / prefill 速度、保留最近 3 次）、每个文档化接口都在参数表右上角提供**测试**按钮（浮层表单，默认值已填好），界面支持中文 / English。 |
 
 ## 界面截图
 
@@ -103,7 +103,7 @@ curl http://localhost:8888/health
 
 | 文档 | 内容 |
 |---|---|
-| [USAGE_CN.md](docs/USAGE_CN.md) | 全部细节：配置详解（`server` / `auth` / `upstreams` / `routing` / `aliases` / `rerank` / `websearch` / `request_log`）、集成 LM Studio、管理台实现、完整接口说明、常见问题、公网安全清单、本地开发 |
+| [USAGE_CN.md](docs/USAGE_CN.md) | 全部细节：配置详解（`server` / `auth` / `upstreams` / `routing` / `aliases` / `api_models` / `rerank` / `websearch` / `request_log`）、集成 LM Studio、管理台实现、完整接口说明、常见问题、公网安全清单、本地开发 |
 | [docs/API.md](docs/API.md) | 转发规则、错误码、请求/响应示例 |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | 镜像构建与发布脚本、反向代理、挂载 |
 | [docs/TESTCASES.md](docs/TESTCASES.md) | 端到端测试矩阵（smoke / management / gateway） |

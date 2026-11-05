@@ -3,7 +3,7 @@
 
 import { i18n } from '@/i18n'
 
-export type BadgeClass = 'idle' | 'gpu' | 'part' | 'cpu' | 'cloud' | 'ok' | 'err'
+export type BadgeClass = 'idle' | 'gpu' | 'part' | 'cpu' | 'cloud' | 'ok' | 'err' | 'warn'
 
 export interface Badge {
   cls: BadgeClass
@@ -80,7 +80,7 @@ export function toInputValue(value: string | null | undefined): string {
   const date = parseUtc(value)
   if (!date) return ''
   const pad = (n: number): string => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 export function fromInputValue(value: string | null | undefined): string | null {
@@ -93,13 +93,30 @@ export function fromInputValue(value: string | null | undefined): string | null 
 export function hoursAgoInput(hours: number): string {
   const date = new Date(Date.now() - hours * 3600 * 1000)
   const pad = (n: number): string => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 export function nowInputValue(): string {
   const date = new Date()
   const pad = (n: number): string => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+// Default range helpers: a 7-day (calendar) window whose edges are aligned to
+// 00:00 / 23:59 instead of "now minus N hours", so the dashboard opens on clean day boundaries.
+export function daysAgoStartInput(days: number): string {
+  const date = new Date()
+  date.setHours(0, 0, 0, 0)
+  date.setDate(date.getDate() - (days - 1))
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+export function todayEndInput(): string {
+  const date = new Date()
+  date.setHours(23, 59, 0, 0)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 export function deviceBadge(device: string | null | undefined, _ratio?: number | null): Badge {
@@ -112,5 +129,7 @@ export function deviceBadge(device: string | null | undefined, _ratio?: number |
 
 export function statusBadge(status: number | null | undefined): Badge {
   if (status === null || status === undefined) return { cls: 'idle', text: '—' }
-  return status < 400 ? { cls: 'ok', text: String(status) } : { cls: 'err', text: String(status) }
+  if (status >= 500) return { cls: 'err', text: String(status) } // 5xx -> red
+  if (status >= 300) return { cls: 'warn', text: String(status) } // 3xx / 4xx -> yellow
+  return { cls: 'ok', text: String(status) } // 2xx -> green
 }

@@ -39,6 +39,8 @@ upstreams:
   type: lmstudio
   base_url: http://host.docker.internal:1234
   models: []
+  # Display rename only: the model is unchanged, it is simply shown and called under this
+  # short name. It does not add a model - for that, use the root `aliases` node below.
   model_aliases:
     qwen3.5:9b: qwen/qwen3.5-9b
   timeout: 600
@@ -54,6 +56,9 @@ upstreams:
   priority: 30
   description: 'OpenCode API Gateway: free built-in models (OpenAI-compatible chat) plus the web search provider used by POST /v1/tools/web-search. Set base_url to your gateway address; remove this upstream if you do not want it.'
 default_upstream: ollama
+# Each entry below is a model of its own: `model` is what actually gets forwarded upstream,
+# `params` are force-injected, and the console lists the alias as a separate row (its target
+# stays callable under its own name). A pure display rename belongs in `model_aliases`.
 aliases:
   qwen3:4b-nothink:
     model: qwen3:4b
@@ -69,12 +74,27 @@ aliases:
 num_ctx_overrides:
   qwen3.6:35b-pruned: 65536
   qwen3.5:9b: 16384
+# Which models each API family may offer. The console's per-endpoint testers read this: a
+# model that answers /api/embed must not appear in the chat selector, and nothing in
+# `upstreams[].models` says which role a model plays. Every list is optional, and a name may
+# be a real model id or any alias. Left empty, the choices are derived instead: `rerank`
+# falls back to rerank.models, `systemone` to systemone.model, and the rest to every
+# declared model minus the names another family claims (`generate` drops the embed, rerank
+# and systemone names; a `websearch` claim does not count, because web search is a chat
+# pass-through). The two Ollama-native testers (/api/generate, /api/embed) also drop models
+# served by an lmstudio / opencode upstream, which only implements the /v1 side; the OpenAI
+# compatible testers keep them. These lists only ever narrow what the selector shows.
+api_models:
+  generate: []
+  embed: []
+  rerank: []
+  systemone: []
+  websearch: []
 rerank:
   enabled: true
   endpoint: /v1/rerank
   mode: logprobs
   models:
-  - qwen3-reranker:4b-rk
   - qwen3-reranker:4b
   instruction: Given a web search query, retrieve relevant passages that answer the query. A passage is relevant only if it directly answers the specific question asked. Passages that merely share the same broad topic, mention related keywords, or talk about the same field or entity without answering the question are NOT relevant.
   yes_token: 'yes'

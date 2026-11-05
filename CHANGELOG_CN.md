@@ -7,6 +7,31 @@
 
 ## [未发布]
 
+### 新增（每个「API 用法」标签页都带接口测试窗口，并新增 `api_models` 配置）
+
+- **管理台里每一个文档化接口都能真的发请求**：Models · LLM、Models · Embed、Models · Rerank、Models · System One、Tools · Web Search 的「API 用法」标签页，每个端点「请求参数」标题右侧都有一个**测试**按钮，点开后是页面上的**浮层**测试窗口（不再嵌在文档下方）——共 7 种（`generate`、`chat`、`embed_ollama`、`embed_openai`、`rerank`、`systemone`、`websearch`）。选模型、改参数、点测试，就能看到状态码、耗时、路由到的上游、被注入的别名参数、拼装出的回答与原始响应体。窗口首次打开才挂载、之后只切换显示，所以关掉再开不会丢掉填过的内容与上一次答复
+- **请求在网关内部执行**（`app/api_test.py`）：管理台会话 Cookie 只过 `require_admin`，它并不是调用方的 API Key，所以测试窗口构造一个合成的 ASGI `Request` 交给网关自己的服务。别名与参数注入、`num_ctx_overrides` 收敛、被屏蔽的管理路径、请求明细落库全部与真实客户端一致；`KINDS` 是一张封闭白名单，无法借它访问任意地址
+- **新增 `api_models` 配置块**（`api_models.generate` / `embed` / `rerank` / `systemone` / `websearch`）用来收窄每类 API 的模型选择框：留空按规则推导（`rerank.models`、`systemone.model`，其余取可调用池）；填写时每一项可以是真实模型 id、别名或派生模型名；被**其它家族显式认领**的名字（`embed` / `rerank` / `systemone` 与 `rerank.models`）不再出现在 generate/chat 里，比较时忽略结尾的 `:latest`（Ollama 把 `tev1` 与 `tev1:latest` 当同一个模型），而 `systemone.model` 这类兜底不算认领；`websearch` 同样不算——搜索端点本质是聊天透传，托管 provider 的路由模型（`opencode/auto`）必须继续可选。`websearch` 与 `systemone` 额外允许手填，因为这两处的 `model` 可省略、由后端自行解析。这些列表只影响管理台展示，路由逻辑不变
+- **Ollama 原生的测试窗口只列 Ollama 模型**：`POST /api/generate` 与 `POST /api/embed` 是 Ollama
+  自己的接口，所以这两个窗口按规则推导时只保留 `type: "ollama"` 上游的行——`lmstudio` /
+  `opencode` 的模型在这里发出去必然上游 404。同样的模型在 `POST /v1/chat/completions` 与
+  `POST /v1/embeddings` 窗口里照常可选（这两类上游实现的正是 `/v1` 侧），显式 `api_models`
+  列表仍按原样展示
+- `GET /v1/management/api-test/models` 按 kind 返回接口地址、可选模型（配了别名显示名，否则显示配置名）、预选项、各参数默认值、是否允许自由输入、该功能是否 `enabled`；若这一类 API 需要额外签名，则给出 `api_key_env` 变量名和固定掩码 `••••••`。`POST /v1/management/api-test` 返回信封（`status`、`ok`、`duration_ms`、`ttft_ms`、`stream`、`content_type`、`body`/`text`、`truncated`，以及实际生效的 `requested_model` / `model` / `upstream` / `injected`）。响应体上限 128 KB；5 个页面共用 `useApiTestContext()` 的一份探测结果，打开测试窗口不会重复探测所有上游
+- 表单**一打开就带着初始值**：显示的就是端点本来会用的值，没有默认值的下拉也会显示「（未设置）」而不是一片空白。「恢复默认值」重新填入（原名「填入默认值」），「清空」清空全部字段与模型选择。**有文档默认值的布尔参数改成复选框**：勾选与否都显式发送 `true` / `false`（不勾选就是 false，而不是「不发」）；没有默认值的布尔仍是三态下拉，System One 这类可选 `stream` 还能留空。其余清空的字段**不会**进入请求体，而是让端点用自己的默认值。两个 LLM 窗口的 `stream` 默认关闭（先拿到单个 JSON），generate 窗口加了默认关闭的 `think` 复选框，chat 窗口提供 OpenAI 兼容的 `reasoning_effort`。模型选择框**只列名字/别名**（配了别名用别名，否则用配置里的声明名），上游与运行状态移进悬停提示，**模型可以随时清除**（字段旁的 × 或下拉的空白项）：清除后请求体不带 `model`，需要模型的家族发送前会提示「请先选择模型」，System One / Web Search 则交给端点决定
+- System One / Web Search 的模型**是真正的下拉框**，默认选中 `default_model`（Web Search 留空），列表末尾多一项「自定义模型…」：选中后换成可手输的输入框（自动聚焦、带候选提示），再选回列表里的名字就收起。之前的输入框预填了默认值，而 Chromium 会按框内文字过滤 `<datalist>`，所以 System One 里选了 `tev1` 就再也看不到 `nimble`；现在下拉里 `tev1`、`nimble` 一目了然。流式相关徽标与首 token 计时按实际观察到的 `content_type` 判定，一个整体返回的 JSON 响应不会再声称自己是流式。数字参数不再让窗口崩溃：`type="number"` 上的 `v-model` 会给出 number，所以读取前统一用 `String(...)` 再 `trim`
+- **`HEAD` 请求只转发、不写请求明细**：它没有请求体也没有响应体，监控探活又会持续发送；判定只在 `logging_on = self._logging_on(cfg) and method != "HEAD"` 一处。按默认的 `allowed_http_methods: [GET, POST]`，HEAD 在到达代理前就会收到 `405`
+- System One 配置投影的 `request_example` 改为 **object** 形式的 `choice.criteria`：Ollama 0.40+ 收到数组会回 `400 "criteria" must be a non-empty object`，而 laya-server 两种都接受，所以同一个示例在两个后端都能直接跑通
+- 文档：`docs/API.md`（两条路由 + **接口测试（api-test）** 一节）、`docs/USAGE.md` / `USAGE_CN.md`（`api_models` 配置详解、**接口测试** 特性行与管理台正文）、`docs/TESTCASES.md`、`docs/web-management/*` 与 `AGENTS.md`；`test_management.py` 增至 297 项断言
+
+### 新增（`aliases:` 声明的模型作为一个独立模型显示）
+
+- **两个概念，现在是两行**：`upstreams[].model_aliases` 里的每一项只是给已有模型换个短名；根 `aliases:` 里的每一项则是**一个独立模型**——它带自己的固化参数（如 `think: false`），目标模型仍可调用、仍按自己的默认参数运行。此前管理台把两者混为一谈：根别名会把目标那一行改名，自己却不成模型行，所以 `qwen3.5:4b-nothink` 在界面上根本看不到
+- `Config` 现在记录了哪些别名名是 `_expand_upstream_aliases` 生成的（`is_renamed_model()` / `derived_aliases()`）；路由与 `/v1/models` 的行为不变
+- `/v1/management/overview`、`/upstreams/{name}`、`/models/llm` 输出 `derived: true` 的派生模型行，并带 `target` / `params` / `description`：派生行紧跟它的目标模型，设备与 `num_ctx` 沿用目标模型在 `/api/ps` 里的运行态，`size_gib` / `vram_gib` 为 `null`，因此显存与 KPI「运行中模型数」只计同一个实例一次；`_alias_by_target()` 不再让根别名给目标模型改名；`aliases[]` 新增 `kind: "rename" | "derived"`
+- 管理台：总览、上游展开行、Models · LLM、联网检索「可用模型」的模型行都加了 `derived` 角标；「别名映射」表改为**别名与派生模型**（名称 / 类型 / 目标模型 / 上游 / 固化参数 / 说明）；派生模型行的测速与悬停历史都按**目标模型**发起并带上别名的 `params.think`（上游并不认识别名名）
+- 文档：`docs/USAGE.md` / `USAGE_CN.md`（`aliases` 段与两处 `model_aliases`）、`docs/API.md`、`docs/TESTCASES.md`、`docs/web-management/*` 与 `AGENTS.md` 都写清「改名 vs 新增模型」；`test_management.py` 增至 219 项断言
+
 ### 变更（文档：README 精简为落地页 + 新增 USAGE 手册与界面截图）
 
 - **README / README_CN 重写为落地页**：一句话定位 + 客户端/网关/后端示意图 + 6 条核心能力 + 6 张真实截图 + 三步快速启动 + 最小可跑的 `curl` 示例 + 文档索引，篇幅从 1000 行级压到 160 行内，进仓库第一眼就能看清「这是干什么的」

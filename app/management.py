@@ -33,13 +33,26 @@ from admin_auth import (
     get_admin_password,
     require_admin,
 )
+from api_test import MAX_RESPONSE_BYTES, KINDS, execute, get_kind
+from auth import client_ip
 from bench import BenchError, BenchOptions, run_bench
 from bench_store import BenchStore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi import status as http_status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from request_log import _DISTRIBUTION_KEYS, MAX_PAGE_SIZE, normalize_ts, now_ts
+
+import yaml
+
+from config import (
+    Config,
+    RerankConfig,
+    SystemOneConfig,
+    UpstreamConfig,
+    WebSearchConfig,
+    _dump_yaml,
+)
 
 logger = logging.getLogger("llm_hub")
 
@@ -138,13 +151,76 @@ def _masked_key(upstream) -> str | None:
 
 
 def _alias_by_target(cfg) -> dict[tuple[str, str], str]:
-    """``(upstream name, real model id) -> exposed alias``; the first declaration wins."""
+    """``(upstream name, real model id) -> renamed model``; the first declaration wins.
+
+    Only `upstreams[].model_aliases` belongs here: it is a pure display rename, so the
+    declared model is shown under its short name. An entry written under root `aliases:`
+    is a model of its own (it can carry its own fixed parameters) and the target stays
+    reachable under its real id, so it must not rename anything - it gets its own row.
+    """
     mapping: dict[tuple[str, str], str] = {}
     for alias_name, alias in cfg.aliases.items():
+        if not cfg.is_renamed_model(alias_name):
+            continue
         owner = cfg.get_upstream(alias.upstream) or cfg.find_upstream_for_model(alias.model)
         if owner is not None:
             mapping.setdefault((owner.name, alias.model), alias_name)
     return mapping
+
+
+def _derived_row(cfg, runtime: dict[tuple[str, str], dict[str, Any]], reachable: dict[str, bool], name: str, alias) -> dict[str, Any] | None:
+    """One root `aliases:` entry, listed as the separate model it is.
+
+    The alias is what the caller sends, so it is both `model` and `display`, and the real
+    id stays in `target`. Device and context length are read from the target because that
+    is the instance Ollama actually holds in memory; memory is deliberately `null` - the
+    same instance is already counted under its own name, so this row must not read as a
+    second allocation.
+    """
+    owner = (
+        cfg.get_upstream(alias.upstream)
+        or cfg.find_upstream_for_model(alias.model)
+        or cfg.default_upstream_obj()
+    )
+    if owner is None:
+        return None
+    live = runtime.get((owner.name, alias.model))
+    hosted = owner.type == "opencode" and reachable.get(owner.name, False)
+    return {
+        "model": name,
+        "display": name,
+        "alias": None,
+        "derived": True,
+        "target": alias.model,
+        "params": alias.params,
+        "description": alias.description,
+        "upstream": owner.name,
+        "type": owner.type,
+        "wildcard": False,
+        "running": live is not None or hosted,
+        "device": live["device"] if live else ("cloud" if hosted else None),
+        "device_ratio": live["device_ratio"] if live else None,
+        "num_ctx": (live["num_ctx"] if live else None) or cfg.num_ctx_overrides.get(alias.model),
+        "size_gib": None,
+        "vram_gib": None,
+        "expires_at": None,
+    }
+
+
+def _derived_rows(
+    cfg,
+    runtime: dict[tuple[str, str], dict[str, Any]],
+    reachable: dict[str, bool],
+    *,
+    available_only: bool = False,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for name, alias in cfg.derived_aliases().items():
+        row = _derived_row(cfg, runtime, reachable, name, alias)
+        if row is None or (available_only and not row["running"]):
+            continue
+        rows.append(row)
+    return rows
 
 
 def _match_running(runtime: dict[tuple[str, str], dict[str, Any]], upstream_name: str, pattern: str):
@@ -198,6 +274,7 @@ def _llm_row(
         "model": name,
         "display": alias or name,
         "alias": alias,
+        "derived": False,
         "upstream": upstream.name,
         "type": upstream.type,
         "wildcard": via_wildcard,
@@ -234,6 +311,7 @@ def _device_entry(
         "model": name,
         "display": alias or name,
         "alias": alias,
+        "derived": False,
         "upstream": upstream_name,
         "device": device,
         "device_ratio": round(ratio, 3),
@@ -375,6 +453,7 @@ def _hosted_models(
                     "model": name,
                     "display": alias or name,
                     "alias": alias,
+                    "derived": False,
                     "upstream": upstream.name,
                     "device": "cloud",
                     "device_ratio": None,
@@ -394,11 +473,16 @@ async def overview(request: Request, _=Depends(require_admin)):
     infos = await _probe_all(cfg, client)
     today = await _log(request).today_summary()
 
-    running = [model for info in infos for model in info["running_models"]]
+    available = [model for info in infos for model in info["running_models"]]
     aliases = _alias_by_target(cfg)
     discovered = await _wildcard_discovery(cfg, client)
     reachable = {i["name"]: i["reachable"] for i in infos}
-    running.extend(_hosted_models(cfg, aliases, discovered, reachable))
+    available.extend(_hosted_models(cfg, aliases, discovered, reachable))
+    # A model declared under root `aliases:` is listed next to its target because callers can
+    # ask for it, but it never joins the KPI count: it runs inside the instance already
+    # counted under its own id, so counting it again would inflate both the models and the VRAM.
+    runtime = {(i["name"], m["model"]): m for i in infos for m in i["running_models"]}
+    running = [*available, *_derived_rows(cfg, runtime, reachable, available_only=True)]
     vram_total = sum(i["vram_total_gib"] for i in infos if i["vram_total_gib"] is not None)
     has_total = any(i["vram_total_gib"] is not None for i in infos)
     return JSONResponse(
@@ -406,7 +490,7 @@ async def overview(request: Request, _=Depends(require_admin)):
             "kpi": {
                 "upstreams_online": sum(1 for i in infos if i["reachable"]),
                 "upstreams_total": len(infos),
-                "running_models": len(running),
+                "running_models": len(available),
                 "vram_used_gib": round(sum(i["vram_used_gib"] for i in infos), 1),
                 "vram_total_gib": round(vram_total, 1) if has_total else None,
                 "requests_today": today["requests_today"],
@@ -435,8 +519,9 @@ async def upstream_detail(name: str, request: Request, _=Depends(require_admin))
     """Live probe plus the models this upstream declares in ``config.yaml``.
 
     Plain names are listed as written; only a prefix wildcard is resolved through the
-    upstream's model list, which is the same call the gateway's routing makes. An aliased
-    model is shown under its alias.
+    upstream's model list, which is the same call the gateway's routing makes. A
+    `model_aliases` rename replaces the name it renames; a model declared under root
+    `aliases:` is added next to its target, because both names are callable.
     """
     cfg = request.app.state.manager.config
     client = request.app.state.client
@@ -452,14 +537,24 @@ async def upstream_detail(name: str, request: Request, _=Depends(require_admin))
     aliases = _alias_by_target(cfg)
     discovered = await _wildcard_discovery(cfg, client)
     names = [name for name, _ in _declared_models(upstream, discovered.get(upstream.name, []))]
+    runtime = {(upstream.name, model["model"]): model for model in info["running_models"]}
+    derived = [
+        row
+        for row in _derived_rows(cfg, runtime, {upstream.name: True})
+        if row["upstream"] == upstream.name
+    ]
     return JSONResponse(
         {
             **_public_upstream(info),
-            "models": [aliases.get((upstream.name, model), model) for model in names],
+            "models": [
+                *(aliases.get((upstream.name, model), model) for model in names),
+                *(row["model"] for row in derived),
+            ],
             # A hosted provider has no /api/ps, so its available models are the declared ones.
             "running_models": [
                 *info["running_models"],
                 *_hosted_models(cfg, aliases, discovered, {upstream.name: True}),
+                *(row for row in derived if row["running"]),
             ],
             "unreachable": False,
         }
@@ -476,8 +571,9 @@ async def models_llm(request: Request, _=Depends(require_admin)):
     Only ``upstreams[].models`` is listed - a model installed on the instance but never
     declared is not routable through the gateway, so it does not belong in this table. A
     prefix wildcard (``opencode/*``) is expanded to the names it actually matches, because
-    the pattern itself is not a model. A declared name that has an alias is displayed under
-    the alias (``display``) while ``model`` keeps the real upstream id.
+    the pattern itself is not a model. A ``model_aliases`` rename replaces the declared name
+    (``display``) while ``model`` keeps the real upstream id; an entry under root
+    ``aliases:`` is a model of its own and gets its own row right after its target.
     """
     cfg = request.app.state.manager.config
     client = request.app.state.client
@@ -487,11 +583,18 @@ async def models_llm(request: Request, _=Depends(require_admin)):
     aliases = _alias_by_target(cfg)
     discovered = await _wildcard_discovery(cfg, client)
 
-    models = [
-        _llm_row(cfg, aliases, runtime, reachable, upstream, name, via_wildcard)
-        for upstream in cfg.upstreams
-        for name, via_wildcard in _declared_models(upstream, discovered.get(upstream.name, []))
-    ]
+    # A derived model reads best next to the instance it runs on, so each one is inserted
+    # after its target; one whose target nothing declares lands at the end instead.
+    pending = {row["model"]: row for row in _derived_rows(cfg, runtime, reachable)}
+    models: list[dict[str, Any]] = []
+    for upstream in cfg.upstreams:
+        for name, via_wildcard in _declared_models(upstream, discovered.get(upstream.name, [])):
+            models.append(_llm_row(cfg, aliases, runtime, reachable, upstream, name, via_wildcard))
+            for model_name, row in list(pending.items()):
+                if row["upstream"] == upstream.name and row["target"] == name:
+                    models.append(row)
+                    pending.pop(model_name)
+    models.extend(pending.values())
 
     alias_rows = []
     for alias_name, alias in cfg.aliases.items():
@@ -499,6 +602,7 @@ async def models_llm(request: Request, _=Depends(require_admin)):
         alias_rows.append(
             {
                 "alias": alias_name,
+                "kind": "rename" if cfg.is_renamed_model(alias_name) else "derived",
                 "target": alias.model,
                 "upstream": owner.name if owner else None,
                 "params": alias.params,
@@ -587,7 +691,13 @@ async def models_systemone(request: Request, _=Depends(require_admin)):
                     "intent": {
                         "type": "choice",
                         "instructions": "What is the customer's primary intent?",
-                        "criteria": ["refund", "cancel", "other"],
+                        # An object, not a list: Ollama rejects an array with 400, and
+                        # laya-server accepts this shape too.
+                        "criteria": {
+                            "refund": "asks for a refund",
+                            "cancel": "wants to cancel",
+                            "other": "anything else",
+                        },
                     },
                 },
                 "model": so.model,
@@ -638,6 +748,7 @@ async def list_requests(
     upstream: str | None = None,
     model: str | None = None,
     status: str | None = None,
+    method: str | None = None,
     path: str | None = None,
     page: int = 1,
     page_size: int = 15,
@@ -673,6 +784,7 @@ async def list_requests(
         upstream=upstream or None,
         model=model or None,
         status=status or None,
+        method=method or None,
         path=path or None,
         page=page,
         page_size=page_size,
@@ -914,4 +1026,360 @@ async def bench_status(job_id: str, _=Depends(require_admin)):
         "created_at": job.created_at,
         "finished_at": job.finished_at,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Interactive API testers (the console's "API usage" tabs)
+# --------------------------------------------------------------------------- #
+def _family_list(cfg, family: str) -> tuple[list[str], str]:
+    """The model names a family may offer, plus where they came from.
+
+    `api_models.<family>` always wins; otherwise each family falls back to the block that
+    already names its models (`rerank.models`, `systemone.model`), and with nothing declared
+    the caller gets the whole pool (`upstreams[].models`) so a tester is never empty.
+    """
+    explicit = list(getattr(cfg.api_models, family, []))
+    if explicit:
+        return explicit, f"api_models.{family}"
+    if family == "rerank" and cfg.rerank.models:
+        return list(cfg.rerank.models), "rerank.models"
+    if family == "systemone" and cfg.systemone.model not in {"", "local"}:
+        return [cfg.systemone.model], "systemone.model"
+    return [], "upstreams[].models"
+
+
+def _callable_pool(cfg, aliases, discovered, runtime, reachable) -> dict[str, dict[str, Any]]:
+    """Every name a caller can actually send, keyed by that name.
+
+    Declared models (wildcards already expanded) plus one entry per root `aliases:` model,
+    which is a name of its own. A prefix pattern nothing matched is not a sendable name, so
+    it never joins the pool.
+    """
+    pool: dict[str, dict[str, Any]] = {}
+    for upstream in cfg.upstreams:
+        for name, via_wildcard in _declared_models(upstream, discovered.get(upstream.name, [])):
+            if name.endswith("*"):
+                continue
+            row = _llm_row(cfg, aliases, runtime, reachable, upstream, name, via_wildcard)
+            row["api_key"] = _masked_key(upstream)
+            row["unknown"] = False
+            pool.setdefault(name, row)
+    for row in _derived_rows(cfg, runtime, reachable):
+        owner = cfg.get_upstream(row["upstream"])
+        row["api_key"] = _masked_key(owner) if owner else None
+        row["unknown"] = False
+        pool.setdefault(row["model"], row)
+    return pool
+
+
+def _pool_row_for_name(cfg, name: str, pool: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Row for a name written in an `api_models` list.
+
+    It may be the real id (a pool entry), an alias of one (the alias is kept as the name to
+    send, so the gateway still applies its injected parameters) or a name nothing serves -
+    which stays visible, because a dead entry is a misconfiguration to show, not hide.
+    """
+    found = pool.get(name)
+    if found is not None:
+        return found
+    resolved = cfg.resolve(name)
+    target = pool.get(resolved.target)
+    if target is not None:
+        row = dict(target)
+        row.update({"model": name, "display": name, "alias": name, "unknown": False})
+        if not resolved.is_alias:
+            row["derived"] = False
+        row["target"] = resolved.target
+        return row
+    return {
+        "model": name,
+        "display": name,
+        "alias": name if name in cfg.aliases else None,
+        "derived": False,
+        "upstream": resolved.upstream.name if resolved.upstream else None,
+        "type": resolved.upstream.type if resolved.upstream else None,
+        "wildcard": False,
+        "running": False,
+        "device": None,
+        "device_ratio": None,
+        "num_ctx": None,
+        "size_gib": None,
+        "vram_gib": None,
+        "api_key": _masked_key(resolved.upstream) if resolved.upstream else None,
+        "unknown": True,
+    }
+
+
+def _bare(name: str) -> str:
+    """Ollama reads `tev1` and `tev1:latest` as one model, and an `api_models` entry can be
+    written either way, so claims and pool rows are compared without the default tag."""
+    return name[: -len(":latest")] if name.endswith(":latest") else name
+
+
+def _claimed_names(cfg) -> set[str]:
+    """Names some other family was given on purpose, normalised for comparison.
+
+    Only explicit declarations count - the `api_models` lists and `rerank.models`. A fallback
+    such as `systemone.model` is deliberately not a claim: a deployment may point System One
+    at the same model it chats with, and that model must stay selectable for chat.
+
+    Web search is not a claim either. Its endpoint is a chat pass-through - the model answers
+    the synthesis prompt - so a hosted provider's routing model (`opencode/auto`) is a chat
+    model first and must stay selectable for generate / chat.
+    """
+    declared = (
+        set(cfg.api_models.embed)
+        | set(cfg.api_models.rerank)
+        | set(cfg.api_models.systemone)
+        | set(cfg.rerank.models)
+    )
+    claimed: set[str] = set()
+    for name in declared:
+        if not name:
+            continue
+        claimed.add(_bare(name))
+        claimed.add(_bare(cfg.resolve(name).target))
+    return claimed
+
+
+def _family_rows(
+    cfg, family: str, pool: dict[str, dict[str, Any]], *, native: bool = False
+) -> tuple[list[dict[str, Any]], str]:
+    names, source = _family_list(cfg, family)
+    if names:
+        return [_pool_row_for_name(cfg, name, pool) for name in names], source
+    rows = list(pool.values())
+    if native:
+        # `/api/generate` and `/api/embed` are Ollama's native dialect; an `lmstudio` or
+        # `opencode` upstream answers only the `/v1` side, so offering its models would be a
+        # guaranteed upstream 404. An explicit `api_models` list is still served as written.
+        rows = [row for row in rows if row.get("type") == "ollama"]
+    if family == "generate":
+        # A name another family was explicitly given answers that kind of request, not a chat
+        # one, so the generate and chat selectors must not offer it. Both spellings count: a
+        # list may name the alias or the tagless id while the pool row keeps the declared name.
+        claimed = _claimed_names(cfg)
+        rows = [
+            row
+            for row in rows
+            if _bare(row["model"]) not in claimed and _bare(row.get("target") or "") not in claimed
+        ]
+    return rows, source
+
+
+class ApiTestRequest(BaseModel):
+    kind: str
+    body: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.get("/api-test/models", summary="Usable models, defaults and masked keys per API family", tags=["management"])
+async def api_test_models(request: Request, _=Depends(require_admin)):
+    """What each tester needs before it can send anything: which models answer that kind of
+    request, which one to preselect, and whether the call is signed with an extra key.
+
+    Credentials never leave the server: an upstream auth header or a provider env key is
+    reported as the fixed mask, next to the name of the variable it came from.
+    """
+    cfg = request.app.state.manager.config
+    client = request.app.state.client
+    infos = await _probe_all(cfg, client)
+    runtime = {(i["name"], m["model"]): m for i in infos for m in i["running_models"]}
+    reachable = {i["name"]: i["reachable"] for i in infos}
+    pool = _callable_pool(cfg, _alias_by_target(cfg), await _wildcard_discovery(cfg, client), runtime, reachable)
+    ws_owner = cfg.websearch_upstream_obj()
+    so_key_set = bool(os.getenv(cfg.systemone.api_key_env or "", "").strip())
+    ws_key_set = bool(os.getenv(cfg.websearch.api_key_env or "", "").strip())
+
+    kinds: dict[str, Any] = {}
+    for name, kind in KINDS.items():
+        rows, source = _family_rows(cfg, kind.family, pool, native=kind.native)
+        if kind.executor == "websearch" and ws_owner is not None:
+            provider_rows = [row for row in rows if row["upstream"] == ws_owner.name]
+            if provider_rows:
+                rows, source = provider_rows, "upstreams[].models (search provider)"
+        endpoint = cfg.rerank.endpoint if kind.executor == "rerank" else kind.endpoint
+        default = None
+        if kind.executor == "websearch":
+            # `model` is optional here and the provider resolves it, so the selector starts
+            # empty rather than preselecting a name the gateway would not rewrite.
+            default = None
+        elif kind.executor == "systemone" and cfg.systemone.model not in {"", "local"}:
+            default = next((r["model"] for r in rows if r["model"] == cfg.systemone.model), cfg.systemone.model)
+        elif rows:
+            default = rows[0]["model"]
+        enabled = {
+            "rerank": cfg.rerank.enabled,
+            "systemone": cfg.systemone.enabled,
+            "websearch": cfg.websearch.enabled,
+        }.get(kind.executor, True)
+        kinds[name] = {
+            "kind": name,
+            "method": "POST",
+            "endpoint": endpoint,
+            "family": kind.family,
+            "model_required": kind.model_required,
+            "free_model": kind.free_model,
+            "enabled": enabled,
+            "source": source,
+            "models": rows,
+            "default_model": default,
+            # Only the two env-keyed capabilities carry a key of their own; a proxied call
+            # signs with the selected model's upstream header, reported row by row.
+            "api_key": MASK
+            if (kind.executor == "systemone" and so_key_set) or (kind.executor == "websearch" and ws_key_set)
+            else None,
+            "api_key_env": cfg.systemone.api_key_env if kind.executor == "systemone" else (
+                cfg.websearch.api_key_env if kind.executor == "websearch" else None
+            ),
+        }
+    return JSONResponse({"kinds": kinds, "max_response_bytes": MAX_RESPONSE_BYTES})
+
+
+@router.post("/api-test", summary="Send one live request through the gateway's own endpoint", tags=["management"])
+async def api_test_run(payload: ApiTestRequest, request: Request, _=Depends(require_admin)):
+    """Execute a tester request server-side, because the admin cookie is not a caller key.
+
+    The body goes to the same service the public route uses, so alias injection, `num_ctx`
+    clamping, path blocking and the request log all apply exactly as they would to an
+    external client. See `app/api_test.py`.
+    """
+    kind = get_kind(payload.kind)
+    cfg = request.app.state.manager.config
+    body = dict(payload.body)
+    if kind.model_required:
+        model = body.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"'{kind.name}' needs a model; pick one in the selector.",
+            )
+        body["model"] = model.strip()
+    if kind.executor == "rerank":
+        kind = dataclasses.replace(kind, endpoint=cfg.rerank.endpoint)
+    result = await execute(request.app, kind, body, (client_ip(request) or "console", 0))
+    return JSONResponse(result)
+
+
+# --------------------------------------------------------------------------- #
+# Config read/write (Settings console)
+# --------------------------------------------------------------------------- #
+def _format_validation_error(exc: ValidationError) -> str:
+    """Flatten a pydantic ValidationError into a short, human-readable message."""
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", []))
+        msg = err.get("msg", "invalid")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts)
+
+
+def _clean_config_dict(cfg: Config) -> dict[str, Any]:
+    """Serialisable view of the config for the console to edit: generated model_aliases are
+    stripped so the round trip never grows config.yaml with entries that
+    ``_expand_upstream_aliases`` recomputes on every load anyway."""
+    data = cfg.model_dump(mode="json")
+    renamed = cfg._renamed_alias_names
+    if renamed:
+        data["aliases"] = {k: v for k, v in data.get("aliases", {}).items() if k not in renamed}
+    return data
+
+
+_SEGMENT_MODELS: dict[str, type[BaseModel]] = {
+    "rerank": RerankConfig,
+    "systemone": SystemOneConfig,
+    "websearch": WebSearchConfig,
+}
+
+
+@router.get("/config", summary="Current config.yaml as a structured object", tags=["management"])
+async def get_config(request: Request, _=Depends(require_admin)) -> JSONResponse:
+    """The live config the Settings console loads and edits. Generated aliases are removed
+    so saving never adds the rename entries the loader recomputes for itself."""
+    cfg = request.app.state.manager.config
+    return JSONResponse(_clean_config_dict(cfg))
+
+
+class ConfigSaveBody(BaseModel):
+    config: dict[str, Any]
+
+
+@router.put("/config", summary="Validate and overwrite config.yaml", tags=["management"])
+async def put_config(request: Request, body: ConfigSaveBody, _=Depends(require_admin)) -> JSONResponse:
+    """Validate each edited segment, then overwrite the whole config.yaml atomically.
+
+    Only the four UI-editable segments (``upstreams``, ``rerank``, ``systemone``,
+    ``websearch``) are taken from the request; every other top-level key is preserved
+    verbatim from the file on disk, so advanced sections the console does not expose are
+    never lost. Each segment is checked on its own first so the error names the exact block
+    that failed; a clean pass then re-validates the merged whole before writing.
+    """
+    manager = request.app.state.manager
+    incoming = body.config
+    segments = ["upstreams", "rerank", "systemone", "websearch"]
+    errors: dict[str, str] = {}
+
+    # Re-parse the on-disk file so untouched sections keep their exact current shape.
+    try:
+        raw = yaml.safe_load(manager.path.read_text(encoding="utf-8")) if manager.path.exists() else {}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read config.yaml: {exc}",
+        )
+    if not isinstance(raw, dict):
+        raw = {}
+
+    # Validate each editable segment individually and replace it in `raw`.
+    for seg in segments:
+        value = incoming.get(seg)
+        try:
+            if seg == "upstreams":
+                validated = TypeAdapter(list[UpstreamConfig]).validate_python(
+                    value if value is not None else []
+                )
+                raw[seg] = [u.model_dump(mode="json", exclude_defaults=True) for u in validated]
+            else:
+                model_cls = _SEGMENT_MODELS[seg]
+                validated = model_cls.model_validate(value if value is not None else {})
+                raw[seg] = validated.model_dump(mode="json", exclude_defaults=True)
+        except ValidationError as exc:
+            errors[seg] = _format_validation_error(exc)
+        except Exception as exc:  # e.g. a wrong shape fed to the adapter
+            errors[seg] = str(exc)
+
+    if errors:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"segments": errors},
+        )
+
+    # Full-object sanity check on the merged file before touching disk.
+    try:
+        Config.model_validate(raw)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"segments": {"config": _format_validation_error(exc)}},
+        )
+
+    # Atomic overwrite: write a temp file beside the target, then replace.
+    target = manager.path
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        tmp.write_text(_dump_yaml(raw), encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to write config.yaml: {exc}",
+        )
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    manager.reload()
+    return JSONResponse({"ok": True, "reloaded": True})
 

@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (per-endpoint API testers on every `API 用法` tab, plus `api_models`)
+
+- **Every documented endpoint can now be called from the console**: the `API 用法` tab of Models · LLM,
+  Models · Embed, Models · Rerank, Models · System One and Tools · Web Search puts a **`Test` button**
+  at the right end of each endpoint's *Request parameters* header, and it opens the tester in a popup
+  over the page rather than inline below the block — 7 kinds in total (`generate`, `chat`,
+  `embed_ollama`, `embed_openai`, `rerank`, `systemone`, `websearch`). Pick a model, adjust the
+  parameters, run it and read back status, timing, the routed upstream, injected alias parameters,
+  the assembled answer and the raw body. The window mounts on first open and is only hidden
+  afterwards, so closing and reopening keeps the form and the last answer
+- **Execution is server-side** (`app/api_test.py`): the console's session cookie authenticates
+  `require_admin` but is not a caller API key, so the tester rebuilds a synthetic ASGI `Request` and
+  hands it to the gateway's own services. Alias + parameter injection, `num_ctx_overrides` clamping,
+  the blocked-path list and request-log capture all behave exactly as they do for a real client, and
+  the `KINDS` table is a closed allowlist — no arbitrary URL is reachable through it
+- **New `api_models` config block** (`api_models.generate` / `embed` / `rerank` / `systemone` /
+  `websearch`) narrows each family's model selector: an empty list derives it (`rerank.models`,
+  `systemone.model`, otherwise the callable pool), a list may name a real id, an alias or a derived
+  model, and any name **explicitly claimed by another family** (`embed` / `rerank` / `systemone`
+  or `rerank.models`) disappears from generate/chat — compared with a trailing `:latest` ignored,
+  since Ollama treats `tev1` and `tev1:latest` as one model. A fallback such as `systemone.model` is
+  deliberately not a claim, so a chat model may also answer decision requests, and a `websearch`
+  claim is not one either: that endpoint is a chat pass-through, so a hosted provider's routing
+  model (`opencode/auto`) stays selectable for chat.
+  `websearch` and `systemone` additionally allow free text, because `model` is optional there and
+  the provider resolves it. The lists narrow what the console offers only — routing is untouched
+- **Ollama-native testers list Ollama models only**: `POST /api/generate` and `POST /api/embed` are
+  Ollama's own API, so a derived selector for those two kinds keeps `type: "ollama"` rows only — an
+  `lmstudio` or `opencode` model would be a guaranteed upstream 404 there. The same models stay
+  selectable on `/v1/chat/completions` and `/v1/embeddings`, which those upstreams do implement, and
+  an explicit `api_models` list is still served as written
+- `GET /v1/management/api-test/models` returns per kind the endpoint, eligible models (alias shown as
+  `display` when configured, else the declared name), the preselected default, each parameter's
+  default, whether free text is allowed, the feature's `enabled` flag and — when that family signs
+  with an extra key — `api_key_env` plus the fixed `••••••` mask. `POST /v1/management/api-test`
+  answers with the envelope (`status`, `ok`, `duration_ms`, `ttft_ms`, `stream`, `content_type`,
+  `body`/`text`, `truncated`, plus the in-force `requested_model` / `model` / `upstream` / `injected`).
+  Responses are capped at 128 KB; the five views share one probe through `useApiTestContext()`, so
+  opening a tester never re-probes every upstream
+- The form **opens with its initial values already filled in** — it shows what the endpoint would
+  have used anyway, and a select with no default displays its `not set` option instead of rendering
+  nothing. A documented boolean is a **checkbox** that always sends `true` / `false` (unchecked
+  means false, never "omit"); a boolean without a default keeps the three-state select so a field
+  like System One's `stream` can still be left out. `Restore defaults` writes the values back (it
+  used to be `Fill defaults`), `Clear` blanks every field and the model, and any remaining empty
+  field is omitted from the body rather than sent empty. The two LLM windows start with **`stream`
+  off** so one Run returns a single JSON; the generate window adds a **`think`** checkbox (off by
+  default, Ollama's native field) and the chat window exposes the OpenAI-compatible
+  **`reasoning_effort`**. The model picker lists **names/aliases only** — the alias when configured,
+  else the declared id — with the upstream and runtime state moved into the hover tooltip, and it
+  **can be cleared at any time** (the `×` beside the field, or the select's empty option): the body
+  then carries no `model`, a family that needs one answers the tester's own "pick a model first"
+  guard, and System One / Web Search let the endpoint decide
+- System One / Web Search pick the model from a **real dropdown**, preset to `default_model`
+  (Web Search stays empty) and ending in a 「Custom model…」 entry that swaps in a free-text box
+  (focused, with the same suggestions); re-picking a listed name closes it again. The old text box
+  pre-filled the default, and Chromium filters a `<datalist>` by the text already in the box - that
+  is why System One showed `tev1` and never `nimble`. Chips for chunked answers and TTFT are driven
+  by the observed `content_type`, so a single JSON response never claims to have streamed. Typing
+  into a numeric parameter no longer crashes the window: `v-model` on `type="number"` yields a
+  number, so every read goes through `String(...)` before trimming
+- **`HEAD` requests are forwarded but never recorded** in the request log (no body, no answer, and
+  monitors send them continuously); the decision lives in one place,
+  `logging_on = self._logging_on(cfg) and method != "HEAD"`. With the shipped
+  `allowed_http_methods: [GET, POST]` a HEAD answers `405` before it ever reaches the proxy
+- The System One config projection's `request_example` now uses an **object** `criteria` for `choice`
+  questions: Ollama 0.40+ rejects an array with `400 "criteria" must be a non-empty object`, while
+  laya-server accepts either shape, so one example runs on both backends
+- Docs: `docs/API.md` (two route rows + the **接口测试（api-test）** section), `docs/USAGE.md` /
+  `USAGE_CN.md` (the `api_models` reference, the **API tester** feature row and the console prose),
+  `docs/TESTCASES.md`, `docs/web-management/*` and `AGENTS.md`; `test_management.py` grew to 297 checks
+
+### Added (a model declared under `aliases:` is listed as a model of its own)
+
+- **Two different concepts, now two different rows**: an entry under `upstreams[].model_aliases` only
+  renames an existing model, while an entry under the root `aliases:` node is a model of its own — it
+  carries its own pinned `params` (e.g. `think: false`) and its target stays callable with its own
+  defaults. The console was conflating them: a root alias renamed its target's row and never appeared
+  as a model, so `qwen3.5:4b-nothink` was invisible
+- `Config` now records which alias names `_expand_upstream_aliases` generated
+  (`is_renamed_model()`, `derived_aliases()`); routing and `/v1/models` are untouched
+- `/v1/management/overview`, `/upstreams/{name}` and `/models/llm` emit derived rows with
+  `derived: true` plus `target` / `params` / `description`: the row sits right after its target,
+  inherits its device and `num_ctx` from the `/api/ps` entry and reports `size_gib` / `vram_gib` as
+  `null`, so VRAM and the KPI `running_models` count the instance once. `_alias_by_target()` no longer
+  renames a target through a root alias. `aliases[]` gained `kind: "rename" | "derived"`
+- Console: a `derived` chip on every model row (Dashboard, Upstreams expander, Models · LLM,
+  Web Search 可用模型), the 别名映射 table became **别名与派生模型** (name / kind / target / upstream /
+  pinned params / description), and the speed test + hover history of a derived row address its
+  **target** model with the alias's `params.think`, because the upstream has never heard of the alias
+- Docs: `docs/USAGE.md` / `USAGE_CN.md` (`aliases` and both `model_aliases` mentions), `docs/API.md`,
+  `docs/TESTCASES.md`, `docs/web-management/*` and `AGENTS.md` all state the rename-vs-new-model rule;
+  `test_management.py` grew to 219 checks
+
 ### Changed (docs: README slimmed to a landing page, new USAGE manual and screenshots)
 
 - **README / README_CN rewritten as a landing page**: one-sentence pitch, a client/gateway/backend

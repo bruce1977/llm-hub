@@ -383,24 +383,28 @@ async def gateway_security_middleware(request: Request, call_next):
     sec = cfg.security if cfg is not None else None
     path = request.url.path
 
+    # The admin console authenticates with its own password and drives a REST API that
+    # needs PUT (config save) and other verbs. It is therefore exempt from the public
+    # perimeter rules below (the method allowlist and the path allowlist): otherwise a
+    # gateway locked down to GET/POST - the default - would make the console's own Save
+    # return 405 and never write config.yaml. The docs are gated separately on
+    # auth.allow_access_ip_whitelist.
+    management_api = path.startswith("/v1/management")
+    is_console = path.startswith("/admin") or management_api
+
     # 1. HTTP method allowlist -------------------------------------------------
     allowed_methods = set(getattr(sec, "allowed_http_methods", None) or ["GET", "POST"])
     method = request.method.upper()
     # CORS preflight needs OPTIONS; permit it only when CORS is actually configured.
     if method == "OPTIONS" and sec is not None and sec.cors_origins:
         allowed_methods = allowed_methods | {"OPTIONS"}
-    if method not in allowed_methods:
+    if method not in allowed_methods and not is_console:
         return _deny(status.HTTP_405_METHOD_NOT_ALLOWED, "Method not allowed.")
 
     if sec is not None:
         # 2. path regex allowlist (perimeter control) --------------------------
-        # The admin console authenticates with its own password, so the perimeter
-        # allowlist must never lock it out -- exempt /admin and the management API
-        # (and the docs, which are gated on auth.allow_access_ip_whitelist instead).
-        management_api = path.startswith("/v1/management")
         if (
-            not path.startswith("/admin")
-            and not management_api
+            not is_console
             and sec.path_allowlist
             and not _path_allowed(path, sec.path_allowlist)
         ):
