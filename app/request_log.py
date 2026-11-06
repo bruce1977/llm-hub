@@ -46,12 +46,21 @@ MAX_PAGE_SIZE = 200
 MAX_QUEUE = 10000
 BATCH_SIZE = 100
 
+# What the console counts and lists. The gateway only ever serves `/v1/*` and `/api/*`, so
+# every other path is a liveness probe, a `/docs` fetch, a favicon request or bot noise: it is
+# still recorded (a 403/404 there can matter), but it must not bend the request counts, the
+# percentiles, the error rate or the distribution pies. `get_request` by id stays unscoped, so a
+# deep link to one of those rows still opens.
+API_PATH_SCOPE = "(path LIKE '/v1/%' OR path LIKE '/api/%')"
+
 # Grouping expressions for /v1/management/stats/distribution. Rows that never reached an
 # upstream (blocked, oversized, unrouted) bucket as "-", the same convention as `failures`.
+# `status` counts every 4xx as an error, unlike the 5xx-only `failures` view and `error_rate`:
+# the pie answers "did the caller get what it asked for", not "did the gateway break".
 _DISTRIBUTION_KEYS = {
     "upstream": "COALESCE(upstream, '-')",
     "model": "COALESCE(model, '-')",
-    "status": "CASE WHEN status >= 500 THEN 'error' ELSE 'ok' END",
+    "status": "CASE WHEN status >= 400 THEN 'error' ELSE 'ok' END",
 }
 
 _SENSITIVE_KEYS = {
@@ -363,7 +372,7 @@ class RequestLog:
         path: str | None,
         method: str | None = None,
     ) -> tuple[str, list[Any]]:
-        clauses: list[str] = []
+        clauses: list[str] = [API_PATH_SCOPE]
         params: list[Any] = []
         if start:
             clauses.append("ts >= ?")
@@ -492,7 +501,7 @@ class RequestLog:
             WITH base AS (
                 SELECT strftime('{fmt}', ts) AS bucket, duration_ms,
                        CASE WHEN status >= 500 THEN 1 ELSE 0 END AS is_err
-                FROM requests WHERE ts >= ? AND ts <= ?
+                FROM requests WHERE ts >= ? AND ts <= ? AND {API_PATH_SCOPE}
             ), ranked AS (
                 SELECT bucket, duration_ms, is_err,
                        COUNT(*) OVER (PARTITION BY bucket) AS cnt,
@@ -525,7 +534,7 @@ class RequestLog:
         expr = _DISTRIBUTION_KEYS[group_by]
         sql = (
             f"SELECT {expr} AS key, COUNT(*) AS c FROM requests "
-            "WHERE ts >= ? AND ts <= ? GROUP BY key ORDER BY c DESC"
+            f"WHERE ts >= ? AND ts <= ? AND {API_PATH_SCOPE} GROUP BY key ORDER BY c DESC"
         )
         with self._db() as conn:
             rows = conn.execute(sql, (start, end)).fetchall()
@@ -540,7 +549,7 @@ class RequestLog:
         return await asyncio.to_thread(self._failures_sync, start, end)
 
     def _failures_sync(self, start: str, end: str) -> dict[str, Any]:
-        where = " WHERE ts >= ? AND ts <= ?"
+        where = f" WHERE ts >= ? AND ts <= ? AND {API_PATH_SCOPE}"
         params = (start, end)
         error_where = f"{where} AND status >= 500"
         with self._db() as conn:

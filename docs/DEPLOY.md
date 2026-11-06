@@ -1,34 +1,48 @@
-# LLM Hub - Docker 部署指南
+# LLM Hub - Deployment guide
 
-## 快速部署
+The gateway is a single codebase with two ways to run it: **Docker (recommended)** — the published image
+already contains the console bundle, so one `data` volume is all it needs — and a **local Python** run,
+which is the faster loop when you are wiring up upstreams or checking a config change. Both read the same
+`data/config.yaml` and `.env`, and clients talk to them identically afterwards (see
+[USAGE.md](USAGE.md#api-usage) and [API.md](API.md)). Chinese version: [DEPLOY_CN.md](DEPLOY_CN.md).
 
-### 前置条件
+| Situation | Where to go |
+|---|---|
+| Production / long-running | [Quick deployment](#quick-deployment) → `docker run`, config and data live in `data/` |
+| Build the image yourself and publish it | [Build / publish scripts (Windows)](#build--publish-scripts-windows) |
+| Local debugging without Docker | [Running locally (no Docker)](#running-locally-no-docker) |
+| You changed the console frontend | [Console bundle and the image](#console-bundle-and-the-image) (`app/web` is a committed build artifact) |
+
+## Quick deployment
+
+### Prerequisites
 
 - Docker 20.10+
 
-### 步骤 1: 准备配置
+### Step 1: Prepare the configuration
 
 ```bash
 cp data/config.example.yaml data/config.yaml
 cp .env.example .env
 ```
 
-编辑 `.env` 设置 API 密钥：
+Edit `.env` to set the API key:
 
 ```bash
 GATEWAY_API_KEYS=sk-gateway-$(openssl rand -hex 16)
 TZ=Asia/Shanghai
 ```
 
-编辑 `data/config.yaml` 添加上游实例，参考 `data/config.example.yaml`。
+Edit `data/config.yaml` to add your upstream instances, using `data/config.example.yaml` as the reference.
 
-> 配置文件是 YAML（镜像里 `CONFIG_PATH=/data/config.yaml`），可以写注释。升级时如果 `/data` 下只有旧版
-> `config.json`，网关会带着警告继续用它，不会用模板覆盖；把文件改名为 `config.yaml` 即可（JSON 本身是合法
-> YAML）。读取配置需要 `PyYAML`，已列在 `requirements.txt`。
+> The config file is YAML (inside the image `CONFIG_PATH=/data/config.yaml`) and may contain comments. On
+> upgrade, if `/data` only holds an old `config.json`, the gateway keeps using it with a warning instead of
+> overwriting it with the template; rename the file to `config.yaml` to adopt the new name (JSON is valid
+> YAML anyway). Reading the config needs `PyYAML`, which is listed in `requirements.txt`.
 
-### 步骤 2: 启动服务
+### Step 2: Start the service
 
-**方式 A: 从 Docker Hub 拉取（推荐）**
+**Option A: pull from Docker Hub (recommended)**
 
 ```bash
 docker pull bruce1977/llm-hub:latest
@@ -41,7 +55,7 @@ docker run -d --name llm-hub \
   bruce1977/llm-hub:latest
 ```
 
-**方式 B: 从源码构建**
+**Option B: build from source**
 
 ```bash
 docker build -t llm-hub:latest .
@@ -54,68 +68,97 @@ docker run -d --name llm-hub \
   llm-hub:latest
 ```
 
-### 步骤 3: 验证
+### Step 3: Verify
 
 ```bash
 curl http://localhost:8888/health
 curl http://localhost:8888/v1/models -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-管理台：浏览器打开 `http://localhost:8888/admin/`，用户名 `admin`、密码为 `.env` 里设置的
-`ADMIN_PASSWORD`。未设置该变量时页面显示「管理台未启用」，`/v1/management/*` 一律返回 503；
-把 `.env` 里的密码改掉后重启容器即可（旧会话同时失效）。
+Console: open `http://localhost:8888/admin/`, user `admin`, password set through `ADMIN_PASSWORD` in `.env`.
+Without that variable the page reports "console not enabled" and every `/v1/management/*` call returns 503;
+change the password in `.env` and restart the container to take effect (existing sessions die with it).
 
 ---
 
-## 一键构建 / 发布脚本（Windows）
+## Build / publish scripts (Windows)
 
-`scripts\` 下有两个批处理，可在 cmd 或 PowerShell 里从仓库任意位置运行（脚本自己会切到仓库根目录）：
+Two batch files under `scripts\` can be run from cmd or PowerShell, from anywhere inside the repository
+(the scripts `cd` to the repo root themselves):
 
 ```bat
-:: 只构建：产出 bruce1977/llm-hub:latest 与 :<版本号>
+:: Build only: produces bruce1977/llm-hub:latest and :<version>
 scripts\docker-build.bat
 
-:: 构建并推送到 Docker Hub（需先 docker login）
+:: Build and push to Docker Hub (docker login first)
 scripts\docker-publish.bat
 
-:: 覆盖镜像名与版本号
+:: Override the image name and version
 scripts\docker-build.bat registry.example.com/team/llm-hub 1.3.0
 ```
 
-- 版本号默认读 `app\main.py` 的 `__version__`（即网关 `GET /` 上报的版本），第二个参数可显式指定
-- 两个脚本都会先确认 Docker 可用，否则直接退出并返回错误码 1
-- `docker-publish.bat` 先构建、成功后才依次推送 `latest` 与版本号标签；推送失败立即停止并提示 `docker login`
-- 脚本不含任何 git 操作：提交、打 tag 请在发布前自己完成
+- The version defaults to `__version__` in `app\main.py` (the value `GET /` reports); the second argument
+  overrides it
+- Both scripts check that Docker is available first, and exit with code 1 otherwise
+- `docker-publish.bat` builds first and only then pushes `latest` and the version tag; a failed push stops
+  immediately with a hint to run `docker login`
+- Neither script touches git — commit and tag before publishing yourself
 
-### 本机启动脚本（不使用 Docker）
+## Running locally (no Docker)
 
-想在宿主机上直接跑网关（调试上游、验证配置），用同一目录下的 `start-local.bat` / `start-local.ps1`：
+### Starting it by hand
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+cp data/config.example.yaml data/config.yaml
+cp .env.example .env                                # fill in GATEWAY_API_KEYS, ADMIN_PASSWORD
+
+cd app
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env
+```
+
+The working directory must be `app/` (the same as the image's `WORKDIR /app`), otherwise the
+`../data/config.yaml` and `../data/.keys` paths in `.env` do not resolve; `--env-file` points at the `.env`
+in the repository root. The console lives at `http://localhost:8000/admin` and requires `app/web` to have
+been built — see the next section.
+
+### Launcher scripts (Windows)
+
+To run the gateway straight on the host (debugging upstreams, validating a config), use `start-local.bat` /
+`start-local.ps1` from the same directory:
 
 ```bat
-:: 检查通过后启动（默认带 --reload）
+:: Start after the preflight checks pass (adds --reload)
 scripts\start-local.bat
 
-:: 只做启动前检查，不启动服务
+:: Run the preflight checks only, do not start
 scripts\start-local.bat -CheckOnly
 
-:: 先装依赖，再换端口启动
+:: Install dependencies first, then start on another port
 scripts\start-local.bat -Install -Port 8888
 ```
 
-它做三件事：定位 python 与 `data\config.yaml`、按 `.env` 注入环境变量（shell 里已设置的变量优先），然后
-调用应用**自己的**模块跑一遍检查——缺依赖、Pydantic 拒绝配置、开了鉴权却没有 API Key、弱/占位 Key、端口被占用、
-`app\web` 未构建——全部通过才用 `--app-dir app` 在 `app/` 目录下启动 uvicorn，与镜像的 `WORKDIR /app` 一致，
-所以 `.env` 里的 `../data/config.yaml`、`../data/.keys` 在本地和容器里解析到同一份文件。其余参数见 README 的「启动脚本」一节。
+It does three things: locate Python and `data\config.yaml`, inject environment variables from `.env`
+(variables already set in the shell win), then run a preflight through the app's **own** modules — missing
+dependencies, a config Pydantic rejects, auth enabled without an API key, weak/placeholder keys, a busy port,
+an unbuilt `app\web` — and only when all of that passes does it start uvicorn with `--app-dir app` from
+`app/`, matching the image's `WORKDIR /app`, so `../data/config.yaml` and `../data/.keys` from `.env` resolve
+to the same files locally and in the container.
 
-### 管理台前端与镜像
+## Console bundle and the image
 
-管理台（`/admin`）的前端是**预先构建好再提交**的：`npm run build` 把产物写进 `app/web`，该目录
-属于版本库内容，`Dockerfile` 只做 `COPY app/web /app/web`，镜像里没有 node 工具链，构建容器时也不会执行 `npm`。
-产物与模块同级，因此本地 `app/web` 与镜像 `/app/web` 走同一个解析路径（和 `app/static` 一样）。
-前端源码全部为 TypeScript（`*.ts` 模块 + `<script setup lang="ts">` 单文件组件），`npm run build`
-会先执行 `vue-tsc --noEmit`，类型错误直接让构建失败；只做检查可用 `npm run typecheck`。
+The console (`/admin`) frontend is **built ahead of time and committed**: `npm run build` writes into
+`app/web`, which is part of the repository, and the `Dockerfile` merely does `COPY app/web /app/web` — the
+image carries no node toolchain and never runs `npm` while building. The bundle sits next to the modules, so
+the local `app/web` and the image's `/app/web` resolve through the same path (just like `app/static`).
+The frontend sources are all TypeScript (`*.ts` modules plus `<script setup lang="ts">` single-file
+components), and `npm run build` runs `vue-tsc --noEmit` first, so a type error fails the build; use
+`npm run typecheck` for the check alone.
 
-因此改过 `web/src` 之后，必须在构建镜像**之前**重新生成产物并把 `app/web` 一起提交：
+So after touching `web/src` you must regenerate the bundle **before** building the image, and commit
+`app/web` along with it:
 
 ```bat
 cd web
@@ -126,83 +169,86 @@ cd ..
 scripts\docker-build.bat
 ```
 
-只改后端或配置时不需要这一步；`npm run dev`（默认 `http://localhost:5173/admin/`，
-把 `/v1/management` 代理到本地 8000 的网关）只用于开发，不产生镜像内容。
-若 `app/web/index.html` 缺失，`/admin` 会返回 503 并提示运行 `npm run build`，
-其余网关功能不受影响。
+Backend- or config-only changes do not need this step; `npm run dev` (default `http://localhost:5173/admin/`,
+proxying `/v1/management` to a gateway on port 8000) is for development only and produces no image content.
+If `app/web/index.html` is missing, `/admin` returns 503 with a hint to run `npm run build`; the rest of the
+gateway is unaffected.
 
-> **用 `-v ./app:/app` 覆盖模块目录时**（文档里的热补丁跑法）：挂载会把镜像里的 `/app` 整个换成宿主机的
-> `app/`，所以宿主机那份也必须先 `npm run build` 生成 `app/web`，否则 `/admin` 变成 503。
-> 只挂 `-v ./data:/data` 的常规跑法不受影响。
+> **When you overlay the module directory with `-v ./app:/app`** (the hot-patch workflow some docs show):
+> the mount replaces the image's whole `/app` with the host's `app/`, so the host copy must have been built
+> with `npm run build` too, or `/admin` becomes a 503. The usual `-v ./data:/data` setup is unaffected.
 
 ---
 
-## 环境变量
+## Environment variables
 
-| 变量 | 必需 | 说明 |
+| Variable | Required | Notes |
 |------|------|------|
-| `GATEWAY_API_KEYS` | ✅* | API 密钥，逗号分隔（*与下一行的密钥文件二选一；`auth.allow_access_ip_whitelist` 非空时可为空） |
-| `GATEWAY_API_KEYS_FILE` | ❌ | 密钥文件路径。不设置时自动读取 `CONFIG_PATH` 同目录的 `.keys`（如挂载的 `/config/.keys`、默认布局的 `/data/.keys`）；显式设置则以其为准 |
-| `CONFIG_PATH` | ❌ | 配置文件路径，默认 `/data/config.yaml` |
-| `TZ` | ❌ | 时区，默认 `UTC` |
-| `SYSTEMONE_SERVER_API_KEY` | ❌ | System One 后端密钥，仅当 `systemone.api_key_env` 指向它时才需要；laya-server 必需，Ollama 0.40+ 后端会忽略该头 |
-| `OPENCODE_GATEWAY_API_KEY` | ❌ | 联网检索上游密钥，仅当 `websearch.api_key_env` 指向它时才需要（默认留空 = 不签名） |
-| `ADMIN_PASSWORD` | ❌ | Web 管理台登录密码（用户名固定 `admin`），与 `GATEWAY_API_KEYS` 是两套凭据：它只用于 `POST /v1/management/auth/login` 换取 12 小时会话 Cookie，本身当作 `Bearer` / `X-API-Key` 提交仍是 401。`/v1/management/*` 除该 Cookie 外也接受 `GATEWAY_API_KEYS` 里的网关 Key（供脚本复用）。未设置时 `/admin` 显示「管理台未启用」，`/v1/management/*` 全部返回 503 |
-| `REQUEST_LOG_DB` | ❌ | 请求明细 SQLite 路径，默认 `CONFIG_PATH` 同目录的 `llmhub.db`（容器内为 `/data/llmhub.db`） |
-| `REQUEST_LOG_RETENTION_DAYS` | ❌ | 请求明细保留天数，默认 `30`；`0` 表示永久保留 |
+| `GATEWAY_API_KEYS` | ✅* | API keys, comma separated (*either this or the key file below; may be empty when `auth.allow_access_ip_whitelist` is set). **Imported once, on the first start, while the `api_keys` table is empty**; afterwards caller keys live in `llmhub.db` and are minted/revoked on the API keys page in `/admin` — editing this variable has no further effect |
+| `GATEWAY_API_KEYS_FILE` | ❌ | Path to a key file. When unset, the gateway reads `.keys` next to `CONFIG_PATH` (e.g. a mounted `/config/.keys`, or `/data/.keys` in the default layout); when set, that path wins. Also first-import only, and keys already in the table are not inserted twice |
+| `CONFIG_PATH` | ❌ | Config file path, defaults to `/data/config.yaml` |
+| `TZ` | ❌ | Timezone, defaults to `UTC` |
+| `SYSTEMONE_SERVER_API_KEY` | ❌ | System One backend key, needed only when `systemone.api_key_env` points at it; required by laya-server, ignored by Ollama 0.40+ backends |
+| `OPENCODE_GATEWAY_API_KEY` | ❌ | Web search upstream key, needed only when `websearch.api_key_env` points at it (empty by default = no signature) |
+| `ADMIN_PASSWORD` | ❌ | Console login password (the user name is always `admin`). It is a separate credential from caller API keys: it only buys a 12-hour session cookie via `POST /v1/management/auth/login`, and presenting it as `Bearer` / `X-API-Key` is still a 401. Besides that cookie, `/v1/management/*` also accepts a gateway key from the `api_keys` table (so scripts can reuse one), except the three `/api-keys` endpoints — those accept only the session cookie, since otherwise any client could mint itself another key. Unset, `/admin` says the console is not enabled and every `/v1/management/*` call returns 503 |
+| `REQUEST_LOG_DB` | ❌ | SQLite path for request details, defaults to `llmhub.db` next to `CONFIG_PATH` (`/data/llmhub.db` in the container). One file holds three tables: `requests` (details), `bench_results` (speed-test history) and `api_keys` (caller key hashes and masks) |
+| `LLMHUB_DB` | ❌ | Database path for the `bench_results` and `api_keys` tables, also `llmhub.db` next to `CONFIG_PATH` by default. Only set it to split those two away from the request log; all three tables share one file by default, so the container needs a single writable `/data` |
+| `REQUEST_LOG_RETENTION_DAYS` | ❌ | Retention for request details in days, default `30`; `0` keeps them forever |
 
-> 管理台会把请求明细写入 SQLite（WAL 模式），需要 `/data` 目录可写。若使用只读挂载，
-> 请把 `REQUEST_LOG_DB` 指到可写路径，或设为空目录下的默认位置。
-> 是否入库由 `config.yaml` 的 `request_log.enabled` 控制（默认 `true`）：该开关逐请求读取，
-> 改成 `false` 保存后无需重启容器；配置的 mtime 每秒最多比对一次，因此约 1 秒内停止写入。
+> The console writes request details into SQLite (WAL mode) and needs `/data` to be writable. With a
+> read-only mount, point `REQUEST_LOG_DB` at a writable path or leave the default location under an empty
+> directory instead. Whether rows are written at all is controlled by `request_log.enabled` in
+> `config.yaml` (default `true`): the switch is read per request, so flipping it to `false` and saving needs
+> no container restart, and since the config mtime is compared at most once per second, writes stop within
+> about a second.
 
 ---
 
-## 常见问题
+## Troubleshooting
 
-### 无法连接到宿主机的 Ollama
+### Cannot reach the host's Ollama
 
 ```bash
-# 确保 Ollama 监听所有接口
+# Make sure Ollama listens on every interface
 OLLAMA_HOST=0.0.0.0:11434 ollama serve
 
-# 启动容器时添加网络配置
+# Add the network mapping when starting the container
 docker run -d --name llm-hub \
   --add-host=host.docker.internal:host-gateway \
   ...
 
-# 或直接使用宿主机 IP（config.yaml 中）
+# Or use the host IP directly (in config.yaml)
 "base_url": "http://172.17.0.1:11434"
 ```
 
-### 健康检查返回 401
+### Health check returns 401
 
-确保 `config.yaml` 中 `auth.allow_anonymous_health` 为 `true`。
+Make sure `auth.allow_anonymous_health` is `true` in `config.yaml`.
 
-### 配置修改后不生效
+### Config changes have no effect
 
 ```bash
-# 检查文件修改时间
+# Check the file's modification time
 stat data/config.yaml
 
-# 某些编辑器不会更新 mtime，手动触发
+# Some editors do not update mtime — trigger it manually
 touch data/config.yaml
 
-# 或重启容器
+# Or restart the container
 docker restart llm-hub
 ```
 
-### 容器启动失败
+### The container fails to start
 
 ```bash
 docker logs llm-hub
 ```
 
-常见原因：API 密钥未配置、弱密钥（需 ≥16 字符）、JSON 语法错误。
+Common causes: no API key configured, a weak key (needs ≥16 characters), a YAML syntax error.
 
-### 流式响应中断
+### Streaming responses cut off
 
-如果使用 Nginx 反向代理，需关闭缓冲并增加超时：
+Behind Nginx, disable buffering and raise the timeouts:
 
 ```nginx
 proxy_buffering off;
@@ -212,24 +258,24 @@ proxy_read_timeout 600s;
 
 ---
 
-## 运维
+## Operations
 
 ```bash
-# 日志
+# Logs
 docker logs -f llm-hub
 docker logs --tail 100 llm-hub
 
-# 重启
+# Restart
 docker restart llm-hub
 
-# 更新镜像
+# Update the image
 docker pull bruce1977/llm-hub:latest
 docker stop llm-hub && docker rm llm-hub
-# 重新执行上面的 docker run 命令
+# then re-run the docker run command above
 
-# 备份配置
+# Back up config
 tar -czf llm-hub-backup-$(date +%Y%m%d).tar.gz data/ .env
 
-# 资源限制
+# Resource limits
 docker update --cpus="2.0" --memory=2g llm-hub
 ```

@@ -2,6 +2,7 @@
 
 完整文档：配置详解、接口清单、Web 管理台、部署与安全。想先快速了解这是什么、看一眼界面截图、
 五分钟跑起来，请回到 [README_CN.md](../README_CN.md)；English：[USAGE.md](USAGE.md)。
+接口文档：[API_CN.md](API_CN.md)。部署：[DEPLOY_CN.md](DEPLOY_CN.md)。
 
 **目录** ·
 [特性](#特性) ·
@@ -23,17 +24,19 @@
 | 能力 | 说明 |
 |------|------|
 | **多上游路由** | 按请求体中的 `model` 字段，转发到对应端口的 Ollama 实例 |
-| **API Key 鉴权** | 支持多 Key 并存，常量时间比较，兼容 `Bearer` / `X-API-Key` |
+| **API Key 鉴权** | 多 Key 并存，兼容 `Bearer` / `X-API-Key`；校验拿请求里的 Key 算一次 `sha256`，与内存中的摘要集合比对（Key 存在 SQLite 的 `api_keys` 表），明文既不落盘也不参与比较 |
 | **Rerank API** | 提供 `/v1/rerank`，支持生成式（`logprobs`）与向量（`embedding`）两种打分 |
 | **联网检索** | `POST /v1/tools/web-search`，把 OpenCode API Gateway 的关键词网页检索收敛到统一入口 |
+| **Anthropic Messages** | `POST /v1/messages`（含单数别名 `/v1/message`）：把 Anthropic 请求转成上游的 chat 格式（Ollama NDJSON 或 OpenAI SSE），回答再包回 Anthropic 信封（`content` 块、`stop_reason`、`usage`）；流式按 `message_start → content_block_delta → message_stop` 的事件序重新编排，不是原样透传 |
 | **统一模型列表** | `/v1/models` 聚合配置中所有实例与别名，而非代理到单个实例 |
 | **别名 + 参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并强制注入 `think: false`；`aliases` 里的每一项都是一个独立模型（管理台单独成行），`model_aliases` 只改名 |
 | **流式透传** | NDJSON（`/api/chat`、`/api/generate`）与 SSE（`/v1/chat/completions`）原样转发 |
 | **管理 API** | `/v1/management/*`：上游/显存总览（含今日请求数与今日 token 合计）、config.yaml 各上游**声明**的模型清单（`model_aliases` 短名优先显示，根 `aliases:` 的派生模型独立成行，前缀通配按上游模型列表展开）与运行态设备/显存内存、配置投影（Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点）、每模型测速（启动 / 轮询 / 历史）与每端点的接口测试（按家族给出可用模型并服务端执行），凭据为管理台会话 Cookie 或网关 API Key |
-| **Web 管理台** | Vue 3 + TypeScript + Element Plus + ECharts 单页应用，构建后由网关在 `/admin` 直接提供（镜像内不含 node）：总览、上游、模型清单（配置声明 + 通配展开 + 运行态）、请求明细与图表、每模型测速、每个 API 文档参数表右上角**测试**按钮打开的浮层测试窗口，界面支持简体中文 / English，本期不提供写配置接口 |
+| **Web 管理台** | Vue 3 + TypeScript + Element Plus + ECharts 单页应用，构建后由网关在 `/admin` 直接提供（镜像内不含 node）：总览、上游、模型清单（配置声明 + 通配展开 + 运行态）、请求明细与图表、每模型测速、每个 API 文档参数表右上角**测试**按钮打开的浮层测试窗口，以及 API Key 管理（签发 / 吊销，列表只显示掩码）；除 Settings 页（唯一保存 `config.yaml` 的编辑器）外，其余页面不再提供写配置入口 |
+| **API Key 管理** | 调用方 Key 是 `llmhub.db` 中 `api_keys` 表的一行，库里只存 `sha256(明文)` 与掩码，**永不存明文**。在管理台签发（`sk-hub-` 开头、共 47 字符）与吊销，新生成的明文只显示一次。`GATEWAY_API_KEYS` / `data/.keys` 只在表为空的首次启动导入一次 |
 | **模型测速** | Models · LLM 的 `测速` 按钮用同一段提示词跑 N 轮，给出 TTFT、decode tok/s、prefill tok/s：上游自己报了 `eval_duration` / `prompt_eval_duration` / `predicted_ms` 就用服务端计时（`timing_source: server`），否则退回客户端计时并标记；每个「上游 + 模型」保留最近 3 次，悬停即可查历史 |
-| **接口测试** | 每个 `API 用法` 标签页里，每个端点「请求参数」标题右侧都有一个**测试**按钮，点开是浮层测试窗口（`/api/generate`、`/v1/chat/completions`、`/api/embed`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、`/v1/tools/web-search`）：模型选择框按 `api_models` 收窄（`/api/...` 原生端点只列 `type: ollama` 上游的模型）且只列名字/别名，文档里的参数基本都能填并**一打开就带着默认值**，可预览将要发送的请求体，结果给出状态码、耗时、实际路由到的模型与别名注入的参数、从 JSON / NDJSON / SSE 抽出的回答。请求由**服务端**用网关自己的服务发出，别名注入与请求明细入库跟外部调用完全一致；需要额外密钥的端点只显示只读 `••••••` |
-| **中英双语** | 简体中文（源语言）与英文，账户菜单切换、按浏览器记忆（`localStorage`）；漏翻的键会让构建失败（`MessageSchema`），不会把原始 key 渲染到界面 |
+| **接口测试** | 每个 `API 用法` 标签页里，每个端点「请求参数」标题右侧都有一个**测试**按钮，点开是浮层测试窗口（`/api/generate`、`/v1/chat/completions`、`/v1/messages`、`/api/embed`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、`/v1/tools/web-search`）：模型选择框按 `api_models` 收窄（`/api/...` 原生端点只列 `type: ollama` 上游的模型）且只列名字/别名，文档里的参数基本都能填并**一打开就带着默认值**，可预览将要发送的请求体，结果给出状态码、耗时、实际路由到的模型与别名注入的参数、从 JSON / NDJSON / SSE 抽出的回答。请求由**服务端**用网关自己的服务发出，别名注入与请求明细入库跟外部调用完全一致；需要额外密钥的端点只显示只读 `••••••` |
+| **三语界面** | 简体中文（源语言）、繁體中文与英文，账户菜单右侧子菜单切换、按浏览器记忆（`localStorage`）；首次访问按 `navigator.language` 猜（`zh-TW` / `zh-HK` / `zh-MO` / `zh-Hant` → 繁体，`en*` → 英文，其余 → 简体），Element Plus 自带的控件（日期面板、分页）也跟着切换。漏翻的键会让构建失败（`MessageSchema`），不会把原始 key 渲染到界面 |
 | **配置热重载** | 修改 `config.yaml` 约 1 秒内自动生效，无需重启容器 |
 | **Docker 外挂** | 配置文件通过 `/data` 卷挂载 |
 | **路由优先级** | 同名模型出现在多个上游时，按 `priority` 数值最小者优先 |
@@ -45,25 +48,30 @@ llm-hub/
 ├── Dockerfile
 ├── requirements.txt
 ├── app/
-│   ├── main.py       # FastAPI 入口与特殊端点
+│   ├── main.py       # FastAPI 入口与特殊端点（/v1/messages 等路由在此注册）
 │   ├── config.py     # 配置模型、加载与热重载、别名解析
 │   ├── auth.py       # API Key 鉴权
+│   ├── admin_auth.py # 管理台登录会话（admin 密码、12 小时 Cookie、登录失败节奏限制）
+│   ├── key_store.py  # 调用方 API Key 的 SQLite 存储（只存 sha256 摘要与掩码，签发/吊销）
 │   ├── proxy.py      # 反向代理与流式透传
+│   ├── messages.py   # Anthropic Messages 兼容层（请求转换、响应与 SSE 事件重建）
 │   ├── rerank.py     # Rerank API 实现
+│   ├── systemone.py  # System One 决策代理（laya-server / Ollama）
 │   ├── request_log.py # 请求明细 SQLite 埋点（异步批量写入）
 │   ├── bench.py      # 模型测速：TTFT / decode / prefill 采集
 │   ├── bench_store.py # 测速历史（与请求明细共用 llmhub.db，每模型保留 3 份）
 │   ├── api_test.py   # 管理台接口测试的执行引擎（封闭的端点白名单）
-│   ├── management.py # Web 管理台 API（/v1/management：只读视图 + 测速 + 接口测试）
+│   ├── management.py # Web 管理台 API（/v1/management：只读视图 + 测速 + 接口测试 + API Key 管理 + 设置页保存）
 │   ├── websearch.py  # 联网检索代理（OpenCode API Gateway 上游）
 │   └── web/          # 管理台构建产物（`npm run build` 的输出），网关在 /admin 提供服务
 ├── web/
 │   ├── src/          # 管理台前端源码（Vue 3 + TypeScript + Vite + Element Plus + ECharts）
-│   └── ...           # 语言文件在 src/i18n/messages（zh-CN.ts 是源语言）
+│   └── ...           # 语言文件在 src/i18n/messages（zh-CN.ts 是源语言，zh-TW.ts / en.ts 与它逐键对齐）
 ├── docs/
-│   ├── screenshots/  # README 用的界面截图（en/ 与 zh/）
-│   └── ...           # 接口、部署、管理台实现说明
-├── tests/            # pytest 测试（smoke / management / gateway）
+│   ├── images/       # README 直接引用的图：架构图、界面截图、公众号二维码
+│   ├── screenshots/  # 管理台逐页实拍（en/ 与 zh/，由 capture-live.js 连真实网关抓取）
+│   └── ...           # 接口（API.md / API_CN.md）、部署（DEPLOY.md / DEPLOY_CN.md）、管理台实现说明
+├── tests/            # 独立运行的测试脚本（smoke / gateway / management / security / 联机 E2E）
 └── data/
     └── config.yaml   # 配置文件（挂载到容器 /data）
 ```
@@ -140,7 +148,7 @@ curl http://localhost:8888/health
 | 模板 | 复制为 | 说明 |
 |------|--------|------|
 | `data/config.example.yaml` | `data/config.yaml` | 网关配置样例，含 `upstreams` / `aliases` / `rerank` / `security` 全字段，已示范 `priority` 路由优先级 |
-| `.env.example` | `.env` | 密钥样例，只需把 `GATEWAY_API_KEYS` 换成你自己的随机串（≥16 位） |
+| `.env.example` | `.env` | 密钥样例，只需把 `GATEWAY_API_KEYS` 换成你自己的随机串（≥16 位）。这些值只在 `api_keys` 表为空的首次启动导入一次，之后请在 `/admin` 的 API Key 管理页签发，改文件不再有效果 |
 
 ```bash
 cp data/config.example.yaml data/config.yaml
@@ -215,18 +223,32 @@ auth:
   allow_access_ip_whitelist: []
 ```
 
-- **密钥不再写在 `config.yaml`**：`api_keys` 字段已移除，密钥只来自环境变量。若旧配置里还留着
-  `api_keys`，启动时会打印警告并忽略它
+- **密钥不再写在 `config.yaml`**：`api_keys` 字段已移除，配置里放不下任何凭据（真源是下面说的
+  `api_keys` 表）。若旧配置里还留着 `api_keys`，启动时会打印警告并忽略它
 - 密钥来源：`GATEWAY_API_KEYS` 环境变量与 `GATEWAY_API_KEYS_FILE` 指向的密钥文件（如 `data/.keys`），两者合并去重
 - `GATEWAY_API_KEYS`：`GATEWAY_API_KEYS=key1,key2`（逗号/换行分隔）
 - `GATEWAY_API_KEYS_FILE`：指向存放密钥的文件路径，适合 Docker/K8s secrets（`docker inspect` 也不会泄露）
+- **上面两个来源只负责给空的 `api_keys` 表喂第一次数据**：真正生效的凭据是 `llmhub.db` 里 `api_keys`
+  表的行，每行只存 `sha256(明文)` 与一段掩码，**库里没有明文**。首次启动把这些 Key 以
+  `source: "file"` 导入，之后**文件不再被读取**——在管理台吊销的 Key 不会随重启复活，改文件也不会
+  新增 Key。环境变量里还有表里没有的 Key 时，启动日志会用掩码逐条告警，提醒它们已经失效。
+  签发与吊销在 `/admin` → 账户菜单 → **API Key 管理**，明文只显示一次
+- **Key 格式与长度**：`sk-hub-` + 40 位 base62（`secrets` 采样）= **固定 47 字符**，约 238 位随机。
+  前缀不是密钥，它的作用是让一个疑似泄漏的字符串在日志或客户端配置里一眼可辨。掩码保留前缀与主体
+  首尾各 4 位（`sk-hub-FNdc…SVvw`）；从文件导入的旧 Key 形状任意，退化为整串首 8 尾 4，12 字符及更短
+  的全部打点。选 SHA-256 而不是 bcrypt/argon2：238 位随机数没有可暴破的弱口令，而网关在**每一笔**
+  请求上都要校验，慢速 KDF 只会给每次调用加几十毫秒、把网关自己变成 DoS 目标
+- **校验走内存**：启动时把全部 hash 读成一个集合，`verify()` 只做一次查表，请求路径不碰 sqlite；
+  每次签发 / 吊销 / 导入都会重载该集合，所以新 Key 立即可用、吊销立即失效，无需重启
 - `allow_access_ip_whitelist`：字符串数组，按正则 **fullmatch** 匹配 ASGI 的客户端地址（直连时就是
   **TCP 对端**；网关代码本身**不读取** `X-Forwarded-For`，因为它可被伪造）。命中的地址可以打开
   `/docs` 与 `/openapi.json`，调用网关 API 时也免 API Key 检查。默认 `[]`（无人豁免）；非法正则会
   记录警告并跳过。注意 uvicorn 的 `ProxyHeadersMiddleware` 在**受信代理**（`--forwarded-allow-ips`，
   默认仅 `127.0.0.1`）转发时会用转发头改写客户端地址——经本机反代部署时，命中判定看到的是真实来源，
   因此必须确保反代正确设置并清理 `X-Forwarded-For`
-- ⚠️ 启用鉴权（`enabled: true`）却一个 Key 都没有时，网关**拒绝启动**并提示配置方式，避免误暴露无鉴权服务
+- ⚠️ 启用鉴权（`enabled: true`）而 `api_keys` 表在导入后仍然一行都没有时，网关**拒绝启动**并给出
+  补救办法：先用 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` 把空表喂上再重启，或改
+  `auth.enabled: false`——避免误暴露无鉴权服务
 - `allow_anonymous_health`：`/health` 免鉴权（建议保持 `true`，否则容器健康检查会失败）
 - `enabled: false` 可临时关闭鉴权
 
@@ -471,7 +493,7 @@ websearch:
 - `model` 字段**纯透传**：不传由上游自选，传了也不会用网关的 `aliases` 去解析
 - 调用方用网关自身 API Key 鉴权；只接受 POST（否则 **405**），上游不可达 / 超时分别返回 **502** / **504**
 
-请求/响应字段与 curl 示例见 [API 文档](API.md#web-searchopencode-网关代理)。
+请求/响应字段与 curl 示例见 [API 文档](API_CN.md#web-searchopencode-网关代理)。
 
 ### `request_log` —— 请求明细入库开关
 
@@ -488,6 +510,10 @@ request_log:
 - 关闭状态下 `/v1/management/overview` 与 `/requests` 会回报 `request_log.enabled: false`，
   管理台据此提示「日志已停用」，避免空列表被误读成没有流量
 - 库路径与保留天数属于部署级配置，走环境变量：`REQUEST_LOG_DB`、`REQUEST_LOG_RETENTION_DAYS`
+- **统计只计 API 调用**：明细列表、图表、KPI 与失败统计一律带上
+  `path LIKE '/v1/%' OR path LIKE '/api/%'`（`request_log.API_PATH_SCOPE`），所以 `/health`、`/metrics`、
+  `/openapi.json` 与 `/admin/*` 的资源请求不会稀释数字。这些路径的行**照样入库**（数据没有丢），
+  且 `GET /requests/{id}` 有意不加这个条件，任何一条记录的深链都还能打开
 - 记录字段：`ts` / `ts_end` / `duration_ms` / `ttfb_ms`（时间与耗时，`ts`/`ts_end` 精确到秒，
   亚秒耗时看 `duration_ms`）、`method` / `path` /
   `query` / `requested_model` / `model` / `request_body` / `req_size` / `stream` / `client_ip`
@@ -506,12 +532,21 @@ request_log:
 `app/web` 与模块同级，本地和镜像里的解析路径因此是同一个）。
 登录用户名固定为 `admin`，密码来自环境变量 `ADMIN_PASSWORD`，登录成功后签发 12 小时
 HttpOnly 会话 Cookie；页面包括 Dashboard、Upstreams、Requests、Models（LLM / Embed / Rerank / System One）、
-Tools（Web Search）、Settings 与 About，本期**不提供任何写配置接口**，“动作”只有两处：
-Models · LLM 上的每模型测速，以及每个 `API 用法` 标签页里的接口测试窗口——两者都只写数据库，不碰 `config.yaml`。
+Tools（Web Search）、API Key 管理、Settings 与 About，会动手的地方只有四处：
+Models · LLM 上的每模型测速、每个 `API 用法` 标签页里的接口测试窗口、API Key 管理页的签发与吊销，
+以及 Settings 页本身（唯一会校验并保存 `config.yaml` 的编辑器）——前三者只写数据库，不碰 `config.yaml`。
 任何管理接口返回 401 时前端会自动登出并跳回登录页；503 不当作鉴权失败，它分别代表
 上游不可达、`ADMIN_PASSWORD` 未设置或前端尚未构建。
-账户卡固定在面板左下角，点击弹出账户菜单：语言（简体中文 / English，按浏览器记忆）、深色/浅色切换、
-设置入口（原侧栏入口已移除）、关于（项目简介、主要功能、动态版本信息、GitHub 地址与公众号二维码，同样不占侧栏位）与退出登录。
+账户卡固定在面板左下角，点击弹出账户菜单：语言（简体中文 / 繁體中文 / English，右侧子菜单，按浏览器记忆）、深色/浅色切换、
+设置入口（原侧栏入口已移除）、**API Key 管理**（同样不占侧栏位）、关于（项目简介、主要功能、动态版本信息、GitHub 地址与公众号二维码）与退出登录。
+
+**API Key 管理**（`/admin/api-keys`）是调用方凭据的签发与吊销之处。表格里每一行只有掩码
+（`sk-hub-FNdc…SVvw`）、描述与创建时间——列表响应里既没有明文，也没有 hash；响应中的 `source`
+（本台签发 / 环境导入）只留给脚本读，界面上不再占一列。
+「新建密钥」弹窗要求填写描述（必填，好让 Key 以后认得出来），随后一次性展示生成的 47 字符明文，
+带复制按钮与「我已保存」确认；关掉弹窗就重新拉取列表，此后这把 Key 只能被删除，无法再被找回。
+吊销是行内的两步操作（「撤销」→「确认撤销」/「取消」），因为一次误点不该打断正在使用它的客户端。
+这三个接口只认管理台会话 Cookie：网关 API Key 是任何客户端都持有的凭据，不能拿它再造一把钥匙。
 
 Models · LLM 表格与 Upstreams 的行展开列出的是**该上游在 config.yaml 里声明**的模型
 （`upstreams[].models`，`model_aliases` 的短名作为显示名、根 `aliases:` 的每一项单独成行；`opencode/*`
@@ -519,9 +554,10 @@ Models · LLM 表格与 Upstreams 的行展开列出的是**该上游在 config.
 运行中的 Ollama 模型给出设备与显存/占用；派生模型行设备沿用它的目标模型、显存显示「-」（同一个实例只计一次，
 KPI「运行中模型数」也不重复计数）；`opencode` 类型的托管上游没有加载状态，探测一旦有效其声明的模型全部算在线，设备显示 **Cloud**、显存显示「-」。
 设备徽标只区分 **GPU / 部分 / CPU / Cloud**，不再显示占用百分比。
-Models · LLM 分两个 Tab：**模型清单**（上述表格，另有**别名与派生模型**表：名称 / 类型（显示别名 vs 派生模型）/ 目标模型 / 上游 / 固化参数 / 说明）与 **API 用法**，后者给出当前支持的两个生成端点
-`POST /api/generate`（Ollama 原生）与 `POST /v1/chat/completions`（OpenAI 兼容）的参数表与请求 / 响应示例，
-并标注两者都**缺省即流式**（不写 `stream` 时分别走 NDJSON 与 SSE）。
+展开一个上游不会收起其他已经展开的行：可以多行同时打开，每行各自探测，每分钟自动刷新时逐个重新探测。
+Models · LLM 分两个 Tab：**模型清单**（上述表格，另有**别名与派生模型**表：名称 / 类型（显示别名与派生模型两种徽标样式相同，只靠文字区分）/ 目标模型 / 上游 / 固化参数——说明不再单列，鼠标停在**名称**或**目标模型**上即可看到）与 **API 用法**，后者给出当前支持的三个生成端点
+`POST /api/generate`（Ollama 原生）、`POST /v1/chat/completions`（OpenAI 兼容）与 `POST /v1/messages`（Anthropic 兼容）的参数表与请求 / 响应示例，
+并标注 `POST /api/generate` 与 `POST /v1/chat/completions` 都**缺省即流式**（不写 `stream` 时分别走 NDJSON 与 SSE），而 `POST /v1/messages` 缺省返回单个 JSON 信封。
 Models · Embed（位于 Rerank 上方）说明两个嵌入端点 `POST /api/embed`（Ollama 原生）与
 `POST /v1/embeddings`（OpenAI 兼容）的字段与示例；两端都是原样透传，页面不读取任何配置。
 每一份 API 文档的「请求参数」标题右侧都有一个**测试**按钮，点开后是浮层里的**接口测试窗口**
@@ -594,6 +630,9 @@ curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overv
 | `POST /v1/management/bench` | 启动测速：`{upstream, model, rounds?, max_tokens?, think?}` → `{job_id, status: "pending"}`。任务跑在独立线程 + 独立事件循环上，关掉浏览器也不会中断 |
 | `GET /v1/management/bench/{job_id}` | `pending` / `running`（带 `{completed, total, warmup}`）/ `done`（含逐轮完整数据）/ `failed`（附 `error`） |
 | `GET /v1/management/bench/history?upstream=&model=` | 该「上游 + 模型」保留的历史记录（默认 3 份），即悬停浮层的数据源 |
+| `GET /v1/management/api-keys` | 调用方 Key 列表（**只认会话 Cookie**）：`{items: [{id, masked, label, source, created_at}], total}`；`source` 为 `console`（本台签发）或 `file`（首次启动从环境导入）。响应里只有掩码，既无明文也无 hash |
+| `POST /v1/management/api-keys` | 签发新 Key（**只认会话 Cookie**）：`{label}`，描述必填（空 → `400`，超 100 字符 → `422`），`201` 返回 `{item, secret}`——**这个响应是明文唯一一次离开服务器** |
+| `DELETE /v1/management/api-keys/{id}` | 吊销（**只认会话 Cookie**）：`200` → `{"deleted": id}`，`id` 不存在 → `404`。内存校验集合随即重载，下一笔请求即失效 |
 
 **测速口径：** 同一段固定提示词经网关跑 `rounds` 轮（默认 4，首轮为预热，`temperature: 0`，
 `max_tokens` 500），逐轮记录 TTFT、decode tok/s、prefill tok/s。上游如果自己报了
@@ -612,7 +651,7 @@ curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overv
 | `ADMIN_PASSWORD` | 未设置（管理接口 503） | 管理台登录密码；仅用于换取会话 Cookie，不能作请求凭据 |
 | `REQUEST_LOG_DB` | `<config 目录>/llmhub.db` | 明细库路径 |
 | `REQUEST_LOG_RETENTION_DAYS` | `30` | 明细保留天数，`0` 表示永久保留 |
-| `LLMHUB_DB` | `<config 目录>/llmhub.db` | 测速历史库路径；默认与明细库同一个文件，部署只需要一个数据文件 |
+| `LLMHUB_DB` | `<config 目录>/llmhub.db` | `bench_results`（测速历史）与 `api_keys`（调用方 Key 的 hash 与掩码）共用的库路径；默认与明细库同一个文件，部署只需要一个数据文件 |
 
 写入通过有界内存队列异步批量完成，不阻塞转发；请求/响应体截断到 8 KB，
 `authorization` / `api_key` / `token` / `password` 等字段落库前替换为 `***`。
@@ -707,6 +746,31 @@ curl http://localhost:8000/api/embed \
 
 > `/api/generate` 只对 **Ollama 上游**有意义：路径会原样拼到上游 `base_url` 后面，
 > LM Studio / OpenAI 兼容的后端并没有这个接口。要跨后端通用请用 `/v1/chat/completions`。
+
+### Anthropic Messages（兼容 Claude 客户端）
+
+`POST /v1/messages`（单数别名 `/v1/message` 等价）让 Anthropic SDK、Claude Code 这类客户端直接接入。
+`max_tokens` 必填（> 0），`model` 可省略（缺省 `auto`，落到默认上游的首个模型）；鉴权用 `x-api-key`
+或 `Authorization: Bearer` 都行。
+
+```bash
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5:9b",
+    "max_tokens": 256,
+    "system": "你是一个简洁的助手。",
+    "messages": [{"role": "user", "content": "用一句话解释 rerank"}]
+  }'
+```
+
+返回是标准 Anthropic 信封（`type: "message"`、`content: [{"type":"text", ...}]`、`stop_reason`、
+`usage.input_tokens` / `output_tokens`，计数取自上游自己的 token 统计）。不写 `stream` 时返回单个
+JSON；`stream: true` 时按 `message_start → content_block_start → content_block_delta* →
+content_block_stop → message_delta → message_stop` 发 SSE。`system` 接受字符串或 content 块数组，
+`content` 里的 `image` 块会转成上游的图片字段。字段细节见
+[API_CN.md](API_CN.md#消息补全anthropic-兼容)。
 
 ### 别名关闭思考模式
 
@@ -959,12 +1023,14 @@ export GATEWAY_API_KEYS_FILE=/data/.keys
 - Ollama 要的是**真实模型名**：`auto` → **404**，缺失 → **400**；所以后端换成 Ollama 时把 `model` 改成实际模型（如 `tev1`）。
 - 后端密钥只能从环境变量读取，绝不写入 `config.yaml`；Ollama 不需要它，会忽略这个 `Authorization` 头。
 
-详情见 [API 文档](API.md#system-one-决策-apilaya-server-与-ollama-代理)。
+详情见 [API 文档](API_CN.md#system-one-决策-apilaya-server-与-ollama-代理)。
 
 ### 公网部署 checklist
 
 - [ ] `admin_endpoints` 保持 `deny`（或至少 `readonly`），绝不 `allow`
-- [ ] 所有密钥 ≥ 16 位随机串，并且只通过 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`（如 `data/.keys`）注入
+- [ ] 所有密钥都是随机的：优先用管理台签发的 47 字符 `sk-hub-…`；首次启动从 `GATEWAY_API_KEYS` /
+      `GATEWAY_API_KEYS_FILE`（如 `data/.keys`）导入的旧 Key 也要 ≥ 16 位随机串。库里只存摘要，
+      所以 `llmhub.db` 要与原来的密钥文件同等保护
 - [ ] 前面有反向代理（Nginx/Caddy）终止 TLS
 - [ ] 如需限制来源，`security.allowed_client_ips` 填可信网段
 - [ ] `auth.allow_access_ip_whitelist` 保持 `[]`；确实要开 `/docs` 时只填可信来源——判定用的是 ASGI 客户端地址，直连即 TCP 对端；经本机反代时 uvicorn 会按受信转发头改写它，务必确保反代清理 `X-Forwarded-For`

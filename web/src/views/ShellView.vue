@@ -74,6 +74,11 @@ function openSettings() {
   router.push({ name: 'settings' })
 }
 
+function openApiKeys() {
+  closeMenu()
+  router.push({ name: 'api-keys' })
+}
+
 function openAbout() {
   closeMenu()
   router.push({ name: 'about' })
@@ -178,6 +183,12 @@ onBeforeUnmount(() => {
             <span class="um-ico">⚙</span>
             <span class="um-t">{{ t('shell.settings') }}</span>
             <span class="um-val">{{ t('nav.settings') }}</span>
+          </button>
+
+          <button type="button" class="um-item" @click="openApiKeys">
+            <span class="um-ico">⚿</span>
+            <span class="um-t">{{ t('shell.apiKeys') }}</span>
+            <span class="um-val">{{ t('nav.apiKeys') }}</span>
           </button>
 
           <button type="button" class="um-item" @click="openAbout">

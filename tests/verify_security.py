@@ -17,6 +17,9 @@ import yaml
 # Fixed temp config path, exported to the environment BEFORE config is imported.
 _TMP = tempfile.mktemp(prefix="llm-hub-sec-", suffix=".yaml")
 os.environ["CONFIG_PATH"] = _TMP
+# One data file per run: llmhub.db also holds the api_keys table, and that is seeded only while
+# empty, so it must not be shared with another suite through the system temp directory.
+os.environ["LLMHUB_DB"] = f"{_TMP}.db"
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "app"))

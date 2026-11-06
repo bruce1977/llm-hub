@@ -1,0 +1,1 @@
+import{W as e}from"./index-cKpIhYS-.js";var t=e({version:null});export{t};

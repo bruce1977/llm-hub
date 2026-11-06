@@ -1112,9 +1112,12 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 ## 管理 API（Web 管理台）
 
 > 端点统一挂在 `/v1/management` 下（实现在 `app/management.py`），由 `require_admin` 保护，
-> 接受**两种凭据之一**：登录换来的会话 Cookie，或 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`
-> 提供的网关 API Key（`Authorization: Bearer` / `X-API-Key`）。`ADMIN_PASSWORD` 只是登录凭据，当作请求头凭据提交
+> 接受**两种凭据之一**：登录换来的会话 Cookie，或 `api_keys` 表（`llmhub.db`）里的网关 API Key
+> （`Authorization: Bearer` / `X-API-Key`；该表在首次启动时由 `GATEWAY_API_KEYS` /
+> `GATEWAY_API_KEYS_FILE` 导入）。`ADMIN_PASSWORD` 只是登录凭据，当作请求头凭据提交
 > 仍返回 **401**。未设置 `ADMIN_PASSWORD` 时所有接口返回 **503**；凭据缺失或错误返回 **401**。
+> 例外：`/api-keys` 三个接口只认会话 Cookie（`require_admin_session`）——网关 Key 是任何客户端
+> 都持有的凭据，不能拿它再造一把钥匙。
 > `/v1/management` 与 `/admin` 一样豁免 `security.path_allowlist`。管理台前端由网关在 `/admin`
 > 直接提供静态服务（构建产物在 `app/web`）。
 
@@ -1154,9 +1157,10 @@ curl -X POST http://localhost:8000/v1/management/auth/logout
 - 用户名比较会先 `strip()` 再转小写，所以 ` Admin ` 也能登录
 - 未带 Cookie 也未带网关 Key，或会话 token 被篡改、过期 -> `401`
 - 把 `ADMIN_PASSWORD` 放到 `Authorization: Bearer` / `X-API-Key` -> `401`（它只是登录凭据，
-  不在网关 Key 列表里）；不在 `GATEWAY_API_KEYS` / 密钥文件中的随机 Key 同样 `401`
+  不在网关 Key 列表里）；不在 `api_keys` 表中的随机 Key 同样 `401`
 - 网关 API Key 只接受请求头，放在查询串（`?api_key=...`）-> `401`，避免密钥落进访问日志
-- `auth.enabled: false` 或环境变量与密钥文件都没有配置 Key 时，Key 这条路径直接关闭，管理接口只认 Cookie
+- `auth.enabled: false` 或首次启动时环境变量与密钥文件都没有配置 Key（表里因此一行都没有），
+  Key 这条路径直接关闭，管理接口只认 Cookie
   （绝不会因此变成匿名可访问）
 - 修改 `ADMIN_PASSWORD` 后旧会话立即失效（签名密钥即密码本身）
 - Cookie 为 HttpOnly + SameSite=Lax，仅在 HTTPS 下加 `Secure`
@@ -1297,6 +1301,10 @@ curl -b cookie.txt "http://localhost:8000/v1/management/requests/42"
 - `status` 只接受档位 `2xx` / `3xx` / `4xx` / `5xx`（传具体数字 -> `400`）
 - `page < 1`、`page_size` 不在 `1..200`、`status` 非法 -> `400`；时间戳非法或 `start > end` -> `400`
 - 记录不存在 -> `404`
+- **只统计 API 调用**：列表、`stats`、分页 `total` 一律带
+  `path LIKE '/v1/%' OR path LIKE '/api/%'`（`request_log.API_PATH_SCOPE`）。非 API 路径（如 `/metrics-probe`、
+  `/health`）的请求照常 `200` 并**确实写进库**（直接查 sqlite 能看到行数增加），但列表里查不到、
+  用 `?path=metrics-probe` 也搜不出来；而它的 `/requests/{id}` 深链仍然 `200`（详情接口故意不加这个条件）
 - 请求/响应体各截断到 8 KB，并用 `request_body_truncated` / `response_body_truncated` 标记；
   `api_key`、`authorization`、`password` 等字段递归替换为 `***`
 
@@ -1612,5 +1620,59 @@ curl -b cookie.txt http://localhost:8000/v1/management/api-test \
   object 是两个后端都能直接跑通的写法
 - 五个页面共用 `useApiTestContext()` 的模块级缓存，`/api-test/models` 一次探测所有上游，所以切换
   标签页不会反复压上游；只有首次进入与点击「重新探测」才会再取一次
+
+### 测试 43: 调用方 API Key 管理（`api-keys`）
+
+```bash
+# 列表：只有登录会话 Cookie 能看（网关 Key 不行）
+curl -b cookie.txt http://localhost:8000/v1/management/api-keys
+
+# 生成：明文只在这一次返回
+curl -b cookie.txt -X POST http://localhost:8000/v1/management/api-keys \
+  -H "Content-Type: application/json" -d '{"label": "backend-a"}'
+# HTTP/1.1 201 Created
+# {"item": {"id": 3, "masked": "sk-hub-7Kp2…Q9df", "label": "backend-a",
+#            "source": "console", "created_at": "2026-11-03T12:04:07Z"},
+#  "secret": "sk-hub-7Kp2…（47 字符，只有这里有）"}
+
+# 撤销（界面上唯一能做的删除）
+curl -b cookie.txt -X DELETE http://localhost:8000/v1/management/api-keys/3
+
+# 新生成的 Key 立刻能当调用方凭据用
+curl -H "Authorization: Bearer sk-hub-7Kp2…" http://localhost:8000/api/tags
+```
+
+**断言:**
+
+- 三条路由都只认会话 Cookie（`require_admin_session`）：先 `logout` 再拿网关 API Key 分别请求
+  `GET` / `POST` / `DELETE /api-keys` -> **全部 401**，登录回来才 `200`。理由写死在
+  `admin_auth.py` 的注释里：网关 Key 是任何客户端都已持有的东西，接受它就等于让客户端给自己发权限
+- 首次启动将 `GATEWAY_API_KEYS` / 密钥文件里的 Key 导入一次：列表里有一行 `source: "file"`、
+  `label` 为空串，`masked` 是旧式 Key 的头 8 尾 4 形式（结尾 4 位与明文相同，便于比对）；
+  此后环境变量再变也不写表，只在启动日志里给掩码警告
+- 任何接口都取不到明文：`GET /api-keys` 与新建响应的 `item` 里只有掩码，随后所有列表都不含那串明文
+  （`secret not in json.dumps(...)`），表里连 `hash` 列都不出现在响应字段中——
+  `listing` 每行只有 `id` / `masked` / `label` / `source` / `created_at` 五列
+- 格式固定：`sk-hub-` + 40 位 base62（`string.ascii_letters + digits`），总长 `KEY_LENGTH = 47`；
+  连取 50 个互不重复。掩码是 `sk-hub-` + 头 4 + `…` + 尾 4；旧式（非该前缀）Key 掩码头 8 尾 4，
+  长度 ≤ 12 的整体用 `••••••` 覆盖，绝不泄露任何一位
+- 存储是 `sha256(明文)` 的小写十六进制（`hash_key`：同值同摘要、异值异摘要、长度 64）。
+  校验走 `ApiKeyStore.verify()` 比较摘要，所以数据库整包被拷走也拿不到可用 Key；
+  改一位明文的 Key 立刻验不过
+- `label` 进库前 `strip()`；路由要求非空（空白串 -> **400**
+  `A label is required, so the key is recognisable later.`），超过 `LABEL_MAX_CHARS = 100`
+  由 pydantic 拦下 -> **422**。`ApiKeyStore.create()` 本身允许空标签并按上限截断，
+  这一层是给导入和将来复用的余量
+- 新建的 Key 立即生效（无需重启）：`GET /api/tags` 与 `/v1/management/auth/ping` 都 `200`——
+  每次写表都会重载进程内的 `frozenset` 缓存，请求路径上不碰 sqlite
+- 撤销：真实 id -> **200** `{"deleted": id}`；同一个 id 再删 -> **404**；不存在的 id -> **404**；
+  列表里该行消失。撤销后（已登出，只测 Key 本身）该 Key 走网关 -> **403**、走管理接口 -> **401**，
+  而最早导入的环境 Key 仍然 `200`
+- 未带任何凭据时列表关闭 -> **401**
+- 单元测试（`test_management.py` 第 [14] 段）覆盖 `ApiKeyStore` 本体：空表 `count() == 0`、
+  `import_plaintext` 跳过重复（三个含一个重样的输入只进 2 行，重复导入同一批增加 0 行）、
+  导入行 `source == "file"` 且能验过、`unserved_env_keys()` 只报未服务的 Key 且返回掩码、
+  `delete()` 对真实 id 返回 `True` 并让 `verify()` 立刻转 `False`、未知 id 返回 `False`、
+  列表按新到旧排序且 `count()` 与表行数一致
 
 

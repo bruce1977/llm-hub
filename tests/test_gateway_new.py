@@ -60,6 +60,10 @@ with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="ut
     _cfg_path = _tmp.name
 os.environ["CONFIG_PATH"] = _cfg_path
 os.environ["GATEWAY_API_KEYS"] = "sk-test-fixture-key"
+# One data file per run: `llmhub.db` also holds the api_keys table, and a key is imported into
+# an *empty* table only, so sharing the system temp directory with another suite would leave
+# this suite's key unimported.
+os.environ["LLMHUB_DB"] = f"{_cfg_path}.db"
 os.environ["SYSTEMONE_SERVER_API_KEY"] = "systemone-secret-env-key"
 os.environ["OPENCODE_GATEWAY_API_KEY"] = "opencode-secret-env-key"
 

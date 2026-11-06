@@ -435,6 +435,7 @@ export interface BenchHistory {
 export type ApiTestKind =
   | 'generate'
   | 'chat'
+  | 'messages'
   | 'embed_ollama'
   | 'embed_openai'
   | 'rerank'
@@ -531,4 +532,36 @@ export interface ConfigUpstream {
 /** Per-segment validation errors returned by PUT /config (HTTP 422). */
 export interface ConfigSaveError {
   segments: Record<string, string>
+}
+
+// --------------------------------------------------------------------------- //
+// API keys (GET/POST/DELETE /v1/management/api-keys). Only the hash lives in
+// llmhub.db, so a listed row carries a mask rather than a secret; the plaintext
+// appears in exactly one response - the one that created it.
+// --------------------------------------------------------------------------- //
+/** `file` marks a key imported from the environment on first start, `console` one minted here. */
+export type ApiKeySource = 'console' | 'file'
+
+export interface ApiKeyItem {
+  id: number
+  masked: string
+  label: string
+  source: ApiKeySource
+  /** ISO UTC, second precision. */
+  created_at: string
+}
+
+export interface ApiKeysResponse {
+  items: ApiKeyItem[]
+  total: number
+}
+
+export interface ApiKeyCreated {
+  item: ApiKeyItem
+  /** The only time this value is ever returned. */
+  secret: string
+}
+
+export interface ApiKeyDeleted {
+  deleted: number
 }

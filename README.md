@@ -1,11 +1,20 @@
 # LLM Hub
 
-**One endpoint in front of every model you run.** LLM Hub sits between your clients — WorkBuddy,
-WeKnora, an SDK, plain `curl` — and the backends you already have (several Ollama instances, LM
-Studio, an OpenCode gateway). Clients see a single address, one API key and one model list; the
-gateway works out which instance actually has the model and forwards the request there. It also
-fills the gaps Ollama leaves open: a **Rerank API**, a **web-search proxy**, per-alias parameter
-injection (e.g. force `think: false`), and a **web console** with live upstream and request data.
+**LLM Hub is a self-hosted FastAPI gateway that unifies your local LLM backends behind one
+OpenAI-compatible endpoint.**
+
+When you run models locally, the Ollama instances rarely number just one: a desktop discrete GPU, an
+integrated GPU, and a pair of nodes on a NAS (internal and public) are common setups. Wiring every
+client — WorkBuddy, WeKnora, an SDK, or plain `curl` — to the right host and port by hand gets
+tedious fast, and Ollama on its own is missing a few capabilities the rest of the stack expects: a
+rerank endpoint for RAG, a web-search pass-through, and an Anthropic-style Messages API.
+
+LLM Hub collapses all of that into a single `base_url`, one API key, and one model list. You send
+`model: "qwen3.5:4b-nothink"` and the gateway resolves the alias, selects the upstream that actually
+holds the model, injects the pinned parameters, and streams the answer back unchanged. On top of
+routing it supplies the endpoints Ollama lacks (rerank, web search, Messages), per-alias parameter
+injection (e.g. `think: false`), and a Vue admin console with live request logs, per-model speed
+tests, and key management.
 
 [简体中文](README_CN.md) · [Full usage guide](docs/USAGE.md) · [API reference](docs/API.md) ·
 [Deployment](docs/DEPLOY.md) · [Changelog](CHANGELOG.md)
@@ -16,49 +25,53 @@ injection (e.g. force `think: false`), and a **web console** with live upstream 
 ![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)
 ![i18n](https://img.shields.io/badge/i18n-中文%20%7C%20English-8B5CF6)
 
-```text
-clients                              llm-hub                                 backends
-┌────────────────────┐              ┌────────────────────┐              ┌────────────────────┐
-│ WorkBuddy          │              │ one base_url       │              │ Ollama GPU 11434   │
-│ WeKnora            │── one key ──▶│ one API key        │── model ────▶│ Ollama iGPU 11435  │
-│ curl / SDK         │              │ one model list     │              │ LM Studio          │
-│                    │              │ /admin console     │              │ OpenCode gateway   │
-└────────────────────┘              └────────────────────┘              └────────────────────┘
+<img src="docs/images/architecture-en.png" width="820" alt="Architecture">
+
+## Admin console
+
+Everything the gateway does is visible and operable from the Vue console at `/admin`: upstream
+health and VRAM, the model inventory with per-model speed tests (TTFT, decode / prefill tok/s), a
+SQLite request log you can filter down to a single call, the rerank keys and configuration
+projection, API-key minting and revocation (masked listings only), and a **Test** button on every
+documented endpoint. The interface switches between 简体中文 / 繁體中文 / English from the account
+menu at the bottom-left.
+
+**Dashboard** — upstream health, VRAM, running models and the request trend.
+
+<img src="docs/images/dashboard-en.jpg" width="900" alt="Dashboard — health, VRAM, running models, traffic">
+
+**Models · LLM** — the model inventory with live device/VRAM and a per-model speed test.
+
+<img src="docs/images/models-llm-en.jpg" width="900" alt="Models · LLM — inventory, live device/VRAM, speed test">
+
+## Deployment
+
+### Local (no Docker)
+
+```bash
+# 1. dependencies + config
+pip install -r requirements.txt
+cp data/config.example.yaml data/config.yaml   # upstreams, aliases, rerank...
+cp .env.example .env                           # GATEWAY_API_KEYS, ADMIN_PASSWORD...
+# edit both files: real upstream base_urls, real keys
+
+# 2. run (loads ../.env, hot-reloads on save)
+cd app
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 ```
 
-## What you get
+On Windows, `scripts\start-local.bat` (add `-Install` the first time) runs the same preflight
+checks and starts uvicorn for you. Open **<http://localhost:8000/admin/>** and sign in as `admin`
+with `ADMIN_PASSWORD`; without that variable the console reports itself disabled and every
+management call answers 503. `config.yaml` edits hot-reload in about a second — no restart.
 
-| | |
-|---|---|
-| **Routing by model** | The `model` field decides the upstream — no per-port URLs in your clients. Same model on several instances? Lowest `priority` wins. |
-| **One auth layer** | Many keys, constant-time compare, `Bearer` / `X-API-Key`. Keys live in the environment or a secret file, never in `config.yaml`. |
-| **APIs Ollama lacks** | `POST /v1/rerank` (logprobs or embedding scoring) and `POST /v1/tools/web-search`, both routed to the upstream that can serve them. |
-| **Aliases** | `qwen3.5:4b-nothink` → `qwen3.5:4b` with `think: false` injected — every `aliases:` entry is a model of its own, so the console lists it as its own row, while `model_aliases` only renames. Also pins `num_ctx` per model to stop Ollama re-spawning. |
-| **Transparent streaming** | NDJSON (`/api/chat`, `/api/generate`) and SSE (`/v1/chat/completions`) are passed through untouched, timings included. |
-| **Console + telemetry** | Vue console at `/admin`, request log in SQLite, per-model **speed test** (TTFT, decode / prefill tok/s, last 3 runs), an **API tester** behind a Test button on every documented endpoint, 简体中文 / English. |
-
-## Screenshots
-
-Live renders of the built console against a real gateway — English set in
-`docs/screenshots/en/`, Chinese set in `docs/screenshots/zh/` (regenerate them with
-`node docs/web-management/capture-live.js`). The console language switches from the account menu
-at the bottom-left.
-
-| Dashboard — health, VRAM, running models, traffic | Upstreams — probe latency and declared models |
-|:--:|:--:|
-| [![Dashboard](docs/screenshots/en/dashboard.jpg)](docs/screenshots/en/dashboard.jpg) | [![Upstreams](docs/screenshots/en/upstreams.jpg)](docs/screenshots/en/upstreams.jpg) |
-| **Models · LLM** — inventory, live device/VRAM, speed test | **Requests** — SQLite log, filters, per-request detail |
-| [![Models](docs/screenshots/en/models-llm.jpg)](docs/screenshots/en/models-llm.jpg) | [![Requests](docs/screenshots/en/requests.jpg)](docs/screenshots/en/requests.jpg) |
-| **Models · Rerank** — config projection, keys masked | **Login gate** — password → 12h HttpOnly cookie |
-| [![Rerank](docs/screenshots/en/models-rerank.jpg)](docs/screenshots/en/models-rerank.jpg) | [![Login](docs/screenshots/en/login.jpg)](docs/screenshots/en/login.jpg) |
-
-## Quick start
+### Docker (recommended)
 
 ```bash
 # 1. config + secrets (both are mounted, never baked into the image)
 mkdir -p llm-hub/data
-cp data/config.example.yaml llm-hub/data/config.yaml   # upstreams, aliases, rerank...
-cp .env.example llm-hub/.env                           # GATEWAY_API_KEYS, ADMIN_PASSWORD...
+cp data/config.example.yaml llm-hub/data/config.yaml
+cp .env.example llm-hub/.env
 # edit both files: real upstream base_urls, real keys
 
 # 2. run
@@ -70,14 +83,11 @@ docker run -d --name llm-hub -p 8888:8000 \
 curl http://localhost:8888/health          # {"ok":true}
 ```
 
-Then open **<http://localhost:8888/admin/>** and sign in as `admin` with `ADMIN_PASSWORD`. Without
-that variable the console reports itself as disabled and every management call answers 503.
-`config.yaml` edits hot-reload in about a second — no restart.
+Open **<http://localhost:8888/admin/>** and sign in the same way. Building from source:
+`docker build -t llm-hub:latest .` — the image is self-contained: the console bundle is committed
+in `app/web`, so no Node toolchain is needed.
 
-Building from source instead: `docker build -t llm-hub:latest .` — see
-[USAGE.md](docs/USAGE.md#quick-start), which also covers a bare-metal run without Docker.
-
-## Talk to it
+### Calling it
 
 ```bash
 KEY=sk-your-gateway-key
@@ -90,6 +100,11 @@ curl http://localhost:8888/api/chat -H "X-API-Key: $KEY" \
 curl http://localhost:8888/v1/chat/completions -H "X-API-Key: $KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.5:4b","messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic Messages (the envelope Claude SDK / Claude Code speaks)
+curl http://localhost:8888/v1/messages -H "x-api-key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5:4b","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
 
 # Rerank — something Ollama does not ship
 curl http://localhost:8888/v1/rerank -H "X-API-Key: $KEY" \
@@ -105,12 +120,18 @@ curl http://localhost:8888/health
 
 | Document | What is in it |
 |---|---|
-| [USAGE.md](docs/USAGE.md) | Everything: config reference (`server` / `auth` / `upstreams` / `routing` / `aliases` / `api_models` / `rerank` / `websearch` / `request_log`), LM Studio integration, web console internals, full endpoint docs, FAQ, security checklist, local development |
-| [docs/API.md](docs/API.md) | Forwarding rules, error codes, request/response examples |
-| [docs/DEPLOY.md](docs/DEPLOY.md) | Image build and publish scripts, reverse proxy, volumes |
-| [docs/TESTCASES.md](docs/TESTCASES.md) | End-to-end test matrix (smoke / management / gateway) |
-| [docs/web-management/](docs/web-management/web-management-implementation.md) | How the console is built, screens, capture scripts |
-| [CHANGELOG.md](CHANGELOG.md) | Release notes |
+| [USAGE.md](docs/USAGE.md) | Full manual: every `config.yaml` section, LM Studio integration, the admin console, calling examples, FAQ, public-deployment security checklist, local development |
+| [API.md](docs/API.md) | Every endpoint (Anthropic Messages included) with request/response examples, streaming formats, error codes, alias injection, tool calling |
+| [DEPLOY.md](docs/DEPLOY.md) | Deployment: `docker run` and volumes, local Python run, image build/publish scripts, environment variables, troubleshooting, operations |
 
-Requirements: Docker (or Python 3.12 + `pip install -r requirements.txt`). The console bundle is
-committed in `app/web`, so the image needs no Node toolchain.
+Requirements: Docker (or Python 3.12 + `pip install -r requirements.txt`).
+
+## Follow & license
+
+<img src="docs/images/wechat-qrcode.png" width="200" alt="WeChat official account QR code">
+
+Scan the code to follow the project's WeChat official account for release notes, deployment notes
+and Q&A.
+
+**License** — released under the [MIT License](LICENSE).
+

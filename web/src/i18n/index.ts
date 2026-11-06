@@ -2,10 +2,12 @@ import { createI18n } from 'vue-i18n'
 
 import en from './messages/en'
 import zhCN from './messages/zh-CN'
+import zhTW from './messages/zh-TW'
 
 /** Locales the console ships. `label` is the endonym, so it is never translated. */
 export const SUPPORTED_LOCALES = [
-  { code: 'zh-CN', label: '中文', short: '中' },
+  { code: 'zh-CN', label: '简体中文', short: '简' },
+  { code: 'zh-TW', label: '繁體中文', short: '繁' },
   { code: 'en', label: 'English', short: 'EN' },
 ] as const
 
@@ -14,8 +16,23 @@ export type LocaleCode = (typeof SUPPORTED_LOCALES)[number]['code']
 const STORAGE_KEY = 'llmhub-console-locale'
 export const DEFAULT_LOCALE: LocaleCode = 'zh-CN'
 
+const LOCALE_CODES: readonly string[] = SUPPORTED_LOCALES.map((l) => l.code)
+
 function isLocale(value: unknown): value is LocaleCode {
-  return value === 'zh-CN' || value === 'en'
+  return LOCALE_CODES.includes(String(value))
+}
+
+/**
+ * Browser tag -> console locale. A `zh` tag is ambiguous, so only the Traditional tags
+ * (`zh-TW`, `zh-HK`, `zh-MO`, or an explicit `zh-Hant` script) land on 繁體中文;
+ * `zh-CN`, bare `zh` and anything unknown keep the default.
+ */
+export function localeFromTag(tag: string): LocaleCode {
+  const value = tag.toLowerCase().replace(/_/g, '-')
+  if (value.startsWith('en')) return 'en'
+  if (value.startsWith('zh-tw') || value.startsWith('zh-hk') || value.startsWith('zh-mo')) return 'zh-TW'
+  if (value.startsWith('zh-hant')) return 'zh-TW'
+  return DEFAULT_LOCALE
 }
 
 /** Saved choice first, then the browser language, then the default (zh-CN). */
@@ -27,7 +44,7 @@ export function detectLocale(): LocaleCode {
     // Private browsing / disabled storage: fall through to the browser hint.
   }
   const nav = typeof navigator === 'undefined' ? '' : navigator.language || ''
-  return nav.toLowerCase().startsWith('en') ? 'en' : DEFAULT_LOCALE
+  return localeFromTag(nav)
 }
 
 export const i18n = createI18n({
@@ -35,7 +52,7 @@ export const i18n = createI18n({
   globalInjection: true,
   locale: detectLocale(),
   fallbackLocale: DEFAULT_LOCALE,
-  messages: { 'zh-CN': zhCN, en },
+  messages: { 'zh-CN': zhCN, 'zh-TW': zhTW, en },
 })
 
 export function currentLocale(): LocaleCode {

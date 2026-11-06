@@ -4,14 +4,16 @@
 
 LLM Hub is a FastAPI-based unified gateway that aggregates multiple Ollama instances, LM Studio, and OpenAI-compatible backends into a single API endpoint. It provides:
 - Multi-upstream routing by model name
-- API key authentication
+- API key authentication (keys live in the `api_keys` table of `llmhub.db` as SHA-256 hashes,
+  minted and revoked from the console; the environment only seeds an empty table on first start)
 - Rerank API implementation
 - Web search pass-through (OpenCode API Gateway upstream)
 - Model aliasing and parameter injection (an entry under root `aliases:` is a model of its own with
   its own pinned parameters; `upstreams[].model_aliases` only renames an existing model)
 - Config hot reload
 - Read-only management API (`/v1/management`) with a SQLite request log; the only actions that
-  actually reach out are the per-model speed test and the per-endpoint API testers
+  actually reach out are the per-model speed test and the per-endpoint API testers, and the only
+  rows it writes are `bench_results`, request-log rows and `api_keys` (create / revoke)
 - Vue 3 web console (`web/`, built into `app/web`, served at `/admin`) over that API
 
 ## Architecture
@@ -22,8 +24,10 @@ llm-hub/
 │   ├── main.py       # FastAPI application, lifespan, special endpoints
 │   ├── config.py     # Config models, loading, hot reload, alias resolution
 │   ├── auth.py       # API key authentication, security helpers
+│   ├── key_store.py  # api_keys table in llmhub.db: SHA-256 hashes, sk-hub- keys, masks only
 │   ├── admin_auth.py # ADMIN_PASSWORD login + require_admin (session cookie or gateway API key)
 │   ├── proxy.py      # Reverse proxy, streaming pass-through, request-log capture
+│   ├── messages.py   # Anthropic Messages compatibility (/v1/messages): request mapping, envelope & SSE rebuild
 │   ├── request_log.py # SQLite request log (WAL, async batched writes, stats queries)
 │   ├── management.py # Read-only management API (/v1/management) for the web console
 │   ├── bench.py      # Model speed test engine (Python port of bench_llm.mjs, no Node needed)
@@ -47,18 +51,19 @@ llm-hub/
 ├── tests/
 │   ├── smoke_test.py        # Comprehensive mock tests (135)
 │   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (63)
-│   ├── test_management.py   # Management API + request log + console serving tests (297)
+│   ├── test_management.py   # Management API + request log + API keys + console serving tests (366)
 │   ├── verify_security.py   # Security control tests (15)
 │   ├── test_api.py          # E2E tests against a live server (28)
 │   └── demo.py              # Demo script (requires real Ollama)
 ├── docs/
-│   ├── API.md               # API documentation with all endpoints
+│   ├── API.md / API_CN.md       # API reference: every endpoint, streaming, errors, aliases (EN / ZH)
 │   ├── TESTCASES.md         # Test cases documentation with examples
-│   ├── DEPLOY.md            # Docker deployment guide
+│   ├── DEPLOY.md / DEPLOY_CN.md # Deployment: Docker, local run, build/publish scripts (EN / ZH)
 │   ├── Ranker.md            # Reranker configuration guide
-│   ├── USAGE.md / USAGE_CN.md  # Full manual: config reference, console, endpoints, security
+│   ├── USAGE.md / USAGE_CN.md  # Full manual: config reference, console, endpoints, security (EN / ZH)
 │   ├── web-management/      # Console spec, mockups, capture-live.js (live screenshot capture)
-│   ├── screenshots/         # README gallery: en/ and zh/ sets, produced by capture-live.js
+│   ├── images/              # Everything the READMEs embed (architecture, screenshots, WeChat QR)
+│   ├── screenshots/         # Full per-page capture sets: en/ and zh/, produced by capture-live.js
 │   └── workflow.md          # Development workflow with diagrams
 ├── scripts/
 │   ├── start-local.ps1      # Local launcher: preflight (deps/config/keys/port) then uvicorn
@@ -72,8 +77,8 @@ llm-hub/
 ├── Dockerfile        # Container build (python:3.12-slim)
 ├── pyproject.toml    # Python tooling config (ruff, mypy, pytest)
 ├── requirements.txt  # Runtime dependencies
-├── README.md / README_CN.md   # Short landing page: pitch, screenshots, quick start
-├── CHANGELOG.md / CHANGELOG_CN.md
+├── README.md / README_CN.md   # Landing page: intro, architecture diagram, console, deployment, docs map, license
+├── CHANGELOG.md
 └── AGENTS.md         # This file
 ```
 
@@ -139,7 +144,7 @@ python tests/demo.py
 ### Test Structure
 - `smoke_test.py` — 135 mock tests (auth, routing, aliases, streaming, `/api/generate` forwarding, rerank, security, `/` system info, upstream types), no external deps
 - `test_gateway_new.py` — 63 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input + the documented `/api/generate` request/response schema)
-- `test_management.py` — 297 tests for admin auth (session cookie **or** gateway API key → 200; the admin password as `Bearer` / `X-API-Key` and a key in the query string → 401; wrong username → 401; `ADMIN_PASSWORD` unset → 503), the `/admin` static console (`/admin` → `/admin/` redirect, SPA fallback, immutable caching for `assets/`, `../` cannot escape the build, the tab icon served as `image/svg+xml` rather than falling back to the shell, 503 with a build hint when `app/web` is missing), upstream probes + device classification, the `upstreams/{name}` detail (declared `models` with renames applied plus the derived alias names, `/api/ps` `running_models`), the config-driven `/models/llm` (only declared names, `display` / `alias` / `derived` per row, a `model_aliases` rename replacing `display` without touching the target, a root `aliases:` entry becoming its own row right after its target — device inherited, memory `null`, `aliases[].kind` separating `rename` from `derived`, a `qwen3:*` or `opencode/*` prefix expanded through discovery and flagged `wildcard`, an unresolvable pattern kept as its own row with `running: false`, runtime device/memory, dead upstream contributes only its declared names), hosted `opencode` rows (probe online ⇒ every declared model `running` with `device: "cloud"` and memory `null`, rows added to `/overview` `running_models` and the KPI, nothing added when offline), `/overview` appending only **running** derived rows to `running_models` while `kpi.running_models` counts just the physical + hosted rows, masked config projections (LLM / rerank / systemone / tools-websearch), the `api_models` derivation and narrowing (names explicitly claimed by embed/rerank/systemone removed from generate/chat while a `websearch` claim does not hide a chat model or its alias, a tagless `tev1` claim matching a declared `tev1:latest`, alias and derived names accepted, `free_model` on websearch/systemone, an unserved name kept visible, the per-kind default and mask, a non-Ollama (`lmstudio`) model absent from the native `generate` / `embed_ollama` kinds while `chat` / `embed_openai` keep it, an explicit list served as written), the `/api-test` envelope (closed `kind` allowlist → 400, a missing `model` where the family needs one → 400, alias + `think` injection, `num_ctx` clamping, the envelope's requested/resolved model + upstream + injected params (flat keys, not nested), NDJSON and SSE assembly with `stream`/`content_type`/`ttft_ms`, an unreachable backend's **502** and a disabled capability's **404** arriving as data rather than as an error, the 128 KB `truncated` cap and the request-log row a tester call leaves), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string, an allowed `HEAD` forwarded but never written to the log, the `tokens_in` / `tokens_out` split from both usage formats and the `NULL` when a response reports no usage), the `kpi.tokens_today` total, filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade (including the declared type of the added columns)
+- `test_management.py` — 366 tests for admin auth (session cookie **or** gateway API key → 200; the admin password as `Bearer` / `X-API-Key` and a key in the query string → 401; wrong username → 401; `ADMIN_PASSWORD` unset → 503), the `/admin` static console (`/admin` → `/admin/` redirect, SPA fallback, immutable caching for `assets/`, `../` cannot escape the build, the tab icon served as `image/svg+xml` rather than falling back to the shell, 503 with a build hint when `app/web` is missing), upstream probes + device classification, the `upstreams/{name}` detail (declared `models` with renames applied plus the derived alias names, `/api/ps` `running_models`), the config-driven `/models/llm` (only declared names, `display` / `alias` / `derived` per row, a `model_aliases` rename replacing `display` without touching the target, a root `aliases:` entry becoming its own row right after its target — device inherited, memory `null`, `aliases[].kind` separating `rename` from `derived`, a `qwen3:*` or `opencode/*` prefix expanded through discovery and flagged `wildcard`, an unresolvable pattern kept as its own row with `running: false`, runtime device/memory, dead upstream contributes only its declared names), hosted `opencode` rows (probe online ⇒ every declared model `running` with `device: "cloud"` and memory `null`, rows added to `/overview` `running_models` and the KPI, nothing added when offline), `/overview` appending only **running** derived rows to `running_models` while `kpi.running_models` counts just the physical + hosted rows, masked config projections (LLM / rerank / systemone / tools-websearch), the `api_models` derivation and narrowing (names explicitly claimed by embed/rerank/systemone removed from generate/chat while a `websearch` claim does not hide a chat model or its alias, a tagless `tev1` claim matching a declared `tev1:latest`, alias and derived names accepted, `free_model` on websearch/systemone, an unserved name kept visible, the per-kind default and mask, a non-Ollama (`lmstudio`) model absent from the native `generate` / `embed_ollama` kinds while `chat` / `embed_openai` keep it, an explicit list served as written), the `/api-test` envelope (closed `kind` allowlist → 400, a missing `model` where the family needs one → 400, alias + `think` injection, `num_ctx` clamping, the envelope's requested/resolved model + upstream + injected params (flat keys, not nested), NDJSON and SSE assembly with `stream`/`content_type`/`ttft_ms`, an unreachable backend's **502** and a disabled capability's **404** arriving as data rather than as an error, the 128 KB `truncated` cap and the request-log row a tester call leaves), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string, an allowed `HEAD` forwarded but never written to the log, the `tokens_in` / `tokens_out` split from both usage formats and the `NULL` when a response reports no usage), the `kpi.tokens_today` total, filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade (including the declared type of the added columns), the `/v1` + `/api` **stats scope** (a non-API path is still written to the raw table yet counted by neither the list, the timeseries, the pies, the KPI or `failures`, and `?path=` cannot bring it back, while its `/requests/{id}` deep link still opens) and the **caller API key routes** (session cookie only — a gateway key alone is **401** on all three; the seeded `source: "file"` row is masked with no plaintext anywhere in the payload; **201** create returns a `sk-hub-` key of exactly 47 base62 characters whose mask equals `mask_key(secret)`, and that plaintext never reappears in a later listing; blank label **400** / over-long **422**; the fresh key authenticates `/api/tags` and `/v1/management/auth/ping` at once, a tampered last character does not; revoke answers **200** then **404**, the row disappears and the key stops authenticating — checked after `logout`, because a live session cookie would otherwise satisfy `require_admin` on its own), plus a direct `ApiKeyStore` unit section (50 generated keys are unique, prefixed and fixed-length; `hash_key` is the lowercase sha256 hex; the three `mask_key` shapes; `create` row fields and label truncation; `list_keys` ordering and its exact column set; `import_plaintext` de-duplicates and marks `source: "file"`; `unserved_env_keys` reports only masks; a deleted key fails `verify()`)
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
 - `test_api.py` — 28 E2E tests against a real running server + Ollama + web search provider
 - `demo.py` — interactive demo (requires real Ollama)
@@ -227,6 +232,47 @@ deployment that only has the pre-YAML `config.json` next to the new default path
 `ConfigManager._active_path()` loads it with a warning instead of overwriting it with a fresh template.
 Comments are allowed, which is why the format changed.
 
+## Documentation
+
+Docs live in `docs/`. Only the two landing pages, `CHANGELOG.md` and this file stay at the repository root.
+
+| File | Language | Role |
+|---|---|---|
+| `README.md` / `README_CN.md` | EN / ZH | Landing page: intro, architecture diagram, admin console, deployment, doc map, license |
+| `docs/USAGE.md` / `docs/USAGE_CN.md` | EN / ZH | Full manual: every config field, LM Studio, console, calling examples, FAQ, security, local dev |
+| `docs/API.md` / `docs/API_CN.md` | EN / ZH | Every endpoint with request/response examples, streaming, error codes, alias injection, tool calling |
+| `docs/DEPLOY.md` / `docs/DEPLOY_CN.md` | EN / ZH | Deployment: Docker, local run, build/publish scripts, environment variables, troubleshooting, operations |
+| `CHANGELOG.md` | EN | Release notes |
+| `docs/web-management/`, `docs/TESTCASES.md`, `docs/Ranker.md`, `docs/workflow.md` | ZH | Internal specs, test notes and workflow diagrams — deliberately absent from the README doc map |
+
+### Rules
+
+- **One language pair per doc, English unsuffixed.** `X.md` is English and `X_CN.md` is its Chinese
+  counterpart; both change in the same commit. There is no `_EN` suffix and the Chinese file is never the
+  only version. `USAGE`, `API` and `DEPLOY` all follow this pattern.
+- **The changelog is English only.** Do not add `CHANGELOG_CN.md` back — one file, one language.
+- **The README doc map has exactly three rows**: USAGE, API, DEPLOY. Internal specs, test cases and
+  workflow notes stay out of the landing page.
+- **Doc-map cells show the file name alone**, never a path: `[API.md](docs/API.md)`, not link text
+  `docs/API.md`.
+- **A one-line description has to match that document's real headings.** Reread the target's table of
+  contents before editing the blurb. Do not describe chapters that never existed — `API.md` has no
+  "forwarding rules" section, `DEPLOY.md` has no standalone reverse-proxy section, and `USAGE.md`
+  documents how to *use* the console rather than how it is implemented.
+- **Images the READMEs embed belong in `docs/images/`** — architecture diagram, the two screenshots, the
+  WeChat QR (`wechat-qrcode.png`). `docs/screenshots/{en,zh}/` keeps the full per-page capture sets for
+  the console spec.
+- **A language pair keeps identical heading structure and anchors**, so a link can be localised by
+  swapping the file name (`API.md#rerank` ↔ `API_CN.md#rerank`). Anchors are GitHub slugs of the heading
+  text, so the Chinese file's anchors stay Chinese (`API_CN.md#消息补全anthropic-兼容`).
+- **Copy code, translate prose.** Commands, JSON, YAML, field names and status codes are identical in both
+  languages; only the explanatory text is translated.
+- **Cross-link in the same pass.** Adding an endpoint or config block means updating USAGE (both
+  languages), API (both), the README calling example when it is user-visible, and the matching subsection
+  here.
+- **Relative links inside `docs/` are file-relative** (`API_CN.md#web-search…` from USAGE_CN, `../README.md`
+  from USAGE), because the files sit side by side.
+
 ## Key Implementation Details
 
 ### Routing Logic
@@ -257,7 +303,8 @@ Comments are allowed, which is why the format changed.
 - Client IP allowlist support
 - CORS configuration (no `*` by default)
 - Request body size limits
-- Weak key detection at startup (refuses to boot with placeholder keys)
+- Weak key detection at startup (refuses to boot with placeholder keys) — only the environment keys
+  can be weak, since console-generated ones are 238-bit random
 - HTTP method allowlist (`security.allowed_http_methods`, default GET/POST -> 405 for the rest)
 - Regex path allowlist (`security.path_allowlist`, 403 for non-matching paths)
 - In-memory token-bucket rate limiter (`security.rate_limit`, 429 when over budget)
@@ -266,15 +313,36 @@ Comments are allowed, which is why the format changed.
   minted by `POST /v1/management/auth/login` **or** a gateway API key (`GATEWAY_API_KEYS` /
   `GATEWAY_API_KEYS_FILE`); `ADMIN_PASSWORD` is a login credential only (sending it as
   `Bearer` / `X-API-Key` is **401**)
-- Caller API keys come only from the environment (`GATEWAY_API_KEYS`, or the file named by
-  `GATEWAY_API_KEYS_FILE` such as `data/.keys`); `auth.api_keys` is a read-only runtime view, and an
-  `api_keys:` block left in `config.yaml` logs a warning and is ignored. When
-  `GATEWAY_API_KEYS_FILE` is unset, `config.collect_env_api_keys()` falls back to `.keys` in the
-  **same directory as `CONFIG_PATH`** (`config.default_keys_file()`), so mounting `/config/.keys`
-  needs no env var — an explicit `GATEWAY_API_KEYS_FILE` always wins
-- Startup requires a key **unless** `auth.allow_access_ip_whitelist` is non-empty: that is the
-  trusted-network mode (whitelisted peers skip the key check anyway), logged as a warning; with no
-  key and an empty whitelist the app refuses to start. The misspellings `allow_access_ip_whilelist`
+- Caller API keys are **rows of `api_keys` in `llmhub.db`** (`app/key_store.py`): `id`, `hash`,
+  `masked`, `label`, `source`, `created_at`. Only `sha256(<plaintext>)` lowercase hex and a display
+  mask are stored, never the secret, so a stolen database cannot be replayed. SHA-256 rather than a
+  slow KDF on purpose: a generated key is 238 bits of randomness (nothing to brute-force) and the
+  gateway verifies a key on **every** client request, where bcrypt/argon2 would add tens of
+  milliseconds and turn the endpoint into a DoS amplifier
+- `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` (e.g. `data/.keys`) **seed an empty table on first
+  start** (`source: "file"`), then are never read again: from that moment the table is the only
+  source of truth, so a key revoked in the console stays revoked across restarts and editing the
+  file changes nothing. `main.lifespan` logs a masked warning listing environment keys the table
+  does not serve, so a dead credential is visible at startup rather than surprising callers with 403
+- When `GATEWAY_API_KEYS_FILE` is unset, `config.collect_env_api_keys()` falls back to `.keys` in
+  the **same directory as `CONFIG_PATH`** (`config.default_keys_file()`), so mounting `/config/.keys`
+  needs no env var — an explicit `GATEWAY_API_KEYS_FILE` always wins. `auth.api_keys` stays a
+  read-only runtime view of those values; an `api_keys:` block left in `config.yaml` logs a warning
+  and is ignored
+- Verification is `key_store.ApiKeyStore.verify()`: a `frozenset` of hashes held **in memory**
+  (`app/auth.py` reaches it through the process-wide `get_store()`), so no client call waits on
+  sqlite. Every write (`create` / `delete` / `import_plaintext`) reloads that cache, which is why a
+  new key works immediately and a revoked one stops working immediately
+- Generated key format: `sk-hub-` + 40 base62 characters from `secrets` = **47 characters, always**
+  (~238 bits). The prefix is not a secret; it is what makes a leaked-looking string recognisable in
+  a log or a client config. `mask_key()` keeps the prefix plus 4+4 body characters
+  (`sk-hub-FNdc…SVvw`); an imported key of any other shape shows head 8 + tail 4, and one of 12
+  characters or fewer is fully dotted
+- Startup requires at least one served key (`api_keys` non-empty after seeding) **unless**
+  `auth.allow_access_ip_whitelist` is non-empty: that is the trusted-network mode (whitelisted peers
+  skip the key check anyway), logged as a warning; with no key and an empty whitelist the app refuses
+  to start, and the remedy named in the error is to seed the empty table from the environment before
+  restarting. The misspellings `allow_access_ip_whilelist`
   / `allow_ip_whitelist` are normalised to the real field with a warning (pydantic would otherwise
   drop them silently and leave the whitelist empty)
 - `/docs` and `/openapi.json` are served only to sources matching `auth.allow_access_ip_whitelist`
@@ -347,9 +415,9 @@ Comments are allowed, which is why the format changed.
 - `management.py` defines an `APIRouter(prefix="/v1/management")`; `main.py` registers it
   **before** the catch-all, otherwise those paths would be proxied to an upstream
 - Auth accepts **two** credentials: the signed session cookie (12h, HttpOnly, SameSite=Lax,
-  Secure only on HTTPS, HMAC keyed by `ADMIN_PASSWORD`) **or** a valid gateway API key from
-  `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` — so scripts can call the management API with the
-  key they already have.
+  Secure only on HTTPS, HMAC keyed by `ADMIN_PASSWORD`) **or** a valid gateway API key from the
+  `api_keys` table (seeded on first start from `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`) — so
+  scripts can call the management API with the key they already have.
   The admin password stays a **login credential only**: `POST /v1/management/auth/login`
   validates it (username `admin`, compared case- and whitespace-insensitively) and mints the
   cookie; sending the password itself as `Bearer` / `X-API-Key` → **401**. The query-string
@@ -357,12 +425,29 @@ Comments are allowed, which is why the format changed.
   gateway auth is disabled there are no keys to accept, so the console can never become
   anonymous. No `ADMIN_PASSWORD` → **503**; no valid credential → **401**. The legacy
   `/admin/login|logout|ping` routes delegate to the same functions
+- The three `/api-keys` routes take `require_admin_session` instead of `require_admin`: **cookie
+  only**. A gateway API key is what any client already holds, so accepting one there would let a
+  caller mint itself more access; a request that arrives with a key but no console session is told
+  to sign in (**401**)
 - `/v1/management` is exempt from `security.path_allowlist` (like `/admin`) but still subject
   to the method allowlist, client-IP allowlist and rate limit
-- All routes are read-only except two: the model speed test (it writes `bench_results` in
-  `llmhub.db`) and the API testers (they send one ordinary call, so they only add a `requests` row).
-  Neither touches `config.yaml`. Probes reuse `app.state.client` with a 5s timeout so one dead
+- All routes are read-only except four: the model speed test (it writes `bench_results` in
+  `llmhub.db`), the API testers (they send one ordinary call, so they only add a `requests` row),
+  the API key list (which creates and deletes `api_keys` rows) and the Settings page's
+  `PUT /v1/management/config` (the one route that validates and overwrites `config.yaml`).
+  The first three never touch `config.yaml`.
+  Probes reuse `app.state.client` with a 5s timeout so one dead
   upstream cannot stall a view; `overview` / `upstreams` use `asyncio.gather` over upstreams
+- Caller API keys (`GET` / `POST` / `DELETE /v1/management/api-keys`, store in `app/key_store.py`):
+  the list returns `{items: [{id, masked, label, source, created_at}], total}` — never a hash and
+  never a plaintext; `source` is `"console"` for a key minted there and `"file"` for one imported
+  from the environment on first start. `POST` body is `{label}` with a **required** non-empty label
+  (blank → **400**, over `LABEL_MAX_CHARS = 100` → **422**) and answers **201** with
+  `{item, secret}` — that response is the only place the plaintext ever appears, so the console
+  shows it once, offers a copy button, and reloads the masked list when the dialog closes.
+  `DELETE /api-keys/{id}` returns `{deleted: id}` or **404** for an unknown id; revoking is the only
+  removal the console offers, and it takes effect on the next request because the in-memory
+  verification set is reloaded by the same call
 - Speed test (`POST /bench`, `GET /bench/{job_id}`, `GET /bench/history`):
   `app/bench.py` mirrors `bench_llm.mjs` (1 warm-up + N streaming rounds, decode/prefill taken from
   server timings `eval_duration` / `predicted_ms` / `prompt_eval_duration` and falling back to the
@@ -484,10 +569,20 @@ Comments are allowed, which is why the format changed.
   the column expression comes from `request_log._DISTRIBUTION_KEYS`, never from the caller
 - `UpstreamConfig.vram_total_gb` feeds the overview VRAM gauge; it is config-only because no
   upstream API exposes the host total
-- `request_log.RequestLog` owns `llmhub.db` (default next to `config.yaml`, override with
+- `request_log.RequestLog` owns the `requests` table of `llmhub.db` (default next to
+  `config.yaml`, override with
   `REQUEST_LOG_DB`), WAL + `synchronous=NORMAL`, 30-day retention (`REQUEST_LOG_RETENTION_DAYS`,
   0 = forever, pruned hourly). Rows are queued (bounded 10 000, drops + warns when full) and
-  written by one background task in batches of 100 via `asyncio.to_thread`
+  written by one background task in batches of 100 via `asyncio.to_thread`. That one database file
+  holds three tables — `requests`, `bench_results` and `api_keys` — each created by its own module
+- **`request_log.API_PATH_SCOPE`** (`"(path LIKE '/v1/%' OR path LIKE '/api/%')"`) is the read
+  scope: the `/requests` list, `stats/timeseries`, `stats/distribution`, `failures` and the
+  `kpi.requests_today` / `kpi.tokens_today` aggregates all count only the API calls callers actually
+  make. Every row is still **recorded** whatever its path, so `/health`, `/metrics`, `/openapi.json`,
+  `/admin/*` and probes stay queryable in the database and in the detail view
+  (`GET /requests/{id}` deliberately stays unscoped, so a deep link from another view still opens).
+  The constant is prepended inside `_where()` and the three `*_sync` stat builders, never from a
+  caller-supplied value
 - One row per call, grouped as: timing (`ts`, `ts_end`, `duration_ms`, `ttfb_ms` — `ts`/`ts_end`
   are second-precision ISO UTC, so `duration_ms` is the sub-second source), request
   (`method`, `path`, `query`, `requested_model`, `model`, `request_body`, `req_size`, `stream`,
@@ -533,14 +628,20 @@ Comments are allowed, which is why the format changed.
 - Response shapes live in `web/src/types/api.ts` (taken from live payloads) and are wired to the
   axios wrappers in `web/src/api/management.ts`, so a renamed backend field surfaces as a
   `vue-tsc` error before it becomes a blank table; `npm run build` runs the type check first
-- **i18n**: `vue-i18n@11` Composition mode, messages in `web/src/i18n/messages/{zh-CN,en}.ts`,
-  namespaced per view. `en.ts` is typed as `MessageSchema = typeof zhCN`, so every locale must have
-  exactly the same keys — a forgotten translation is a `vue-tsc` error, never a silent Chinese
-  fallback. Locale persists in `localStorage` (`llmhub-console-locale`), the first visit guesses
-  from `navigator.language` (`en*` → `en`), and `App.vue` mirrors it into Element Plus via
-  `el-config-provider` (plus `<html lang>`). Plain TS modules (`utils/format.ts`,
-  `api/client.ts`) call `i18n.global.t()`. When adding any user-facing string: put it in **both**
-  message files and reference it with `t('ns.key')` — no literal Chinese in templates
+- **i18n**: `vue-i18n@11` Composition mode, messages in
+  `web/src/i18n/messages/{zh-CN,zh-TW,en}.ts`, namespaced per view. `zh-CN.ts` is the source
+  language and exports `MessageSchema = typeof zhCN`; every other locale file is typed
+  `const x: MessageSchema`, so a forgotten translation is a `vue-tsc` error, never a silent Chinese
+  fallback. The locale list is **data-driven** (`SUPPORTED_LOCALES` in `i18n/index.ts`: code, full
+  label, short chip), which is what the account-menu flyout and `App.vue` render from, so adding a
+  fourth language means one message file plus one array entry - no per-view branching.
+  `localeFromTag()` maps a browser tag (`en*` → `en`; `zh-TW` / `zh-HK` / `zh-MO` / any `zh-Hant*` →
+  `zh-TW`; everything else → `zh-CN`). Locale persists in `localStorage`
+  (`llmhub-console-locale`), and `App.vue` mirrors it into Element Plus via
+  `el-config-provider` (the `zh-cn` / `zh-tw` / `en` locale bundles, so a date panel reads
+  「現在 / 確認」 vs 「现在 / 确定») plus `<html lang>`. Plain TS modules (`utils/format.ts`,
+  `api/client.ts`) call `i18n.global.t()`. When adding any user-facing string: put it in **all
+  three** message files and reference it with `t('ns.key')` — no literal Chinese in templates
 - `main.py` registers the static routes **after** `/admin/login|logout|ping` and **before** the
   catch-all: `/admin` redirects to `/admin/`, the bundle is `Path(__file__).parent / "web"` -
   one path for both layouts because the modules are flat in the image (`/app/web`) and in the
@@ -574,9 +675,15 @@ Comments are allowed, which is why the format changed.
   `-` memory uses the same path. Device badges never show a
   percentage - GPU / 部分 / CPU / Cloud only
 - The Models · LLM 别名与派生模型 table renders both kinds side by side (`kind` `显示别名` vs
-  `派生模型`) with the target, upstream, pinned `params` (`think=false` style) and description; the
-  speed test always benches `m.target ?? m.model` (the upstream knows nothing about alias names) and
-  passes `params.think` as `BenchStart.think`
+  `派生模型`) with the target, upstream and pinned `params` (`think=false` style). Both kinds share
+  **one chip style** (`.chip.s2`) — the text is the only difference — and there is **no 说明 column**:
+  `description` is the native `title` on the 名称 and 目标模型 cells, and `table-layout: fixed` +
+  `colgroup` pins the five columns at 24/12/24/14/26% so a long name clips with an ellipsis instead of
+  pushing the table apart. The speed test always benches `m.target ?? m.model` (the upstream knows
+  nothing about alias names) and passes `params.think` as `BenchStart.think`
+- Upstreams rows expand **independently**: `expanded` and `detailBusy` are arrays of upstream names, so
+  clicking one row leaves the already-open panels open, two probes can be in flight at once, and the
+  per-minute refresh re-probes every open row (`Promise.all`), not just the last one clicked
 - The Requests 模型 dropdown follows the chosen 上游: `/models/llm` rows carry their upstream, and an
   alias is offered under every upstream that serves its target (`ModelChoice.upstreams: string[]`).
   A derived alias is now *also* its own row, so the choices are deduped by name
@@ -671,11 +778,32 @@ Comments are allowed, which is why the format changed.
   page the card still sits inside the panel instead of floating below it. The avatar is a gradient
   circle with a double ring for contrast
 - Clicking the account card opens a popup menu: 语言 / Language (a **right-side flyout submenu** that
-  does not expand the current menu - only 中文 is selectable, English is a `soon` placeholder),
-  深色模式 switch, 设置 (`/admin/settings`), 关于 (`/admin/about`), 退出登录 (`signOut()` then the
+  does not expand the current menu - the three `SUPPORTED_LOCALES` entries are all selectable, each
+  marked with `✓` + `.um-item.on` when current and `·` otherwise; the old `soon` placeholder for
+  English is gone),
+  深色模式 switch, 设置 (`/admin/settings`), **API Key 管理** (`/admin/api-keys`, `⚿`), 关于
+  (`/admin/about`), 退出登录 (`signOut()` then the
   login gate). Outside `pointerdown` or `Esc` closes it; the flyout closes 150ms after the pointer
   leaves so it can be crossed. There is no sidebar or floating theme toggle any more - the theme
   switch lives in this menu
+- API keys (`/admin/api-keys`, `ApiKeysView.vue`, reached from that menu rather than the sidebar) is
+  the console's one page that changes gateway credentials: a 功能介绍 card, the masked 密钥清单 table
+  (掩码 / 描述 / 建立时间 / 操作 — the `source` field is in the API payload but not shown as a column)
+  and a 密钥格式与储存 card that states the `sk-hub-` + 40 base62
+  shape and the SHA-256 rule, so the contract is readable without opening a doc. **新建立鑰** opens the
+  same `.modal-overlay` / `.modal` window the speed test uses; a non-empty label is required (the
+  backend answers **400** for a blank one) and the created key is shown exactly once in a readonly
+  textarea with a copy button and an "I have saved it" acknowledgement. `navigator.clipboard` is
+  tried first and falls back to a `document.execCommand('copy')` textarea, then to focusing the box
+  with a "copy it manually" error strip, because the console is often reached over plain http where
+  the async API is unavailable. Closing that dialog reloads the list, so the plaintext never has a
+  second home in the DOM. Revoking is **two steps inline** (the row's 撤銷 button becomes 確認撤銷 /
+  取消) - a single click on a table row must not destroy a credential in use
+- Every refreshable control box is one height: `.sel`, `input.inp` and `.filters .btn` are pinned to
+  `height: 32px` in `theme.css`, which is what Element Plus' own `.el-input__wrapper` already is, so a
+  hand-rolled `<select>` next to a date picker no longer sits 2px short. Native checkboxes take
+  `accent-color: var(--accent)` rather than the browser default (and `ApiTester` no longer overrides
+  it with its own violet), so a tick matches the theme instead of clashing with it
 - About (`/admin/about`, no sidebar row) answers "what is this project, what can it do, which build
   is running": 项目简介 + a two-column 主要功能 grid + **动态** 版本信息 (`gateway_version` from
   `/overview`, alongside online upstreams, running models, today's requests/tokens, the request-log
@@ -700,7 +828,12 @@ Comments are allowed, which is why the format changed.
    path is silently proxied to an upstream instead of served locally
 3. If it is a documented pass-through route, add the path to `POST_ONLY_PATHS` so other methods get 405
 4. Add tests in `smoke_test.py`
-5. Update documentation
+5. Expose it to the console tester: a `Kind` in `KINDS` (`app/api_test.py`) plus the matching `ApiDoc` /
+   tester fields in the view, `ApiTestKind` in `types/api.ts` and the three i18n files
+6. Document it in **both** languages: `docs/API.md` + `docs/API_CN.md` (endpoint section with a
+   request/response example), and `docs/USAGE.md` + `docs/USAGE_CN.md` when it changes how people call the
+   gateway. Add the README calling example only if it is a headline capability, and keep the doc-map blurbs
+   in sync when the doc grows a new chapter
 
 ### Adding New Upstream Type
 1. Extend `UpstreamConfig` with new type
@@ -725,7 +858,10 @@ Comments are allowed, which is why the format changed.
 
 ### Common Issues
 - **Config not reloading**: Check file mtime, restart container
-- **Auth failures**: Verify `GATEWAY_API_KEYS` environment variable
+- **Auth failures**: a **403** means the key you sent hashes to no row of `api_keys` — check the list
+  at `/admin` (⚿ API Key 管理). `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` only matter while that
+  table is still empty (first start), so editing the file changes nothing afterwards; the startup log
+  names the ignored keys by mask. A **401** is a missing credential entirely
 - **Upstream unreachable**: Check `host.docker.internal` resolution
 - **Rerank scores all 0**: Switch to `embedding` mode or check logprobs
 - **Local start refuses to boot**: `scripts\start-local.bat -CheckOnly` re-runs the app's own

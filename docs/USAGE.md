@@ -3,6 +3,7 @@
 The complete documentation: configuration reference, API endpoints, web console, deployment and
 security. The short version — what the project is, screenshots and a 60-second start — lives in
 [README.md](../README.md). Chinese version: [USAGE_CN.md](USAGE_CN.md).
+Endpoint reference: [API.md](API.md). Deployment: [DEPLOY.md](DEPLOY.md).
 
 **Contents** ·
 [Features](#features) ·
@@ -24,17 +25,19 @@ security. The short version — what the project is, screenshots and a 60-second
 | Capability | Description |
 |------|------|
 | **Multi-upstream routing** | Route by the `model` field in the request body to the matching backend instance |
-| **API key auth** | Multiple keys, constant-time comparison, `Bearer` / `X-API-Key` compatible |
+| **API key auth** | Multiple keys, `Bearer` / `X-API-Key` compatible; every call is checked against the SHA-256 hashes held in memory (`api_keys` in SQLite), so no plaintext is ever stored or compared |
 | **Rerank API** | `/v1/rerank` with generative (`logprobs`) and vector (`embedding`) scoring |
 | **Web search** | `POST /v1/tools/web-search` proxies keyword search to an OpenCode API Gateway upstream and returns the retrieved passages |
+| **Anthropic Messages** | `POST /v1/messages` (plus the singular alias `/v1/message`): the Anthropic request is mapped onto the upstream chat format (Ollama NDJSON or OpenAI SSE) and the answer is wrapped back into an Anthropic envelope (`content` blocks, `stop_reason`, `usage`); streaming is re-sequenced as `message_start → content_block_delta → message_stop`, not passed through |
 | **Unified model list** | `/v1/models` aggregates models & aliases from all upstreams instead of proxying to one instance |
 | **Alias + param injection** | `qwen3.5:4b-nothink` → forwards `qwen3.5:4b` and force-injects `think: false`. Every entry under `aliases:` is a model of its own (the console lists it as a separate row); `upstreams[].model_aliases` only renames |
 | **Streaming pass-through** | NDJSON (`/api/chat`, `/api/generate`) and SSE (`/v1/chat/completions`) forwarded as-is |
 | **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview with today's request and token totals, the models `config.yaml` declares per upstream (`model_aliases` renames applied, a root `aliases:` entry listed as its own model, prefix wildcards expanded through the upstream's model list) plus runtime device/memory, config projections (Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite), the per-model speed test (start / poll / history) and the per-endpoint API tester (usable models per family + live execution); authenticated with the console session cookie or a gateway API key |
-| **Web console** | Vue 3 + TypeScript + Element Plus + ECharts single-page app served by the gateway itself at `/admin` (no node in the image): overview, upstreams, the configured model inventory (display renames, derived models, wildcards expanded, running device/memory), request details and charts, a per-model speed test, an API tester popup behind a **Test** button on every documented endpoint, 简体中文 / English — no configuration writes in this release |
+| **Web console** | Vue 3 + TypeScript + Element Plus + ECharts single-page app served by the gateway itself at `/admin` (no node in the image): overview, upstreams, the configured model inventory (display renames, derived models, wildcards expanded, running device/memory), request details and charts, a per-model speed test, an API tester popup behind a **Test** button on every documented endpoint, and API key management (mint / revoke, masked list). Apart from the Settings page (the one editor that saves `config.yaml`), the views offer no other configuration writes |
+| **API key management** | Caller keys are rows of the `api_keys` table in `llmhub.db`, stored as `sha256(<plaintext>)` plus a display mask — the database never holds a secret. The console mints (`sk-hub-…`, 47 characters) and revokes them, showing a new plaintext exactly once. `GATEWAY_API_KEYS` / `data/.keys` only seed an empty table on first start |
 | **Model speed test** | `测速` on **Models · LLM** runs the same prompt N times through the gateway and reports TTFT, decode tok/s and prefill tok/s — taken from the server's own timings (`eval_duration` / `prompt_eval_duration` / `predicted_ms`) when the upstream provides them, falling back to client-side measurement (flagged `timing_source`) otherwise. The latest 3 runs per upstream + model stay in SQLite and show up on hover |
-| **API tester** | Every `API usage` tab carries a **`Test` button** at the right end of each endpoint's *Request parameters* header, opening the tester in a popup (`/api/generate`, `/v1/chat/completions`, `/api/embed`, `/v1/embeddings`, `/v1/rerank`, `/v1/systemone`, `/v1/tools/web-search`): a model picker narrowed by `api_models` (the two native `/api` testers list models of `type: ollama` upstreams only) that lists **names/aliases only**, one input per documented parameter **pre-filled with its default**, a request-body preview, then the status, timings, the model the gateway really routed to with the parameters an alias injected, and the answer pulled out of JSON / NDJSON / SSE. The call runs server-side through the gateway's own service, so alias injection and the request log behave exactly as for an external client, and any extra API key appears only as a read-only `••••••` |
-| **Bilingual console** | Simplified Chinese (source) and English, switched from the account menu and remembered per browser via `localStorage`; missing keys fail the build (`MessageSchema`) instead of rendering raw ids |
+| **API tester** | Every `API usage` tab carries a **`Test` button** at the right end of each endpoint's *Request parameters* header, opening the tester in a popup (`/api/generate`, `/v1/chat/completions`, `/v1/messages`, `/api/embed`, `/v1/embeddings`, `/v1/rerank`, `/v1/systemone`, `/v1/tools/web-search`): a model picker narrowed by `api_models` (the two native `/api` testers list models of `type: ollama` upstreams only) that lists **names/aliases only**, one input per documented parameter **pre-filled with its default**, a request-body preview, then the status, timings, the model the gateway really routed to with the parameters an alias injected, and the answer pulled out of JSON / NDJSON / SSE. The call runs server-side through the gateway's own service, so alias injection and the request log behave exactly as for an external client, and any extra API key appears only as a read-only `••••••` |
+| **Trilingual console** | Simplified Chinese (source), Traditional Chinese and English, switched from the account menu and remembered per browser via `localStorage`; a first visit guesses from `navigator.language` (`zh-TW` / `zh-HK` / `zh-MO` / `zh-Hant` → Traditional, `en*` → English, else Simplified), and Element Plus' own widgets (date panels, pagination) follow the choice. Missing keys fail the build (`MessageSchema`) instead of rendering raw ids |
 | **Config hot reload** | `config.yaml` changes take effect within ~1s, no restart required |
 | **Docker volume mount** | Config file mounted via `/data` |
 | **Routing priority** | When the same model appears in multiple upstreams, the lowest `priority` wins |
@@ -46,25 +49,30 @@ llm-hub/
 ├── Dockerfile
 ├── requirements.txt
 ├── app/
-│   ├── main.py       # FastAPI entrypoint & special endpoints
+│   ├── main.py       # FastAPI entrypoint & special endpoints (the /v1/messages routes live here)
 │   ├── config.py     # Config model, loading, hot reload, alias resolution
 │   ├── auth.py       # API key authentication
+│   ├── admin_auth.py # Console login sessions (admin password, 12-hour cookie, login throttling)
+│   ├── key_store.py  # Caller API keys in SQLite: sha256 hashes, masks, mint/revoke
 │   ├── proxy.py      # Reverse proxy & streaming pass-through
+│   ├── messages.py   # Anthropic Messages compatibility layer (request mapping, response & SSE rebuild)
 │   ├── rerank.py     # Rerank API implementation
+│   ├── systemone.py  # System One decision proxy (laya-server / Ollama)
 │   ├── request_log.py # Request log (SQLite, async batched writes)
 │   ├── bench.py      # Model speed test: TTFT / decode / prefill measurement
 │   ├── bench_store.py # Speed-test history (shares llmhub.db, keeps 3 runs per model)
 │   ├── api_test.py   # Engine behind the console's API testers (closed endpoint allowlist)
-│   ├── management.py # Web console API (/v1/management: read-only views + speed test + API testers)
+│   ├── management.py # Web console API (/v1/management: read-only views + speed test + API testers + API key management + Settings save)
 │   ├── websearch.py  # Web search proxy (OpenCode API Gateway upstream)
 │   └── web/          # Built console bundle (output of `npm run build`), served at /admin
 ├── web/
 │   ├── src/          # Console frontend sources (Vue 3 + TypeScript + Vite + Element Plus + ECharts)
-│   └── ...           # i18n messages under src/i18n/messages (zh-CN.ts is the source language)
+│   └── ...           # i18n messages under src/i18n/messages (zh-CN.ts is the source language, zh-TW.ts / en.ts mirror its keys)
 ├── docs/
-│   ├── screenshots/  # Console screenshots for this README (en/ and zh/)
-│   └── ...           # API, deployment, web console implementation notes
-├── tests/            # pytest suites (smoke / management / gateway)
+│   ├── images/       # Images the README embeds: architecture, screenshots, WeChat QR
+│   ├── screenshots/  # Full per-page console captures (en/ and zh/, shot by capture-live.js)
+│   └── ...           # API.md / API_CN.md, DEPLOY.md / DEPLOY_CN.md, console implementation notes
+├── tests/            # Standalone test scripts (smoke / gateway / management / security / live E2E)
 └── data/
     └── config.yaml   # Config file (mounted into the container at /data)
 ```
@@ -144,7 +152,7 @@ The repo ships two templates with **no real information**; copy and fill them in
 | Template | Copy to | Description |
 |------|--------|------|
 | `data/config.example.yaml` | `data/config.yaml` | Sample config with full `upstreams` / `aliases` / `rerank` / `security` fields, including a `priority` example |
-| `.env.example` | `.env` | Sample secrets; just replace `GATEWAY_API_KEYS` with your own random strings (≥16 chars) |
+| `.env.example` | `.env` | Sample secrets; just replace `GATEWAY_API_KEYS` with your own random strings (≥16 chars). These values seed the empty `api_keys` table on the first start — afterwards mint keys at `/admin` instead of editing this file |
 
 ```bash
 cp data/config.example.yaml data/config.yaml
@@ -227,13 +235,26 @@ auth:
   allow_access_ip_whitelist: []
 ```
 
-- **Keys are no longer configurable in `config.yaml`**: the `api_keys` field is gone and keys come
-  only from the environment. A leftover `api_keys` block logs a warning and is ignored
+- **Keys are no longer configurable in `config.yaml`**: the `api_keys` field is gone, so the file
+  carries no credential at all (the live store is the `api_keys` table described below). A leftover
+  `api_keys` block logs a warning and is ignored
 - Key sources: the `GATEWAY_API_KEYS` env var and the file named by `GATEWAY_API_KEYS_FILE`
   (e.g. `data/.keys`); both merge and de-duplicate
 - `GATEWAY_API_KEYS`: `GATEWAY_API_KEYS=key1,key2` (comma / newline separated)
 - `GATEWAY_API_KEYS_FILE`: path to a file holding the keys, ideal for Docker / K8s secrets (won't
   leak via `docker inspect`)
+- **Those two only seed an empty `api_keys` table.** The live source of truth is that table, inside
+  `llmhub.db`, where every row keeps `sha256(<plaintext>)` plus a display mask and **never the
+  secret**. The first start imports the environment keys as `source: "file"`; from then on the file
+  is not read again, so revoking a key in the console survives restarts and editing the file adds
+  nothing. A startup warning lists, masked, any environment key the table does not serve. Mint and
+  revoke at `/admin` → account menu → **API keys**, where the plaintext is shown exactly once
+  (see [Web console](#web-console))
+- **Key format**: `sk-hub-` + 40 base62 characters = **47 characters**, ~238 random bits. The prefix
+  is not a secret; it is what makes a key recognisable as one in a log or a client config. The mask
+  keeps the first and last 4 body characters (`sk-hub-FNdc…SVvw`); an imported key of another shape
+  shows head 8 + tail 4. SHA-256 (not bcrypt) because a 238-bit random key has no passphrase to
+  brute-force and every client request would otherwise pay a slow KDF
 - `allow_access_ip_whitelist`: list of regexes matched with **fullmatch** against the ASGI client
   address (the **TCP peer** on a direct connection; the gateway code itself never reads
   `X-Forwarded-For`, which a caller can forge). Matching addresses may open `/docs` and
@@ -242,8 +263,10 @@ auth:
   address from forwarded headers when the peer is a **trusted proxy** (`--forwarded-allow-ips`,
   default `127.0.0.1`), so behind a local reverse proxy the real source is what matches — make sure
   that proxy sets and sanitises `X-Forwarded-For`
-- ⚠️ With auth enabled (`enabled: true`) and zero keys, the gateway **refuses to start** and prints
-  the configuration options, avoiding an accidentally unauthenticated service
+- ⚠️ With auth enabled (`enabled: true`) and **no row in `api_keys`** (after seeding), the gateway
+  **refuses to start** and names the fix: seed the empty table with `GATEWAY_API_KEYS` /
+  `GATEWAY_API_KEYS_FILE` and restart, or set `auth.enabled: false`. This avoids an accidentally
+  unauthenticated service
 - `allow_anonymous_health`: let `/health` skip auth (keep `true` or the container health check
   fails)
 - `enabled: false` temporarily disables auth
@@ -269,7 +292,7 @@ upstreams:
   Default `ollama`
   - `ollama`: model list `/api/tags`, health check `/api/version`
   - `lmstudio`: OpenAI-compatible, model list `/v1/models`, health check `/v1/models`
-  - `opencode`: [OpenCode API Gateway](API.md#web-searchopencode-网关代理) — OpenAI-compatible model
+  - `opencode`: [OpenCode API Gateway](API.md#web-search-opencode-gateway-proxy) — OpenAI-compatible model
     list `/v1/models`, health check `/health`; also serves the web search endpoint (see `websearch`)
 - `models`: supports **prefix wildcards** — `"qwen3:*"` matches `qwen3:4b`, `qwen3:8b`, `qwen3:14b`.
   The wildcard is a literal prefix, so slash-separated ids need the slash form: `"opencode/*"`
@@ -510,7 +533,7 @@ response as-is (`query`, `results[]`, concatenated `text`, `sources`, and `answe
   POST-only (**405** otherwise) and returns **502** / **504** when the provider is unreachable
   or slow
 
-Full request/response contract and curl examples: [API.md → Web Search](API.md#web-searchopencode-网关代理).
+Full request/response contract and curl examples: [API.md → Web Search](API.md#web-search-opencode-gateway-proxy).
 
 ### `request_log` — request detail switch
 
@@ -534,6 +557,11 @@ Feeds the console's "Requests" view: every call through the gateway becomes one 
   monitors send it continuously, so logging it would drown the real calls. Under the default
   `allowed_http_methods: [GET, POST]` a HEAD never reaches the proxy at all (it answers `405`);
   allow `HEAD` there and the request is forwarded normally, just without a row
+- **Statistics count API calls only**: the list, the charts, the KPIs and the failure view all add
+  `path LIKE '/v1/%' OR path LIKE '/api/%'` (`request_log.API_PATH_SCOPE`), so `/health`, `/metrics`,
+  `/openapi.json` and the `/admin/*` asset requests cannot dilute the numbers. Rows for those paths
+  are still **written** — nothing is thrown away, and `GET /requests/{id}` deliberately stays
+  unscoped, so a deep link to any row still opens
 - Recorded columns: `ts` / `ts_end` / `duration_ms` / `ttfb_ms` (timing — `ts` and `ts_end` are
   second precision, so read `duration_ms` for sub-second cost), `method` / `path` /
   `query` / `requested_model` / `model` / `request_body` / `req_size` / `stream` / `client_ip`
@@ -552,15 +580,29 @@ gateway itself at **`http://localhost:8888/admin/`**, so the image needs no node
 and inside the container). Sign in as `admin`
 with the `ADMIN_PASSWORD` from `.env`; a successful login mints a 12h HttpOnly session cookie.
 The views — Dashboard, Upstreams, Requests, Models (LLM / Embed / Rerank / System One), Tools (Web Search),
-Settings and About — expose **no configuration writes** in this release; the actions are the
-per-model speed test on Models · LLM and the API testers on every `API usage` tab, and neither
-touches `config.yaml`. A 401 from any management call
+API keys, Settings and About — write only in four places: the
+per-model speed test on Models · LLM, the API testers on every `API usage` tab, minting or
+revoking a caller key on the **API keys** page, and the Settings page itself (the single editor that
+validates and saves `config.yaml`); the first three never touch `config.yaml`. A 401 from any management call
 signs the user out and returns to the login page. A 503 is never treated as an auth failure:
 it means an unreachable upstream, `ADMIN_PASSWORD` unset, or the frontend not built yet.
 The account chip sits at the bottom-left of the panel and opens the account menu: language
-(简体中文 / English, remembered per browser), the dark/light switch, Settings (its old sidebar row is
-gone), About (project introduction, features, live version info, repository link and the WeChat QR)
+(简体中文 / 繁體中文 / English — a right-side flyout, remembered per browser), the dark/light switch,
+Settings (its old sidebar row is
+gone), **API keys** (its own page, also without a sidebar row), About (project introduction, features, live version info, repository link and the WeChat QR)
 and sign-out.
+
+**API keys** (`/admin/api-keys`) is where caller credentials are born and die. The table lists every
+key as a mask (`sk-hub-FNdc…SVvw`) with its label and creation time — the plaintext is not in any
+list response, and neither is the hash. The response's `source` (`console` / `file`) stays a field
+for scripts; the table gives it no column.
+**New key** opens a dialog that asks for a label (required, so a key is recognisable later), then
+shows the generated 47-character key once, in a box with a copy button and a confirmation that it
+was saved; closing that dialog reloads the list, and from then on the value can only be revoked,
+never recovered. Revoking is deliberately two steps on the row itself (*Revoke* → *Confirm revoke* /
+*Cancel*), because one stray click must not kill a credential some client is using right now. Those
+three routes accept the console session cookie **only** — a gateway API key is what any client
+already holds, so it cannot be used to mint more access.
 Models · LLM and the Upstreams row-expander list the models each upstream declares in
 `config.yaml` (`upstreams[].models`, shown under its `model_aliases` short name when one is
 configured, while every entry of the root `aliases:` node becomes a row of its own; a prefix
@@ -570,12 +612,17 @@ VRAM/memory; a derived (`derived: true`) row inherits its target's device and re
 because the instance is already counted under its own name and the KPI never double-counts it;
 an OpenCode-style hosted upstream has no load state, so when its probe answers every
 declared model counts as online, its device reads **Cloud** and its memory `-`. Device badges only
-distinguish **GPU / 部分 / CPU / Cloud** and never show a percentage. Models · LLM is split into two tabs:
+distinguish **GPU / 部分 / CPU / Cloud** and never show a percentage. Expanding an Upstreams row never
+collapses the others: several instances can stay open at once and each is re-probed on the automatic
+refresh. Models · LLM is split into two tabs:
 **model inventory** (those tables, plus **Aliases & derived models** with name / kind / target /
-upstream / pinned params / description) and **API usage**, which documents the two generation endpoints the
-gateway supports today - `POST /api/generate` (Ollama native) and `POST /v1/chat/completions`
-(OpenAI-compatible) - with their parameter tables, request and response examples, and the note that
-both **stream by default** (omitting `stream` yields NDJSON and SSE respectively). Models · Embed
+upstream / pinned params — the two kinds share one chip style and the description is no longer a
+column, it is the tooltip on the name and target cells) and **API usage**, which documents the three generation endpoints the
+gateway supports today - `POST /api/generate` (Ollama native), `POST /v1/chat/completions`
+(OpenAI-compatible) and `POST /v1/messages` (Anthropic-compatible) - with their parameter tables,
+request and response examples, and the note that `POST /api/generate` and `POST /v1/chat/completions`
+**stream by default** (omitting `stream` yields NDJSON and SSE respectively), while `POST /v1/messages`
+defaults to a single JSON envelope. Models · Embed
 (sits above Rerank) documents the two embedding pass-throughs - `POST /api/embed` (Ollama native) and
 `POST /v1/embeddings` (OpenAI-compatible) - and fetches no configuration because there is none.
 Each of those documents carries a **`Test` button** at the right end of its *Request parameters*
@@ -659,6 +706,9 @@ curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overv
 | `POST /v1/management/bench` | Start a speed test: `{upstream, model, rounds?, max_tokens?, think?}` → `{job_id, status: "pending"}`. Runs on its own thread + event loop, so closing the browser does not cancel it |
 | `GET /v1/management/bench/{job_id}` | `pending` / `running` (with `{completed, total, warmup}`) / `done` (full per-round payload) / `failed` (+ `error`) |
 | `GET /v1/management/bench/history?upstream=&model=` | The latest records kept for that upstream + model (3 by default) — the data behind the hover panel |
+| `GET /v1/management/api-keys` | Caller key list (**session cookie only**): `{items: [{id, masked, label, source, created_at}], total}`, `source` being `console` (minted here) or `file` (imported on first start). Masks only — no plaintext, no hash |
+| `POST /v1/management/api-keys` | Mint a key (**session cookie only**): `{label}` (blank → `400`, over 100 chars → `422`) → `201` `{item, secret}`; **that response is the only time the plaintext leaves the server** |
+| `DELETE /v1/management/api-keys/{id}` | Revoke (**session cookie only**): `200` → `{"deleted": id}`, unknown id → `404`. The in-memory verification set reloads immediately, so the next request already fails |
 
 **Speed test (`测速` on Models · LLM):** one fixed prompt is sent through the gateway `rounds`
 times (4 by default, first round as warm-up, `temperature: 0`) with `max_tokens` 500. Per round it
@@ -678,7 +728,7 @@ writing altogether — the switch is read per request, so it applies without a r
 | `ADMIN_PASSWORD` | unset (management API → 503) | Console login password; exchanged for a session cookie, not a request credential |
 | `REQUEST_LOG_DB` | `<config dir>/llmhub.db` | Request log database path |
 | `REQUEST_LOG_RETENTION_DAYS` | `30` | Prune rows older than N days; `0` keeps everything |
-| `LLMHUB_DB` | `<config dir>/llmhub.db` | Speed-test store path; point it at the same file the request log uses (the default) to keep one data file per deployment |
+| `LLMHUB_DB` | `<config dir>/llmhub.db` | Shared store for `bench_results` (speed-test history) and `api_keys` (hashed caller keys); point it at the same file the request log uses (the default) to keep one data file per deployment |
 
 Writes go through a bounded in-memory queue and batched `executemany`, so forwarding never waits
 on disk. Bodies are truncated to 8 KB and `authorization` / `api_key` / `token` / `password`
@@ -776,6 +826,33 @@ curl http://localhost:8000/api/embed \
 > `/api/generate` only makes sense against **Ollama upstreams**: the path is appended to the routed
 > upstream's `base_url` unchanged, and OpenAI-compatible backends (LM Studio, vLLM, ...) do not
 > serve it. Use `/v1/chat/completions` for something that works across every backend type.
+
+### Anthropic Messages (Claude clients)
+
+`POST /v1/messages` (the singular `/v1/message` behaves identically) lets an Anthropic SDK, Claude
+Code and similar clients talk to the gateway directly. `max_tokens` is required (> 0); `model` may be
+omitted, in which case `auto` picks the first model of the default upstream. Authentication accepts
+either `x-api-key` or `Authorization: Bearer`.
+
+```bash
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5:9b",
+    "max_tokens": 256,
+    "system": "Answer in one sentence.",
+    "messages": [{"role": "user", "content": "What does a reranker do?"}]
+  }'
+```
+
+The reply is a standard Anthropic envelope (`type: "message"`, `content: [{"type":"text", ...}]`,
+`stop_reason`, and `usage.input_tokens` / `output_tokens` taken from the upstream's own token counts).
+Without `stream` you get a single JSON object; with `stream: true` the gateway emits SSE in the order
+`message_start → content_block_start → content_block_delta* → content_block_stop → message_delta →
+message_stop`. `system` accepts a string or an array of content blocks, and `image` blocks inside
+`content` are mapped onto the upstream's image field. Field-by-field details live in
+[API.md](API.md#messages-anthropic-compatible).
 
 ### Alias to disable thinking
 
@@ -1010,7 +1087,9 @@ normalised with a warning.
 ### Public-deployment checklist
 
 - [ ] Keep `admin_endpoints` at `deny` (or at least `readonly`); never `allow`
-- [ ] All keys ≥ 16 random chars, supplied only via `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` (e.g. `data/.keys`)
+- [ ] Every key is random — 47-char `sk-hub-…` keys minted in the console (≥ 16 random chars for a
+      legacy key imported from `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`, e.g. `data/.keys`); the
+      store keeps hashes only, so protect `llmhub.db` as you would protect the file
 - [ ] A reverse proxy (Nginx / Caddy) in front terminates TLS
 - [ ] To restrict origins, set `security.allowed_client_ips` to trusted ranges
 - [ ] Keep `auth.allow_access_ip_whitelist` at `[]`; if `/docs` must be reachable, list only trusted sources — the check uses the ASGI client address (the TCP peer on a direct connection), which uvicorn rewrites from forwarded headers when a trusted proxy is in front, so make sure that proxy sanitises `X-Forwarded-For`

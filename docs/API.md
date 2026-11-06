@@ -1,89 +1,101 @@
-# LLM Hub API 文档
+# LLM Hub API Documentation
 
-## 目录
+Chinese version: [API_CN.md](API_CN.md).
 
-- [基础信息](#基础信息)
-- [认证方式](#认证方式)
-- [端点列表](#端点列表)
-  - [健康检查](#健康检查)
-  - [系统信息](#系统信息)
-  - [实例探测](#实例探测)
-  - [模型列表](#模型列表)
-  - [Ollama 原生模型列表](#ollama-原生模型列表)
-  - [实例运行状态 (Process Status)](#实例运行状态-process-status)
-  - [System One 决策 API（laya-server 与 Ollama 代理）](#system-one-决策-apilaya-server-与-ollama-代理)
-  - [Web Search（OpenCode 网关代理）](#web-searchopencode-网关代理)
-  - [重排序](#重排序)
-  - [聊天补全](#聊天补全)
-  - [文本补全](#文本补全)
-  - [嵌入向量](#嵌入向量)
-  - [模型管理](#模型管理)
-  - [管理 API（Web 管理台）](#管理-apiweb-管理台)
-- [流式响应](#流式响应)
-- [错误响应](#错误响应)
-- [别名参数注入](#别名参数注入)
-- [工具调用](#工具调用)
+## Table of contents
+
+- [Basics](#basics)
+- [Authentication](#authentication)
+- [Endpoints](#endpoints)
+  - [Health check](#health-check)
+  - [System info](#system-info)
+  - [Instance probe](#instance-probe)
+  - [Model list](#model-list)
+  - [Ollama-native model list](#ollama-native-model-list)
+  - [Instance runtime status (Process Status)](#instance-runtime-status-process-status)
+  - [System One decision API (laya-server and Ollama proxy)](#system-one-decision-api-laya-server-and-ollama-proxy)
+  - [Web Search (OpenCode gateway proxy)](#web-search-opencode-gateway-proxy)
+  - [Rerank](#rerank)
+  - [Chat completions](#chat-completions)
+  - [Messages (Anthropic compatible)](#messages-anthropic-compatible)
+  - [Text completion](#text-completion)
+  - [Embeddings](#embeddings)
+  - [Model management](#model-management)
+  - [Management API (web console)](#management-api-web-console)
+- [Streaming responses](#streaming-responses)
+- [Error responses](#error-responses)
+- [Alias parameter injection](#alias-parameter-injection)
+- [Tool calling](#tool-calling)
 
 ---
 
-## 基础信息
+## Basics
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 基础 URL | `http://localhost:8888` |
-| 协议 | HTTP/HTTPS |
-| 数据格式 | JSON |
-| 字符编码 | UTF-8 |
+| Base URL | `http://localhost:8888` |
+| Protocol | HTTP/HTTPS |
+| Data format | JSON |
+| Character encoding | UTF-8 |
 
 ---
 
-## 认证方式
+## Authentication
 
-大部分端点需要 API 密钥认证，支持以下两种方式：
+Most endpoints require an API key, supplied in one of two ways:
 
 ```bash
-# 方式一：Authorization 头
+# Option 1: Authorization header
 -H "Authorization: Bearer sk-gateway-example-key"
 
-# 方式二：X-API-Key 头
+# Option 2: X-API-Key header
 -H "X-API-Key: sk-gateway-example-key"
 ```
 
-**例外：** `/`、`/health` 端点默认无需认证（由 `auth.allow_anonymous_health` 控制）。
+**Exceptions:** `/` and `/health` need no authentication by default (controlled by
+`auth.allow_anonymous_health`).
 
-**客户端 IP 白名单：** `auth.allow_access_ip_whitelist`（正则字符串数组，`re.fullmatch` 逐条匹配）
-命中的来源可以访问 `/docs` 与 `/openapi.json`，并且调用任何业务 API 时免查 API Key；未命中时
-`/docs`、`/openapi.json` 一律 **404**（不是 401/403，对外看起来就像没有这两个路径）。匹配对象是
-ASGI 的客户端地址（`request.client.host`），网关代码从不读取 `X-Forwarded-For`；但 uvicorn 的
-`ProxyHeadersMiddleware` 在 TCP 对端属于可信代理时（`--forwarded-allow-ips`，默认 `127.0.0.1`）
-会用转发头改写 `request.client`，所以前置代理必须自行清理 `X-Forwarded-For`。
+**Where keys come from:** a caller key is a row in the `api_keys` table inside `llmhub.db`, where only
+`sha256(plaintext)` and a mask are stored. Keys are minted and revoked in the console at `/admin`
+(account menu → ⚿ API keys). `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` (e.g. `data/.keys`) are imported
+**once, on the first start while the table is empty**; the file is not read again after that. A newly minted
+key looks like `sk-hub-` plus 40 base62 characters, 47 in total. See **Caller API keys** in the
+[Management API](#management-api-web-console) section.
 
-**Swagger UI：** 打开 `/docs`（需先满足上面的 IP 白名单），**每个端点的 Parameters 区都有一个
-`X-API-Key` 输入框**——点 **Try it out** 后填入 Key，点 **Execute** 时随本次请求发送（只影响该端点的
-这一次请求）。也可以用右上角 **Authorize** 一次性填入 `Authorization: Bearer` 或 `X-API-Key`，此后
-所有请求自动携带（`persistAuthorization` 刷新页面后依然保留）。白名单命中的来源即使不填 Key 也能
-直接 Execute。
+**Client IP allowlist:** sources matching `auth.allow_access_ip_whitelist` (an array of regex strings,
+each matched with `re.fullmatch`) may open `/docs` and `/openapi.json`, and may call any business API without
+an API key. For everything else `/docs` and `/openapi.json` return **404** (not 401/403, so from the outside
+the paths simply do not exist). Matching runs against the ASGI client address (`request.client.host`); the
+gateway never reads `X-Forwarded-For` itself, but uvicorn's `ProxyHeadersMiddleware` rewrites
+`request.client` from forwarding headers when the TCP peer is a trusted proxy (`--forwarded-allow-ips`,
+`127.0.0.1` by default), so a front proxy must sanitise `X-Forwarded-For` on its own.
+
+**Swagger UI:** open `/docs` (after satisfying the allowlist above). **Every endpoint's Parameters section
+carries an `X-API-Key` input** — click **Try it out**, fill the key in, and **Execute** sends it with that one
+request. You can also use **Authorize** in the top right to set `Authorization: Bearer` or `X-API-Key` once,
+after which every request carries it (`persistAuthorization` keeps it across reloads). A source covered by the
+allowlist can hit Execute without any key at all.
 
 ---
 
-## 端点列表
+## Endpoints
 
-### 健康检查
+### Health check
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/health` |
-| 方法 | `GET` |
-| 认证 | ❌ 不需要 |
-| 说明 | 轻量级健康检查，不消耗任何资源 |
+| Path | `/health` |
+| Method | `GET` |
+| Auth | ❌ not required |
+| Description | Lightweight health check that consumes no resources |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/health
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -93,22 +105,22 @@ curl http://localhost:8888/health
 
 ---
 
-### 系统信息
+### System info
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/` |
-| 方法 | `GET` |
-| 认证 | ❌ 不需要 |
-| 说明 | 返回系统名称与网关版本，供客户端发现/握手 |
+| Path | `/` |
+| Method | `GET` |
+| Auth | ❌ not required |
+| Description | Returns the service name and gateway version, for client discovery/handshake |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -119,23 +131,23 @@ curl http://localhost:8888/
 
 ---
 
-### 实例探测
+### Instance probe
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/probe` |
-| 方法 | `GET` |
-| 认证 | ✅ 需要 |
-| 说明 | 探测所有上游实例的连接状态和模型可用性。本端点只处理 `GET`；其它方法会落到统一转发 catch-all，被当作上游路径代理（通常得到 502/404） |
+| Path | `/probe` |
+| Method | `GET` |
+| Auth | ✅ required |
+| Description | Probes connectivity and model availability of every upstream. Only `GET` is handled here; other verbs fall through to the catch-all forwarder and are proxied as an upstream path (usually ending in 502/404) |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/probe \
   -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -164,40 +176,40 @@ curl http://localhost:8888/probe \
 }
 ```
 
-**响应字段说明：**
+**Response fields:**
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 |------|------|------|
-| `upstreams[].name` | string | 上游实例名称 |
-| `upstreams[].type` | string | 后端类型：`ollama` 或 `lmstudio` |
-| `upstreams[].base_url` | string | 上游基础 URL |
-| `upstreams[].reachable` | boolean | 是否可达 |
-| `upstreams[].version` | string | Ollama 版本（仅 Ollama） |
-| `upstreams[].error` | string | 错误信息（不可达时） |
-| `upstreams[].models[].name` | string | 模型名称 |
-| `upstreams[].models[].declared` | boolean | 是否在配置中声明 |
-| `upstreams[].models[].available` | boolean | 是否在上游中可用 |
-| `upstreams[].models[].wildcard` | boolean | 是否为通配符声明 |
+| `upstreams[].name` | string | Upstream name |
+| `upstreams[].type` | string | Backend type: `ollama` or `lmstudio` |
+| `upstreams[].base_url` | string | Upstream base URL |
+| `upstreams[].reachable` | boolean | Whether the upstream is reachable |
+| `upstreams[].version` | string | Ollama version (Ollama only) |
+| `upstreams[].error` | string | Error message (when unreachable) |
+| `upstreams[].models[].name` | string | Model name |
+| `upstreams[].models[].declared` | boolean | Whether the model is declared in the config |
+| `upstreams[].models[].available` | boolean | Whether the model is available upstream |
+| `upstreams[].models[].wildcard` | boolean | Whether the entry is a wildcard declaration |
 
 ---
 
-### 模型列表
+### Model list
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/v1/models`, `/models` |
-| 方法 | `GET` |
-| 认证 | ✅ 需要 |
-| 说明 | 聚合所有已配置上游的模型（含声明模型、实时拉取的模型、别名） |
+| Path | `/v1/models`, `/models` |
+| Method | `GET` |
+| Auth | ✅ required |
+| Description | Aggregates the models of every configured upstream (declared models, live models, aliases) |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/v1/models \
   -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -227,23 +239,23 @@ curl http://localhost:8888/v1/models \
 
 ---
 
-### Ollama 原生模型列表
+### Ollama-native model list
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/api/tags` |
-| 方法 | `GET` |
-| 认证 | ✅ 需要 |
-| 说明 | 返回 Ollama 格式的模型列表 |
+| Path | `/api/tags` |
+| Method | `GET` |
+| Auth | ✅ required |
+| Description | Model list in Ollama's own format |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/api/tags \
   -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -274,23 +286,23 @@ curl http://localhost:8888/api/tags \
 
 ---
 
-### 实例运行状态 (Process Status)
+### Instance runtime status (Process Status)
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/api/ps` |
-| 方法 | `GET` |
-| 认证 | ✅ 需要 |
-| 说明 | 聚合所有 Ollama 上游的 `/api/ps`（已加载/运行中的模型）。LM Studio 等 OpenAI 兼容上游无此端点，会被自动跳过。每个条目都会标注来源 `upstream`。 |
+| Path | `/api/ps` |
+| Method | `GET` |
+| Auth | ✅ required |
+| Description | Aggregates `/api/ps` from every Ollama upstream (models loaded/running right now). OpenAI-compatible upstreams such as LM Studio have no such endpoint and are skipped automatically. Every entry carries the source `upstream`. |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/api/ps \
   -H "Authorization: Bearer sk-gateway-example-key"
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -312,20 +324,20 @@ curl http://localhost:8888/api/ps \
 }
 ```
 
-> 单个上游不可达时不会中断整体响应，错误会汇总到 `errors` 字段。
+> One unreachable upstream does not abort the whole response; failures are collected in `errors`.
 
 ---
 
-### System One 决策 API（laya-server 与 Ollama 代理）
+### System One decision API (laya-server and Ollama proxy)
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/v1/systemone` |
-| 方法 | `POST` |
-| 认证 | ✅ 需要（网关自身的 API Key，来自 `.env` / `GATEWAY_API_KEYS`） |
-| 说明 | 将请求原样转发到配置的 System One 后端（`1panel/laya-server`，或 **Ollama 0.40+**——它原生提供 `POST /v1/systemone`）。网关用 `systemone.api_key_env`（默认 `SYSTEMONE_SERVER_API_KEY`）环境变量中的密钥对后端签名，请求体与响应体均原样透传。 |
+| Path | `/v1/systemone` |
+| Method | `POST` |
+| Auth | ✅ required (the gateway's own API key, from `.env` / `GATEWAY_API_KEYS`) |
+| Description | Forwards the request body unchanged to the configured System One backend (`1panel/laya-server`, or **Ollama 0.40+**, which ships `POST /v1/systemone` natively). The gateway signs with the key named by `systemone.api_key_env` (default `SYSTEMONE_SERVER_API_KEY`); both request and response bodies pass through untouched. |
 
-**配置（`config.yaml` 的 `systemone` 段）：**
+**Configuration (the `systemone` block of `config.yaml`):**
 
 ```yaml
 systemone:
@@ -337,31 +349,42 @@ systemone:
   timeout: 60.0
 ```
 
-- `backend` 指向任一 System One 后端即可，网关侧行为完全一致——纯转发，不做模型解析、不改写响应。容器内指向宿主机 Ollama 时用 `http://host.docker.internal:11435`。
-- `model` **会原样出现在转发给后端的请求体里**：仅当它是具体值且调用方自身没带 `model` 时才注入；`"local"` 是**哨兵值**，表示不注入、由调用方自行指定。
-- laya-server 的 `model` 为字面量枚举，**仅接受 `auto` / `english` / `multilingual` / `typed-decisions`**，其它值返回 **HTTP 422** `literal_error`。
-- Ollama 的 `model` 必须是**真实模型名**：`auto` → **404** `model 'auto' not found`；缺失 → **400** `model is required`。因此后端换成 Ollama 时，把 `model` 配成实际模型（如示例中的 `tev1`）。
-- 后端密钥从环境变量读取，绝不写入 `config.yaml`。该 `Authorization` 头对不需要鉴权的 Ollama 后端无副作用，Ollama 会直接忽略。
+- `backend` may point at either backend; the gateway behaves identically — pure forwarding, no model
+  resolution, no response rewriting. From inside a container, use `http://host.docker.internal:11435` to reach
+  an Ollama on the host.
+- `model` **is copied verbatim into the forwarded body**: it is injected only when it holds a concrete value
+  and the caller sent no `model` of its own. `"local"` is a **sentinel** meaning "do not inject, the caller
+  decides".
+- laya-server's `model` is a literal enum and **accepts only `auto` / `english` / `multilingual` /
+  `typed-decisions`**; anything else returns **HTTP 422** `literal_error`.
+- Ollama's `model` must be a **real model name**: `auto` → **404** `model 'auto' not found`; omitted → **400**
+  `model is required`. So when the backend is Ollama, configure `model` with an actual model (like `tev1`
+  above).
+- The backend key is read from the environment and never written into `config.yaml`. That `Authorization`
+  header is harmless for backends that do not authenticate — Ollama simply ignores it.
 
-**请求体结构（两家后端 `state` / `questions` 均必填；差异：laya-server **拒绝未知顶层字段**，实测 Ollama 会忽略）：**
+**Request body (`state` / `questions` are required on both backends; the difference: laya-server **rejects
+unknown top-level fields**, while Ollama was measured to ignore them):**
 
-| 字段 | 类型 | 必填 | 说明 |
+| Field | Type | Required | Description |
 |------|------|------|------|
-| `state` | object | ✅ | 自由结构，承载上下文，如 `{"message": "..."}` |
-| `questions` | object | ✅ | 问题 id → 问题定义，至少 1 项 |
-| `model` | string | ❌ | 模型名/路由提示，取值规则见上文；缺省时由网关按配置注入 |
+| `state` | object | ✅ | Free-form context carrier, e.g. `{"message": "..."}` |
+| `questions` | object | ✅ | Question id → definition, at least one entry |
+| `model` | string | ❌ | Model name / routing hint, governed by the rules above; when omitted the gateway injects the configured value |
 
-`questions.<id>` 是**按 `type` 判别的联合类型**（tag 为 `type`），共三种变体。`criteria` 的形状是两家唯一的形式差异，下表同时给出兼容写法：
+`questions.<id>` is a **union discriminated by `type`** (the tag is `type`) with three variants. `criteria`
+is the only shape difference between the two backends; the table gives the form that satisfies both:
 
-| `type` | 额外必填字段 | 语义 | `criteria` 兼容要求 | 响应关键字段 |
+| `type` | Extra required fields | Meaning | `criteria` compatibility | Key response fields |
 |--------|--------------|------|--------------------|--------------|
-| `noul` | `instructions: string` | 二值判定 | 不需要 | `noul`（概率）；laya 另有 `confidence`、`action`，Ollama 只回 `noul` |
-| `choice` | `instructions: string`、`criteria` | 多选一 | laya 接受 `string[]` 或 object；**Ollama 只接受非空 object**（数组 → 400） | `choice`、`probabilities`、`confidence` |
-| `score` | `instructions: string`、`criteria` | 打分/择优 | laya 要求 `string[]`（≥2 项）；**Ollama 要求 2–10 项的数组**（object → 400） | `score`、`legend`、`probabilities`、`confidence` |
+| `noul` | `instructions: string` | Binary judgement | not needed | `noul` (probability); laya also returns `confidence` and `action`, Ollama only `noul` |
+| `choice` | `instructions: string`, `criteria` | Pick one | laya accepts `string[]` or an object; **Ollama accepts only a non-empty object** (array → 400) | `choice`, `probabilities`, `confidence` |
+| `score` | `instructions: string`, `criteria` | Score / rank | laya requires `string[]` (≥2 items); **Ollama requires an array of 2–10 items** (object → 400) | `score`, `legend`, `probabilities`, `confidence` |
 
-> 即：`choice` 用 object、`score` 用数组，同一份请求体在 laya-server 与 Ollama 上都能通过校验。
+> In short: use an object for `choice` and an array for `score`, and one body validates on both laya-server
+> and Ollama.
 
-**请求示例（两种后端均合法）：**
+**Request example (valid on both backends):**
 
 ```bash
 curl -X POST http://localhost:8888/v1/systemone \
@@ -378,7 +401,7 @@ curl -X POST http://localhost:8888/v1/systemone \
   }'
 ```
 
-**响应示例（Ollama 0.40+ / `model: tev1` 实测）：**
+**Response example (measured on Ollama 0.40+ / `model: tev1`):**
 
 ```json
 {
@@ -392,7 +415,7 @@ curl -X POST http://localhost:8888/v1/systemone \
 }
 ```
 
-**响应示例（laya-server 实测）：**
+**Response example (measured on laya-server):**
 
 ```json
 {
@@ -406,20 +429,21 @@ curl -X POST http://localhost:8888/v1/systemone \
 }
 ```
 
-> 响应（`answers`、`model`、`usage`，以及 laya-server 独有的 `routing`）由后端原样返回，网关不做任何改写。后端返回的错误（状态码 + body）同样原样透传。
+> The response (`answers`, `model`, `usage`, plus laya-server's own `routing`) is returned by the backend
+> as-is; the gateway rewrites nothing. Backend errors (status code + body) are passed through the same way.
 
 ---
 
-### Web Search（OpenCode 网关代理）
+### Web Search (OpenCode gateway proxy)
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/v1/tools/web-search` |
-| 方法 | `POST` |
-| 认证 | ✅ 需要（网关自身的 API Key，来自 `.env` / `GATEWAY_API_KEYS`） |
-| 说明 | 关键词检索网页正文段落。请求体转发到 `websearch.upstream` 指定的上游（`websearch.path`，默认 `v1/web-search`），上游响应原样返回，网关不改写。检索能力的实现方是 [opencode-port](https://github.com/bruce1977/opencode-port)（OpenCode API Gateway）。 |
+| Path | `/v1/tools/web-search` |
+| Method | `POST` |
+| Auth | ✅ required (the gateway's own API key, from `.env` / `GATEWAY_API_KEYS`) |
+| Description | Searches the web and returns body paragraphs by keyword. The body is forwarded to the upstream named by `websearch.upstream` (`websearch.path`, default `v1/web-search`) and the upstream response comes back untouched. The search itself is implemented by [opencode-port](https://github.com/bruce1977/opencode-port) (OpenCode API Gateway). |
 
-**配置（`config.yaml` 的 `websearch` 段 + 对应上游）：**
+**Configuration (the `websearch` block of `config.yaml` plus the matching upstream):**
 
 ```yaml
 upstreams:
@@ -439,39 +463,57 @@ websearch:
   timeout: 300.0
 ```
 
-- 检索方是一个普通的 `upstreams` 条目（`type: "opencode"`）：它的地址、超时、附加 `headers` 只配一次，同时被模型聚合（`/v1/models`、`/api/tags`）、聊天路由和 `/probe` 复用。`opencode` 类型走 OpenAI 兼容的发现接口（`GET /v1/models`，解析 `data[].id`），健康探测走 `GET /health`。
-- `websearch.upstream` 留空时自动选取**第一个 `type: "opencode"` 的上游**；填了名字却找不到对应上游则返回 **503**（不会静默回退到别的上游）。
-- `api_key_env` 默认空字符串 = 不签名（当前 OpenCode 网关匿名可访问）。若上游启用了密钥，把它设成变量名（如 `OPENCODE_GATEWAY_API_KEY`），网关会以 `Authorization: Bearer <值>` 调用上游；密钥只从环境变量读取，绝不写入 `config.yaml`。
-- `model` 字段**纯透传**：取 opencode-port 支持的模型名（**不是 llm-hub 在 `config.yaml` 里配置的模型**），调用方传什么就转什么，不传则由上游自行选择；网关不会用自己的 `aliases` 去解析它。上游（opencode-port）的模型清单可在控制台的 Tools · Web Search →「模型清单」查看；省略 `model` 时由 opencode-port 依次取 `web_search.model` → 首个本地模型（`ollama-local/*`）→ `models.auto.fallback` 作为默认模型，该模型只在 `synthesize=true` 时参与答案综合。
-- `synthesize: true` 会额外驱动一次模型综合作答，耗时由上游的推理速度决定，可能远超纯检索（实测 5~15s）。上游自身对单次推理有 **300 秒** 的硬上限：绕过本网关直接压测 `vm.gateway:11430`，`synthesize` 在 311s 返回 `502 {"error":{"message":"inference timed out (>300s)","code":"opencode_unavailable"}}`。因此 `websearch.timeout` 至少保持 300（默认即 `300.0`），让上游自己的错误原样透传（**502**）而不是先被网关判成 **504**；再往上调也不会更快拿到答案。需要 `answer` 时建议把 `model` 指向更快的上游。
+- The search backend is an ordinary `upstreams` entry (`type: "opencode"`): its address, timeout and extra
+  `headers` are configured once and reused by model aggregation (`/v1/models`, `/api/tags`), chat routing and
+  `/probe`. The `opencode` type uses the OpenAI-compatible discovery endpoint (`GET /v1/models`, parsing
+  `data[].id`) and probes health through `GET /health`.
+- With `websearch.upstream` empty, the **first upstream of `type: "opencode"`** is picked; a name that matches
+  no upstream returns **503** (it never silently falls back to another one).
+- `api_key_env` defaults to the empty string = no signing (the current OpenCode gateway is anonymous). If the
+  upstream requires a key, set it to a variable name (e.g. `OPENCODE_GATEWAY_API_KEY`) and the gateway calls
+  it with `Authorization: Bearer <value>`; the key is read from the environment only, never stored in
+  `config.yaml`.
+- `model` is **pure passthrough**: it takes a model name that opencode-port supports (**not a model configured
+  in llm-hub's `config.yaml`**), whatever the caller sends is forwarded, and when omitted the upstream chooses.
+  The gateway does not resolve it through its own `aliases`. The upstream's model list is visible in the
+  console under Tools · Web Search → "model list"; when `model` is omitted, opencode-port picks
+  `web_search.model` → the first local model (`ollama-local/*`) → `models.auto.fallback` as its default, and
+  that model only takes part in answer synthesis when `synthesize=true`.
+- `synthesize: true` drives one extra model summarisation, whose duration follows the upstream's inference
+  speed and can far exceed plain retrieval (5–15 s measured). The upstream itself caps a single inference at
+  **300 seconds**: hitting `vm.gateway:11430` directly with `synthesize` measured **502**
+  `{"error":{"message":"inference timed out (>300s)","code":"opencode_unavailable"}}` at 311 s. Keep
+  `websearch.timeout` at 300 or above (the default is `300.0`) so the upstream's own error passes through
+  (**502**) instead of being reported as a gateway **504**; raising it further does not make an answer arrive
+  sooner. For `answer`, point `model` at a faster upstream.
 
-**请求体字段：**
+**Request body fields:**
 
-| 字段 | 类型 | 必填 | 说明 |
+| Field | Type | Required | Description |
 |------|------|------|------|
-| `query` | string | ✅ | 检索关键词（非空） |
-| `model` | string | ❌ | opencode-port 支持的模型名（不是 llm-hub 配置的模型），原样透传；省略时使用 opencode-port 的默认模型 |
-| `top_k` | int | ❌ | 抓取页数，1~50 |
-| `max_chars_per_page` | int | ❌ | 单页正文字符上限，超出则 `truncated: true` |
-| `locale` | string | ❌ | 检索语言提示，如 `zh-CN` |
-| `recency` | string | ❌ | 时间窗：`day` / `week` / `month` / `year` |
-| `synthesize` | bool | ❌ | 额外驱动模型综合作答，返回填充 `answer`（耗时明显变长） |
-| `include_sources` | bool | ❌ | 是否返回扁平的 `sources` URL 列表 |
+| `query` | string | ✅ | Search keywords (non-empty) |
+| `model` | string | ❌ | A model name opencode-port supports (not one configured in llm-hub), forwarded verbatim; when omitted opencode-port's default is used |
+| `top_k` | int | ❌ | Pages to fetch, 1–50 |
+| `max_chars_per_page` | int | ❌ | Character cap per page; exceeding it sets `truncated: true` |
+| `locale` | string | ❌ | Language hint for the search, e.g. `zh-CN` |
+| `recency` | string | ❌ | Time window: `day` / `week` / `month` / `year` |
+| `synthesize` | bool | ❌ | Also drive a model summarisation, filling in `answer` (noticeably slower) |
+| `include_sources` | bool | ❌ | Whether to return a flat `sources` list of URLs |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl -X POST http://localhost:8888/v1/tools/web-search \
   -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
-  -d '{"query": "Ollama keep_alive 默认值", "top_k": 2}'
+  -d '{"query": "Ollama keep_alive default", "top_k": 2}'
 ```
 
-**响应示例（实测）：**
+**Response example (measured):**
 
 ```json
 {
-  "query": "Ollama keep_alive 默认值",
+  "query": "Ollama keep_alive default",
   "model": "ollama-local/qwen3.5:9b",
   "engine": "opencode-websearch",
   "truncated": false,
@@ -492,24 +534,28 @@ curl -X POST http://localhost:8888/v1/tools/web-search \
 }
 ```
 
-- `text` 是所有抓取段落的拼接结果，可直接塞进 prompt；`results[]` 保留逐页的标题/URL/摘要/段落；`answer` 仅在 `synthesize: true` 时非 null。
-- 状态码：`websearch.enabled=false` → **404**；上游缺失 → **503**；上游不可达 → **502**；网关等待超过 `websearch.timeout` → **504**；非 POST → **405**；请求体不是 JSON 对象 → **400**。上游自己返回的错误（如 `synthesize` 触发上游 300s 推理上限的 **502**）连同响应体**原样透传**。
+- `text` is the concatenation of every fetched paragraph and can go straight into a prompt; `results[]` keeps
+  title/URL/snippet/paragraphs per page; `answer` is non-null only with `synthesize: true`.
+- Status codes: `websearch.enabled=false` → **404**; upstream missing → **503**; upstream unreachable →
+  **502**; gateway wait exceeding `websearch.timeout` → **504**; non-POST → **405**; a body that is not a JSON
+  object → **400**. Errors the upstream raises itself (such as the **502** from its 300 s inference cap when
+  `synthesize` is on) are passed through with their body intact.
 
-> 启用该上游后，它的免费模型也会出现在 `/v1/models` 里，并可直接路由聊天：
-> `{"model": "opencode/big-pickle", ...}` 打到 `POST /v1/chat/completions` 即可。
+> Once this upstream is enabled, its free models also show up in `/v1/models` and can be routed for chat
+> directly: `{"model": "opencode/big-pickle", ...}` against `POST /v1/chat/completions` just works.
 
 ---
 
-### 重排序
+### Rerank
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/v1/rerank`, `/rerank`, `/api/rerank` |
-| 方法 | `POST` |
-| 认证 | ✅ 需要 |
-| 说明 | 对文档进行重排序（支持 logprobs 和 embedding 模式） |
+| Path | `/v1/rerank`, `/rerank`, `/api/rerank` |
+| Method | `POST` |
+| Auth | ✅ required |
+| Description | Reorders documents by relevance (logprobs and embedding modes) |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/v1/rerank \
@@ -517,39 +563,39 @@ curl http://localhost:8888/v1/rerank \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-reranker:4b",
-    "query": "如何冲泡手冲咖啡？",
+    "query": "How do I brew pour-over coffee?",
     "documents": [
-      "手冲咖啡需要90°C左右的水温",
-      "Python是一种编程语言",
-      "研磨度影响萃取速度"
+      "Pour-over coffee needs water at about 90°C",
+      "Python is a programming language",
+      "Grind size affects extraction speed"
     ],
     "top_n": 3,
     "return_documents": true
   }'
 ```
 
-**请求参数：**
+**Request parameters:**
 
-| 参数 | 类型 | 必需 | 说明 |
+| Parameter | Type | Required | Description |
 |------|------|------|------|
-| `model` | string | ✅ | 重排序模型名称 |
-| `query` | string | ✅ | 查询文本 |
-| `documents` | array | ✅ | 待排序文档列表（`string` 或 `{"text": "..."}`） |
-| `top_n` | integer | ❌ | 返回前 N 个结果 |
-| `return_documents` | boolean | ❌ | 是否返回文档内容（默认取配置 `rerank.return_documents`） |
-| `instruction` | string | ❌ | 覆盖默认指令 |
+| `model` | string | ✅ | Rerank model name |
+| `query` | string | ✅ | Query text |
+| `documents` | array | ✅ | Documents to rank (`string` or `{"text": "..."}`) |
+| `top_n` | integer | ❌ | Return only the top N results |
+| `return_documents` | boolean | ❌ | Whether to echo document text (defaults to `rerank.return_documents`) |
+| `instruction` | string | ❌ | Overrides the default instruction |
 
-兼容别名（便于对接不同客户端 / 网关）：
+Compatibility aliases (for clients and gateways that use other field names):
 
-| 别名 | 对应字段 | 说明 |
+| Alias | Maps to | Notes |
 |------|----------|------|
-| `model_name` / `model_id` | `model` | 优先级：`model` > `model_name` > `model_id` |
-| `input` | `query` | 支持字符串或单元素数组 |
-| `texts` / `passages` | `documents` | 文档列表的另一种写法 |
+| `model_name` / `model_id` | `model` | Precedence: `model` > `model_name` > `model_id` |
+| `input` | `query` | String or single-element array |
+| `texts` / `passages` | `documents` | Alternative spelling of the document list |
 
-> 未传 `model` 时，会回退到配置 `rerank.models` 中的第一个模型。
+> With no `model`, it falls back to the first entry of `rerank.models`.
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -562,7 +608,7 @@ curl http://localhost:8888/v1/rerank \
       "rank": 0,
       "relevance_score": 0.91234567,
       "document": {
-        "text": "手冲咖啡需要90°C左右的水温"
+        "text": "Pour-over coffee needs water at about 90°C"
       }
     },
     {
@@ -570,7 +616,7 @@ curl http://localhost:8888/v1/rerank \
       "rank": 1,
       "relevance_score": 0.63456789,
       "document": {
-        "text": "研磨度影响萃取速度"
+        "text": "Grind size affects extraction speed"
       }
     }
   ],
@@ -592,43 +638,47 @@ curl http://localhost:8888/v1/rerank \
 }
 ```
 
-**打分模式：**
+**Scoring modes:**
 
-| 模式 | 适用模型 | 原理 |
+| Mode | Suitable models | How it works |
 |------|----------|------|
-| `logprobs`（默认） | Qwen3-Reranker 等生成式重排模型 | 用 yes/no 提示词取**首个回答 token** 的 logprobs，做二分类 softmax 得到概率 |
-| `embedding` | bge-m3 等向量模型 | 一次性批量向量化 query + 文档，用余弦相似度打分 |
+| `logprobs` (default) | Generative rerankers such as Qwen3-Reranker | A yes/no prompt, then the logprobs of the **first answer token** go through a two-class softmax to yield a probability |
+| `embedding` | Vector models such as bge-m3 | Query and documents are embedded in one batch and scored by cosine similarity |
 
-`relevance_score` 默认是**绝对概率**（0~1，跨请求可比）。若希望把本批次分数拉伸到 `[0,1]`，可设置 `rerank.normalize: true`。
+`relevance_score` is an **absolute probability** by default (0–1, comparable across requests). Set
+`rerank.normalize: true` to stretch each batch's scores into `[0,1]`.
 
-**关键配置项（`rerank` 段）：**
+**Key configuration (`rerank` block):**
 
-| 配置 | 默认值 | 说明 |
+| Setting | Default | Description |
 |------|--------|------|
-| `mode` / `model_modes` | `logprobs` | 全局模式 / 按模型覆盖，如 `{"bge-m3:latest": "embedding"}` |
-| `upstream_api` | `auto` | Ollama 走 `/api/generate`（`raw_prompt=true`，避免注入 `<think>`），OpenAI 兼容走 `/v1/chat/completions`；可强制 `chat` |
-| `top_logprobs` | `20` | 向上游请求的候选 token 数，用于计算 yes/no 概率 |
-| `max_tokens` | `2` | 只生成少量 token 判定 yes/no |
-| `normalize` | `false` | 是否做 min-max 归一化 |
-| `return_documents` | `true` | 响应是否回带文档原文 |
-| `on_error` | `score_zero` | 单篇打分失败时：记 0 分或返回 502（全部失败一律 502） |
-| `max_documents` / `max_document_chars` | `0` | 文档数量 / 单篇长度上限，0 表示不限制 |
-| `embedding_query_prefix` / `embedding_clamp` | `""` / `true` | embedding 模式的 query 前缀、余弦值裁剪到 `[0,1]` |
+| `mode` / `model_modes` | `logprobs` | Global mode / per-model override, e.g. `{"bge-m3:latest": "embedding"}` |
+| `upstream_api` | `auto` | Ollama uses `/api/generate` (`raw_prompt=true`, so no `<think>` is injected), OpenAI-compatible uses `/v1/chat/completions`; force `chat` if needed |
+| `top_logprobs` | `20` | Candidate tokens requested from the upstream, used to compute the yes/no probability |
+| `max_tokens` | `2` | Only a couple of tokens are generated to decide yes/no |
+| `normalize` | `false` | Whether to min-max normalise |
+| `return_documents` | `true` | Whether responses carry the document text back |
+| `on_error` | `score_zero` | When a single document fails: zero it or return 502 (all failing always returns 502) |
+| `max_documents` / `max_document_chars` | `0` | Caps on document count and per-document length; 0 means unlimited |
+| `embedding_query_prefix` / `embedding_clamp` | `""` / `true` | Query prefix for embedding mode; clamp cosine values into `[0,1]` |
 
 ---
 
-### 聊天补全
+### Chat completions
 
-#### OpenAI 兼容格式
+#### OpenAI-compatible format
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/v1/chat/completions` |
-| 方法 | `POST` |
-| 认证 | ✅ 需要 |
-| 说明 | OpenAI 兼容的聊天补全接口 |
+| Path | `/v1/chat/completions` |
+| Method | `POST` |
+| Auth | ✅ required |
+| Description | OpenAI-compatible chat completions |
 
-**请求示例：**
+> Claude SDK / Claude Code speak the Anthropic envelope — use [`/v1/messages`](#messages-anthropic-compatible)
+> instead. Same upstream, same alias resolution, only the outer request/response shape differs.
+
+**Request example:**
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
@@ -637,8 +687,8 @@ curl http://localhost:8888/v1/chat/completions \
   -d '{
     "model": "qwen3:8b",
     "messages": [
-      {"role": "system", "content": "你是一个有帮助的助手"},
-      {"role": "user", "content": "什么是机器学习？"}
+      {"role": "system", "content": "You are a helpful assistant"},
+      {"role": "user", "content": "What is machine learning?"}
     ],
     "temperature": 0.7,
     "max_tokens": 500,
@@ -646,19 +696,19 @@ curl http://localhost:8888/v1/chat/completions \
   }'
 ```
 
-**请求参数：**
+**Request parameters:**
 
-| 参数 | 类型 | 必需 | 说明 |
+| Parameter | Type | Required | Description |
 |------|------|------|------|
-| `model` | string | ✅ | 模型名称 |
-| `messages` | array | ✅ | 消息列表 |
-| `temperature` | float | ❌ | 温度参数 (0-2) |
-| `max_tokens` | integer | ❌ | 最大生成 token 数 |
-| `stream` | boolean | ❌ | 是否流式返回 |
-| `reasoning_effort` | string | ❌ | OpenAI 兼容的思考强度（`none` / `low` / `medium` / `high`）；Ollama 用 `none` 关闭思考，不传由后端决定 |
-| `tools` | array | ❌ | 工具定义列表 |
+| `model` | string | ✅ | Model name |
+| `messages` | array | ✅ | Message list |
+| `temperature` | float | ❌ | Sampling temperature (0–2) |
+| `max_tokens` | integer | ❌ | Maximum tokens to generate |
+| `stream` | boolean | ❌ | Whether to stream the response |
+| `reasoning_effort` | string | ❌ | OpenAI-compatible reasoning effort (`none` / `low` / `medium` / `high`); on Ollama `none` disables thinking, unset lets the backend decide |
+| `tools` | array | ❌ | Tool definitions |
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -671,7 +721,7 @@ curl http://localhost:8888/v1/chat/completions \
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "机器学习是人工智能的一个分支..."
+        "content": "Machine learning is a branch of AI..."
       },
       "finish_reason": "stop"
     }
@@ -684,16 +734,16 @@ curl http://localhost:8888/v1/chat/completions \
 }
 ```
 
-#### Ollama 原生格式
+#### Ollama-native format
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/api/chat` |
-| 方法 | `POST` |
-| 认证 | ✅ 需要 |
-| 说明 | Ollama 原生聊天接口 |
+| Path | `/api/chat` |
+| Method | `POST` |
+| Auth | ✅ required |
+| Description | Ollama's native chat endpoint |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/api/chat \
@@ -702,20 +752,20 @@ curl http://localhost:8888/api/chat \
   -d '{
     "model": "qwen3:8b",
     "messages": [
-      {"role": "user", "content": "你好"}
+      {"role": "user", "content": "hello"}
     ],
     "stream": false
   }'
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
   "model": "qwen3:8b",
   "message": {
     "role": "assistant",
-    "content": "你好！有什么可以帮你的？"
+    "content": "Hello! What can I help you with?"
   },
   "done": true,
   "total_duration": 1234567890,
@@ -725,43 +775,120 @@ curl http://localhost:8888/api/chat \
 
 ---
 
-### 文本补全
+### Messages (Anthropic compatible)
 
-| 项目 | 值 |
+#### Anthropic Messages format
+
+| Item | Value |
 |------|-----|
-| 路径 | `/v1/completions` |
-| 方法 | `POST` |
-| 认证 | ✅ 需要 |
-| 说明 | OpenAI 兼容的文本补全接口 |
+| Path | `/v1/messages` (plus the singular alias `/v1/message`) |
+| Method | `POST` |
+| Auth | ✅ required (`Authorization: Bearer` or `x-api-key`) |
+| Description | Anthropic Messages-compatible endpoint: the gateway maps the request onto the OpenAI chat format, forwards it to the upstream (Ollama `/api/chat` or `/v1/chat/completions`), then wraps the answer back into an Anthropic envelope |
 
-#### Ollama 原生格式
+> An empty `model` or `"auto"` falls back to the first model of the **default upstream**; with no
+> `default_upstream` configured and the model unresolvable, the call returns `404`. Unknown fields are
+> preserved, and request logging plus alias resolution behave exactly like every other upstream path — but
+> **streaming is not passthrough**: the upstream's NDJSON / SSE chunks are re-sequenced into the Anthropic
+> event stream described below.
 
-| 项目 | 值 |
-|------|-----|
-| 路径 | `/api/generate` |
-| 方法 | `POST`（其他方法一律 **405**，响应头 `Allow: POST`） |
-| 认证 | ✅ 需要 |
-| 说明 | Ollama 原生补全接口，按 `model` 路由后原样转发；在 `/docs` 中有完整 schema |
+**Request example:**
 
-**请求参数：**
+```bash
+curl http://localhost:8888/v1/messages \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3:8b",
+    "max_tokens": 256,
+    "system": "You are a helpful assistant",
+    "messages": [
+      {"role": "user", "content": "What is machine learning?"}
+    ],
+    "stream": false
+  }'
+```
 
-| 参数 | 类型 | 必需 | 说明 |
+**Request parameters:**
+
+| Parameter | Type | Required | Description |
 |------|------|------|------|
-| `model` | string | ✅ | 模型名或网关别名（别名会先解析成真实模型名再转发） |
-| `prompt` | string | ✅ | 待续写的提示词 |
-| `raw` | boolean | ❌ | `true` 跳过模型内嵌 chat template，直接续写 `prompt`（打分/重排类提示需要） |
-| `system` / `template` / `context` | string/string/array | ❌ | Ollama 原生字段，原样透传 |
-| `images` | array | ❌ | 视觉模型的 base64 图片列表 |
-| `format` | `"json"` / object | ❌ | 结构化输出：`json` 或直接给 JSON schema |
-| `stream` | boolean | ❌ | **缺省即流式**（与 Ollama 一致，返回 NDJSON）；`false` 返回单个 JSON 对象 |
-| `think` | boolean | ❌ | Ollama 原生思考开关：`false` 关闭思考（响应不含 `thinking`），缺省由模型决定 |
-| `keep_alive` | string/number | ❌ | 模型驻留时长，如 `"3m"` |
-| `logprobs` / `top_logprobs` | boolean / int(1-20) | ❌ | 逐 token 对数概率及其候选数 |
-| `options` | object | ❌ | `temperature` / `top_p` / `num_predict` / `num_ctx` / `seed` / `stop` …；`num_ctx` 可能被 `num_ctx_overrides` 覆盖 |
+| `model` | string | ❌ | Model name or alias; empty / `auto` falls back to the default upstream's first model (a gateway route name, not the upstream's raw name) |
+| `system` | string / array | ❌ | System prompt; a string or an array of text blocks `[{"type":"text","text":"..."}]` |
+| `messages` | array | ✅ | Message list of `{"role","content"}` (`role` ∈ `user`/`assistant`); `content` is a string or an array of blocks (including `image` blocks) |
+| `max_tokens` | integer | ✅ | Maximum tokens to generate (must be > 0) |
+| `temperature` | float | ❌ | Sampling temperature (0–2) |
+| `top_p` | float | ❌ | Nucleus sampling cutoff (0–1) |
+| `top_k` | integer | ❌ | Number of candidate tokens kept (Ollama upstreams only) |
+| `stop_sequences` | array | ❌ | Stop sequences; generation ends when one is hit |
+| `stream` | boolean | ❌ | `false` returns one JSON envelope, `true` returns an Anthropic SSE event stream |
 
-其余未知字段一律保留，网关不注入任何内容（别名声明的 `params` 除外）。
+**Response (non-streaming, 200 OK):**
 
-**请求示例：**
+```json
+{
+  "id": "msg_abc123",
+  "type": "message",
+  "role": "assistant",
+  "model": "qwen3:8b",
+  "content": [
+    {"type": "text", "text": "Machine learning is a branch of AI..."}
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 25,
+    "output_tokens": 100
+  }
+}
+```
+
+> `usage` is rebuilt from the upstream's own token counts: Ollama's `prompt_eval_count` / `eval_count`, or
+> `prompt_tokens` / `completion_tokens` on OpenAI-compatible upstreams.
+
+**Streaming (SSE) event order:** `message_start` → `content_block_start` → `content_block_delta*` (each
+`delta.text` carries an incremental piece) → `content_block_stop` → `message_delta` (final `stop_reason` and
+`usage`) → `message_stop`. Upstream failures arrive as an `event: error` instead of dropping the connection.
+
+---
+
+### Text completion
+
+| Item | Value |
+|------|-----|
+| Path | `/v1/completions` |
+| Method | `POST` |
+| Auth | ✅ required |
+| Description | OpenAI-compatible text completions |
+
+#### Ollama-native format
+
+| Item | Value |
+|------|-----|
+| Path | `/api/generate` |
+| Method | `POST` (every other verb returns **405** with `Allow: POST`) |
+| Auth | ✅ required |
+| Description | Ollama's native completion endpoint: routed by `model` and forwarded as-is; full schema in `/docs` |
+
+**Request parameters:**
+
+| Parameter | Type | Required | Description |
+|------|------|------|------|
+| `model` | string | ✅ | Model name or gateway alias (aliases are resolved to the real model before forwarding) |
+| `prompt` | string | ✅ | Prompt to continue |
+| `raw` | boolean | ❌ | `true` skips the model's embedded chat template and continues `prompt` directly (needed by scoring/rerank-style prompts) |
+| `system` / `template` / `context` | string/string/array | ❌ | Ollama-native fields, passed through untouched |
+| `images` | array | ❌ | Base64 images for vision models |
+| `format` | `"json"` / object | ❌ | Structured output: `json`, or a JSON schema directly |
+| `stream` | boolean | ❌ | **Streams by default** (matching Ollama, NDJSON); `false` returns a single JSON object |
+| `think` | boolean | ❌ | Ollama's native thinking switch: `false` disables thinking (no `thinking` in the response); unset leaves it to the model |
+| `keep_alive` | string/number | ❌ | How long the model stays loaded, e.g. `"3m"` |
+| `logprobs` / `top_logprobs` | boolean / int(1-20) | ❌ | Per-token log probabilities and how many candidates to return |
+| `options` | object | ❌ | `temperature` / `top_p` / `num_predict` / `num_ctx` / `seed` / `stop` …; `num_ctx` may be overridden by `num_ctx_overrides` |
+
+Any other field is preserved; the gateway injects nothing except the `params` declared on an alias.
+
+**Request example:**
 
 ```bash
 curl http://localhost:8888/api/generate \
@@ -769,7 +896,7 @@ curl http://localhost:8888/api/generate \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
-    "prompt": "写一首关于编程的诗：",
+    "prompt": "Write a poem about programming:",
     "raw": true,
     "format": "json",
     "keep_alive": "3m",
@@ -778,12 +905,12 @@ curl http://localhost:8888/api/generate \
   }'
 ```
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
   "model": "qwen3:8b",
-  "response": "代码如诗行，\n逻辑似水流...",
+  "response": "Code like verse,\nlogic like a river...",
   "done": true,
   "done_reason": "stop",
   "total_duration": 2345678901,
@@ -791,30 +918,30 @@ curl http://localhost:8888/api/generate \
 }
 ```
 
-流式（`stream` 为 `true` 或缺省）时返回 `application/x-ndjson`，每行一个上述结构的片段，
-最后一行 `done: true`：
+When streaming (`stream` true or omitted) the response is `application/x-ndjson`, one fragment of the
+structure above per line, with `done: true` on the last one:
 
 ```
-{"model":"qwen3:8b","response":"代码","done":false}
-{"model":"qwen3:8b","response":"如诗行","done":true,"done_reason":"stop","eval_count":8}
+{"model":"qwen3:8b","response":"Code","done":false}
+{"model":"qwen3:8b","response":" like verse","done":true,"done_reason":"stop","eval_count":8}
 ```
 
-> 与聊天接口一样，`/api/generate` 只在 **Ollama 上游**可用；把模型路由到 LM Studio /
-> OpenAI 兼容上游时，该路径会原样打到对方 `base_url` 上（对方一般回 404）。
-> 需要跨后端通用请用 `/v1/chat/completions`。
+> As with chat, `/api/generate` only works against **Ollama upstreams**; route a model to LM Studio or an
+> OpenAI-compatible upstream and the path lands on that `base_url` verbatim (usually a 404). Use
+> `/v1/chat/completions` when you need something that works across backends.
 
 ---
 
-### 嵌入向量
+### Embeddings
 
-| 项目 | 值 |
+| Item | Value |
 |------|-----|
-| 路径 | `/api/embed`, `/v1/embeddings` |
-| 方法 | `POST` |
-| 认证 | ✅ 需要 |
-| 说明 | 生成文本嵌入向量 |
+| Path | `/api/embed`, `/v1/embeddings` |
+| Method | `POST` |
+| Auth | ✅ required |
+| Description | Generates text embeddings |
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/api/embed \
@@ -822,18 +949,18 @@ curl http://localhost:8888/api/embed \
   -H "Content-Type: application/json" \
   -d '{
     "model": "bge-m3:latest",
-    "input": ["你好世界", "机器学习入门"]
+    "input": ["hello world", "intro to machine learning"]
   }'
 ```
 
-**请求参数：**
+**Request parameters:**
 
-| 参数 | 类型 | 必需 | 说明 |
+| Parameter | Type | Required | Description |
 |------|------|------|------|
-| `model` | string | ✅ | 嵌入模型名称 |
-| `input` | string/array | ✅ | 输入文本（字符串或数组） |
+| `model` | string | ✅ | Embedding model name |
+| `input` | string/array | ✅ | Input text (a string or an array) |
 
-**响应 (200 OK)：**
+**Response (200 OK):**
 
 ```json
 {
@@ -847,21 +974,21 @@ curl http://localhost:8888/api/embed \
 
 ---
 
-### 模型管理
+### Model management
 
-以下端点默认被阻止（`security.admin_endpoints: "deny"`），需要修改配置才能使用。
+These endpoints are blocked by default (`security.admin_endpoints: "deny"`) and need a config change to use.
 
-| 路径 | 方法 | 说明 |
+| Path | Method | Description |
 |------|------|------|
-| `/api/pull` | `POST` | 拉取模型 |
-| `/api/push` | `POST` | 推送模型 |
-| `/api/delete` | `POST` | 删除模型 |
-| `/api/create` | `POST` | 创建模型 |
-| `/api/copy` | `POST` | 复制模型 |
-| `/api/show` | `POST` | 显示模型信息 |
-| `/api/blobs/*` | `GET/POST/DELETE` | Blob 操作 |
+| `/api/pull` | `POST` | Pull a model |
+| `/api/push` | `POST` | Push a model |
+| `/api/delete` | `POST` | Delete a model |
+| `/api/create` | `POST` | Create a model |
+| `/api/copy` | `POST` | Copy a model |
+| `/api/show` | `POST` | Show model information |
+| `/api/blobs/*` | `GET/POST/DELETE` | Blob operations |
 
-**请求示例（需要配置 `security.admin_endpoints: "allow"`）：**
+**Request example (requires `security.admin_endpoints: "allow"`):**
 
 ```bash
 curl http://localhost:8888/api/pull \
@@ -872,73 +999,83 @@ curl http://localhost:8888/api/pull \
 
 ---
 
-### 管理 API（Web 管理台）
+### Management API (web console)
 
-Web 管理台使用的只读接口，统一挂在 `/v1/management` 前缀下（实现在
-`app/management.py`，请求明细由 `app/request_log.py` 落库）。管理台前端本身
-由网关以静态文件提供服务，地址 **`/admin/`**（构建产物在 `app/web`，见 README 的
-「Web 管理台」一节）；静态壳层不鉴权——登录页要能打开——但页面内每一次数据请求
-都经过 `require_admin`。除登录外，全部接口需要以下**两种凭据之一**：
+The read-only interface behind the web console, all under the `/v1/management` prefix (implemented in
+`app/management.py`, with request details persisted by `app/request_log.py`). The console frontend itself is
+served by the gateway as static files at **`/admin/`** (the bundle lives in `app/web`, see the "Web console"
+section of USAGE); the static shell is unauthenticated — the login page has to open — but every data request
+inside it goes through `require_admin`. Apart from login, every endpoint accepts **one of two credentials**:
 
-- **管理台会话 Cookie**：`POST /v1/management/auth/login` 用 `ADMIN_PASSWORD` 换取
-  12 小时 HMAC 签名 HttpOnly Cookie（浏览器走这条路）；
-- **网关 API Key**：`GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`（如 `data/.keys`）提供
-  的任一 Key，经 `Authorization: Bearer` 或 `X-API-Key` 提交，便于脚本与 curl 复用已有凭据。
-  未设置 `GATEWAY_API_KEYS_FILE` 时会自动读取 `CONFIG_PATH` 同目录的 `.keys`（如 `/config/.keys`）。
+- **Console session cookie**: `POST /v1/management/auth/login` exchanges `ADMIN_PASSWORD` for a 12-hour
+  HMAC-signed HttpOnly cookie (what the browser uses);
+- **Gateway API key**: any key in the `api_keys` table (`llmhub.db`), submitted as `Authorization: Bearer` or
+  `X-API-Key`, so scripts and curl can reuse an existing credential. The table is imported from
+  `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` (e.g. `data/.keys`) on the **first start** and the file is
+  never read again; with `GATEWAY_API_KEYS_FILE` unset, `.keys` next to `CONFIG_PATH` is picked up
+  automatically (e.g. `/config/.keys`).
 
-**认证方式：**
+The three `/api-keys` endpoints are the one exception: they accept **only the session cookie**
+(`require_admin_session`). A gateway API key is something every client already holds, so accepting it there
+would let a client mint itself another key — minting and revoking require a console login.
+
+**Authentication:**
 
 ```bash
-# 登录换取 12 小时 HttpOnly 会话 Cookie
+# Log in and receive a 12-hour HttpOnly session cookie
 curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
   -H "Content-Type: application/json" -d '{"password": "your-admin-password"}'
 
-# 之后用 Cookie 认证
+# From then on authenticate with the cookie
 curl -b cookie.txt http://localhost:8888/v1/management/overview
 
-# 或直接带上网关 API Key
+# Or present a gateway API key directly
 curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overview
 ```
 
-`ADMIN_PASSWORD` 本身只是登录页凭据，不是请求凭据：把它当作 `Bearer` / `X-API-Key`
-提交一律 **401**；查询串里的 key 也不接受（避免落进访问日志与浏览器历史）。
-网关鉴权关闭（`auth.enabled: false` 或环境变量与密钥文件都没有 key）时没有可接受的 API Key，
-管理接口退回 Cookie-only，绝不会变成匿名可访问。
+`ADMIN_PASSWORD` is only a login credential, never a request credential: presenting it as `Bearer` /
+`X-API-Key` is always **401**, and a key in the query string is not accepted either (it would end up in access
+logs and browser history). When gateway auth is off (`auth.enabled: false`, or the first start found no keys
+in the environment or key file, leaving the `api_keys` table empty) there is no API key to accept, so the
+management endpoints fall back to cookie-only — they never become anonymously reachable.
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |------|------|------|
-| `POST` | `/v1/management/auth/login` | Body `{"password": "..."}`；成功 `200` 并下发 Cookie，密码错误 `401` |
-| `POST` | `/v1/management/auth/logout` | 清除会话 Cookie |
-| `GET` | `/v1/management/auth/ping` | 受保护心跳，返回 `{"ok": true, "admin": true}` |
-| `GET` | `/v1/management/overview` | KPI（含今日请求数与今日 token 合计 `tokens_today`）、上游摘要、可用模型清单（Ollama 取 `/api/ps` 的驻留模型；OpenCode 这类托管上游没有 `/api/ps`，探测成功时把它声明的模型一并计入，设备为 `"cloud"`、显存为 `null`；根 `aliases:` 的派生模型再追加在末尾，`derived: true`、设备沿用目标模型、显存为 `null`，`kpi.running_models` 不重复计它们），每行含 `model` / `display`（`model_aliases` 短名）/ `alias`；另有 `request_log` 开关与库信息 |
-| `GET` | `/v1/management/upstreams` | 上游实例列表（状态 / 已加载数 / 显存 / 探测延迟） |
-| `GET` | `/v1/management/upstreams/{name}` | 单实例详情：`models` 取自 `config.yaml` 的 `upstreams[].models`（`model_aliases` 短名作为显示名），前缀通配（如 `opencode/*`）用与路由同一个发现结果展开成具体模型，末尾追加归属于该上游的根 `aliases:` 派生模型名；`running_models` 是 `/api/ps` 的运行中模型（含设备与显存/占用），托管上游则列出它声明的模型（设备为 `"cloud"`、显存为 `null`），派生模型行 `derived: true`（设备沿用目标模型、显存 `null`）；不可达返回 `503` 且带 `"unreachable": true` |
-| `GET` | `/v1/management/models/llm` | 逐上游的模型清单，来源是 `config.yaml` 的 `upstreams[].models`（实例上装了但没声明的模型不列出，因为它们本来就走不通网关）；前缀通配按发现结果展开，根 `aliases:` 的派生模型作为独立一行紧跟其目标模型。每行 `model`（真实 id，派生行是别名名）/ `display`（`model_aliases` 短名，无则即声明名）/ `alias` / `derived` / `wildcard`（由通配展开而来）/ `running` / `device` / `device_ratio` / `num_ctx` / `size_gib` / `vram_gib`，派生行另带 `target` / `params` / `description` 且显存为 `null`；OpenCode 上游探测有效即全部 `running: true`，设备为 `"cloud"` 且显存为 `null`。另有 `aliases`（别名 / `kind`：`rename` 只改名、`derived` 是带固化参数的独立模型 / 目标 / 上游 / `params` / `description`）与 `num_ctx_overrides` |
-| `GET` | `/v1/management/models/rerank` | Rerank 配置投影（`api_key` 一律掩码为 `••••••`），含 `upstream_api` / `on_error` 与请求/响应示例 |
-| `GET` | `/v1/management/models/systemone` | System One 配置投影（同样掩码），含请求/SSE 示例 |
-| `GET` | `/v1/management/tools/websearch` | Web Search 配置投影：`enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url`（由 provider upstream 派生）/ `api_key_env` / `api_key`（掩码）/ `timeout` / `provider_configured` |
-| `GET` | `/v1/management/requests` | 请求明细：`start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`，返回 `stats` + `rows` + `pagination` + `request_log`（开关状态） |
-| `GET` | `/v1/management/requests/{id}` | 单条明细（含截断至 8 KB 的请求/响应体，敏感字段已脱敏） |
-| `GET` | `/v1/management/stats/timeseries` | 时序聚合：`bucket=hour\|day`，每桶 `count` / `errors` / `p95` |
-| `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count}]}`；`status` 只分 `ok`(<400) / `error`(≥400)，未命中上游的行计入 `-` |
-| `GET` | `/v1/management/stats/failures` | 失败统计：`by_code` / `by_upstream` / `samples` |
-| `GET` | `/v1/management/api-test/models` | 每个 API 家族的可用模型、默认值与掩码密钥：`kinds` 以 `generate` / `chat` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch` 为键，每键含 `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source`（选项来自哪个配置项）/ `models[]`（`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key`（掩码）/ `unknown`）/ `default_model` / `api_key`（掩码）/ `api_key_env`；顶层另有 `max_response_bytes`。`api_models` 为空时按配置推导；`/api/...` 原生端点（`generate`、`embed_ollama`）只列 `type: "ollama"` 上游的模型，`/v1/...` 端点（`chat`、`embed_openai`）也列 `lmstudio` / `opencode` 的模型；显式 `api_models` 列表按原样返回。一次探测所有上游，所以前端整站共用一份缓存，只在首次打开与点击「重新探测」时取 |
-| `POST` | `/v1/management/api-test` | Body `{"kind": "generate", "body": {...}}`；服务端用网关自己的服务发出这一笔请求，返回信封 `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`。`kind` 不在白名单、或需要模型的家族没给 `model` → `400` |
-| `POST` | `/v1/management/bench` | 启动一次模型测速任务，Body `{"upstream": "...", "model": "...", "rounds"?: 4, "max_tokens"?: 500, "think"?: "auto"}`，立即返回 `{"job_id": "...", "status": "pending"}`；任务在后台跑 |
-| `GET` | `/v1/management/bench/history` | 该 `upstream` + `model` 最近的 **3** 份测速记录（`?upstream=&model=`），按时间倒序，每行含 `decode_tok_s` / `decode_sd` / `prefill_tok_s` / `ttft_ms` / `timing_source` 与完整 `payload`。**注册顺序在 `/bench/{job_id}` 之前**，否则 "history" 会被当成 job_id |
-| `GET` | `/v1/management/bench/{job_id}` | 轮询任务状态：`status` 为 `pending` / `running` / `done` / `failed`，`progress` 为 `{completed, total, warmup}`，完成时 `result` 含各轮明细与 `steady` 汇总，失败时 `error` 给出原因 |
+| `POST` | `/v1/management/auth/login` | Body `{"password": "..."}`; `200` with a cookie on success, `401` on a wrong password |
+| `POST` | `/v1/management/auth/logout` | Clears the session cookie |
+| `GET` | `/v1/management/auth/ping` | Protected heartbeat, returns `{"ok": true, "admin": true}` |
+| `GET` | `/v1/management/overview` | KPI (including today's request count and today's token total `tokens_today`), upstream summary, available model inventory (Ollama contributes the models resident in `/api/ps`; a managed upstream such as OpenCode has no `/api/ps`, so when the probe succeeds its declared models are counted too, with device `"cloud"` and VRAM `null`; derived models from a root `aliases:` entry are appended last with `derived: true`, the target model's device and `null` VRAM, and they are not counted again in `kpi.running_models`), each row carrying `model` / `display` (the `model_aliases` short name) / `alias`; plus the `request_log` switch and database information |
+| `GET` | `/v1/management/upstreams` | Upstream list (status / loaded count / VRAM / probe latency) |
+| `GET` | `/v1/management/upstreams/{name}` | Single-instance detail: `models` comes from `upstreams[].models` in `config.yaml` (`model_aliases` short names as the display name), prefix wildcards (such as `opencode/*`) are expanded into concrete models using the same discovery result routing uses, and root `aliases:` derived models belonging to this upstream are appended; `running_models` is what `/api/ps` reports (with device and VRAM/occupancy), while a managed upstream lists its declared models (device `"cloud"`, VRAM `null`) and derived rows are marked `derived: true` (target model's device, `null` VRAM); an unreachable upstream returns `503` with `"unreachable": true` |
+| `GET` | `/v1/management/models/llm` | Per-upstream model inventory, sourced from `upstreams[].models` in `config.yaml` (models installed but not declared are not listed, since they cannot be routed through the gateway anyway); prefix wildcards are expanded from discovery results, and root `aliases:` derived models get their own row right after their target. Each row has `model` (the real id; the alias name for derived rows) / `display` (the `model_aliases` short name, or the declared name) / `alias` / `derived` / `wildcard` (came from a wildcard expansion) / `running` / `device` / `device_ratio` / `num_ctx` / `size_gib` / `vram_gib`; derived rows also carry `target` / `params` / `description` and a `null` VRAM. An OpenCode upstream that probes successfully reports every row `running: true` with device `"cloud"` and `null` VRAM. The response also carries `aliases` (name / `kind`: `rename` only renames, `derived` is a standalone model with pinned parameters / target / upstream / `params` / `description`) and `num_ctx_overrides` |
+| `GET` | `/v1/management/models/rerank` | Rerank config projection (`api_key` always masked as `••••••`), including `upstream_api` / `on_error` and request/response examples |
+| `GET` | `/v1/management/models/systemone` | System One config projection (masked the same way), with request/SSE examples |
+| `GET` | `/v1/management/tools/websearch` | Web Search config projection: `enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url` (derived from the provider upstream) / `api_key_env` / `api_key` (masked) / `timeout` / `provider_configured` |
+| `GET` | `/v1/management/requests` | Request details: `start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`, returning `stats` + `rows` + `pagination` + `request_log` (switch state). **API calls only**: the query always carries `request_log.API_PATH_SCOPE` (`path LIKE '/v1/%' OR path LIKE '/api/%'`), so rows such as `/health`, `/metrics`, `/openapi.json` and `/admin/*` are still stored but never appear in lists, charts, KPIs or failure stats |
+| `GET` | `/v1/management/requests/{id}` | A single detail row (request/response bodies truncated to 8 KB, sensitive fields redacted) |
+| `GET` | `/v1/management/stats/timeseries` | Time-series aggregation: `bucket=hour\|day`, each bucket with `count` / `errors` / `p95` |
+| `GET` | `/v1/management/stats/distribution` | Grouped counts: `group_by=upstream\|model\|status`, returning `{group_by, start, end, items:[{key, count}]}`; `status` only splits into `ok` (<400) / `error` (≥400), and rows with no matched upstream are counted under `-` |
+| `GET` | `/v1/management/stats/failures` | Failure stats: `by_code` / `by_upstream` / `samples` |
+| `GET` | `/v1/management/api-test/models` | Available models, defaults and masked keys per API family: `kinds` is keyed by `generate` / `chat` / `messages` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch`, each with `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source` (which config field the options came from) / `models[]` (`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key` (masked) / `unknown`) / `default_model` / `api_key` (masked) / `api_key_env`; the top level also carries `max_response_bytes`. With `api_models` empty the lists are derived from the config; the native `/api/...` endpoints (`generate`, `embed_ollama`) list only models of `type: "ollama"` upstreams, while the `/v1/...` endpoints (`chat`, `messages`, `embed_openai`) also list `lmstudio` / `opencode` models; an explicit `api_models` list is returned as written. All upstreams are probed in one pass, so the whole console shares a single cache, refreshed on first open and on "probe again" |
+| `POST` | `/v1/management/api-test` | Body `{"kind": "generate", "body": {...}}`; the server issues the request through the gateway's own service and returns an envelope with `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`. A `kind` outside the allowlist, or a model-requiring family without `model` → `400` |
+| `POST` | `/v1/management/bench` | Starts a speed-test job, body `{"upstream": "...", "model": "...", "rounds"?: 4, "max_tokens"?: 500, "think"?: "auto"}`, returning `{"job_id": "...", "status": "pending"}` immediately; the job runs in the background |
+| `GET` | `/v1/management/bench/history` | The most recent **3** speed tests for that `upstream` + `model` (`?upstream=&model=`), newest first, each row with `decode_tok_s` / `decode_sd` / `prefill_tok_s` / `ttft_ms` / `timing_source` and the full `payload`. **Registered before `/bench/{job_id}`**, otherwise "history" would be read as a job id |
+| `GET` | `/v1/management/bench/{job_id}` | Polls a job: `status` is `pending` / `running` / `done` / `failed`, `progress` is `{completed, total, warmup}`; on success `result` carries the per-round detail and the `steady` summary, on failure `error` explains why |
+| `GET` | `/v1/management/api-keys` | Caller API key list (**session cookie only**): `{items: [{id, masked, label, source, created_at}], total}`, where `source` is `console` (minted in the console) or `file` (imported from the environment on first start). Masks only — neither plaintext nor hashes |
+| `POST` | `/v1/management/api-keys` | Mints a new key (**session cookie only**): body `{"label": "..."}`, `label` required (empty → `400`, longer than 100 characters → `422`), `201` returns `{item, secret}`. **This response is the only time the plaintext ever leaves the server**; no endpoint can return it again |
+| `DELETE` | `/v1/management/api-keys/{id}` | Revokes a key (**session cookie only**): `200` returns `{"deleted": id}`, an unknown `id` → `404`. The in-memory verification set reloads immediately, so the very next request fails |
 
-**状态码：**
+**Status codes:**
 
-| 码 | 场景 |
+| Code | Situation |
 |----|------|
-| `200` | 正常 |
-| `400` | 时间格式非法、`start > end`、`page`/`page_size`/`status`/`bucket`/`group_by` 取值非法、`api-test` 的 `kind` 不在白名单或该家族要求模型却没给 `model` |
-| `401` | 既无有效会话 Cookie 也无网关 API Key；或登录密码、用户名错误；或把 `ADMIN_PASSWORD` 当成请求头凭据 |
-| `404` | `upstream` 名称或请求记录 `id` 不存在 |
-| `503` | 未配置 `ADMIN_PASSWORD`；探测的上游不可达（`upstreams/{name}`）；`/admin` 的前端尚未构建（`app/web` 缺失） |
+| `200` | Normal |
+| `400` | Malformed timestamps, `start > end`, an invalid `page`/`page_size`/`status`/`bucket`/`group_by`, or an `api-test` `kind` outside the allowlist / a model-requiring family without `model` |
+| `401` | Neither a valid session cookie nor a gateway API key; a wrong login password or user name; `ADMIN_PASSWORD` presented as a request credential; or `/api-keys` reached with only a gateway API key (those three accept the session cookie alone) |
+| `404` | Unknown `upstream` name, request-log `id`, or `api-keys/{id}` |
+| `503` | `ADMIN_PASSWORD` not configured; the probed upstream is unreachable (`upstreams/{name}`); the `/admin` frontend has not been built (`app/web` missing) |
 
-**分布与配置投影示例：**
+**Distribution and config projection examples:**
 
 ```json
 // GET /v1/management/stats/distribution?group_by=upstream
@@ -947,7 +1084,7 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
              { "key": "lmstudio", "count": 380 },
              { "key": "-", "count": 12 } ] }
 
-// group_by=status 只有两个键：ok（status < 400）与 error（status >= 400）
+// group_by=status has only two keys: ok (status < 400) and error (status >= 400)
 
 // GET /v1/management/tools/websearch
 { "enabled": true, "endpoint": "/v1/tools/web-search", "upstream": "opencode",
@@ -956,122 +1093,190 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
   "api_key": "••••••", "timeout": 300.0, "provider_configured": true }
 ```
 
-`base_url` / `upstream_type` 由 `websearch.upstream`（未指名时取第一个 `type: "opencode"` 上游）派生，
-与 `WebSearchService` 的路径解析用的是同一函数 `Config.websearch_upstream_obj()`；
-`api_key` 只回报 `websearch.api_key_env` 所指环境变量是否已设置，值永远不外泄。
+`base_url` / `upstream_type` are derived from `websearch.upstream` (the first `type: "opencode"` upstream when
+none is named) through the same helper `WebSearchService` uses, `Config.websearch_upstream_obj()`;
+`api_key` only reports whether the environment variable named by `websearch.api_key_env` is set — the value
+never leaves the server.
 
-**请求日志（SQLite）：**
+**Request log (SQLite):**
 
-每笔请求在 `requests` 表中占一行，字段覆盖请求参数、耗时与响应结果：
+Every request occupies one row in the `requests` table, covering request parameters, timings and the result:
 
-| 分类 | 字段 |
+| Group | Fields |
 |------|------|
-| 时间 | `ts`（到达）、`ts_end`（完成，流式在流关闭时写入）、`duration_ms`、`ttfb_ms`；`ts`/`ts_end` 精确到秒，亚秒耗时看 `duration_ms` |
-| 请求 | `method`、`path`、`query`、`requested_model`（客户端写的名字）、`model`（别名解析后）、`request_body`、`req_size`、`stream`、`client_ip` |
-| 结果 | `status`、`upstream`、`response_body`、`res_size`、`tokens_in`、`tokens_out`、`tokens`、`error` |
-| 标记 | `request_body_truncated`、`response_body_truncated` |
+| Timing | `ts` (arrival), `ts_end` (completion; for streams, when the stream closes), `duration_ms`, `ttfb_ms`; `ts`/`ts_end` are second-precision, so read sub-second durations from `duration_ms` |
+| Request | `method`, `path`, `query`, `requested_model` (the name the client sent), `model` (after alias resolution), `request_body`, `req_size`, `stream`, `client_ip` |
+| Result | `status`, `upstream`, `response_body`, `res_size`, `tokens_in`, `tokens_out`, `tokens`, `error` |
+| Flags | `request_body_truncated`, `response_body_truncated` |
 
-- **token 用量分方向入库**：`tokens_in` / `tokens_out` 分别是输入（提示）与输出（生成）的 token 数，
-  取自 OpenAI 兼容响应的 `usage.prompt_tokens` / `usage.completion_tokens`，或 Ollama 响应里的
-  `prompt_eval_count` / `eval_count`；`tokens` 继续保存总量，优先采用上游自己回报的 `total_tokens`
-  （它计入推理 token 时会大于两者之和）。上游没有回报用量时三列都是 `NULL`，与真实的 `0` 可区分。
-- **入库开关**：`config.yaml` 的 `request_log.enabled`（默认 `true`）逐请求读取，无需重启。
-  关掉后代理不再采集请求/响应体、也不写库，`/overview` 与 `/requests` 里的
-  `request_log.enabled` 会回报 `false`；改回 `true` 即恢复记录。
-  配置热加载每秒最多比对一次文件 mtime，所以开关在**约 1 秒内**生效（已实测）。
-  数据库路径与保留天数仍由环境变量决定。
-- 默认写入 `config.yaml` 同级目录的 `llmhub.db`（容器内即 `/data/llmhub.db`），WAL 模式；
-  可用 `REQUEST_LOG_DB` 覆盖路径、`REQUEST_LOG_RETENTION_DAYS`（默认 30，0 表示永久保留）控制清理。
-- 旧库自动升级：启动时比对 `PRAGMA table_info(requests)`，缺失的列用 `ALTER TABLE ADD COLUMN` 补齐。
-- 写入通过有界内存队列异步批量落盘，不阻塞转发主链路；队列满时丢弃并告警。
-- 请求/响应体截断至 8 KB，`authorization`、`api_key`、`token`、`password` 等字段在落库前替换为 `***`。
-- **`HEAD` 请求只转发、不记录**：它没有请求体也没有响应体，且监控探活会持续发送，记下来只会淹没真实
-  调用。转发路径照旧，写入判定只在 `logging_on = self._logging_on(cfg) and method != "HEAD"` 一处。
-  （按默认的 `allowed_http_methods: [GET, POST]`，HEAD 根本到不了代理，直接 `405`。）
+- **Token usage is stored per direction**: `tokens_in` / `tokens_out` are the input (prompt) and output
+  (generation) token counts, taken from `usage.prompt_tokens` / `usage.completion_tokens` on
+  OpenAI-compatible responses or `prompt_eval_count` / `eval_count` on Ollama responses; `tokens` keeps the
+  total and prefers the upstream's own `total_tokens` when reported (it exceeds the sum of the two once
+  reasoning tokens are counted). When the upstream reports no usage, all three are `NULL`, which stays
+  distinguishable from a genuine `0`.
+- **Logging switch**: `request_log.enabled` in `config.yaml` (default `true`) is read per request, no restart
+  needed. Turned off, the proxy stops capturing bodies and writing rows, and `request_log.enabled` in
+  `/overview` and `/requests` reports `false`; turning it back on resumes logging. Config hot reload compares
+  the file mtime at most once per second, so the switch takes effect in **about a second** (measured). The
+  database path and retention stay environment-driven.
+- Rows go to `llmhub.db` next to `config.yaml` (`/data/llmhub.db` in the container), WAL mode;
+  `REQUEST_LOG_DB` overrides the path, `REQUEST_LOG_RETENTION_DAYS` (default 30, 0 = keep forever) controls
+  pruning.
+- Old databases upgrade automatically: on startup `PRAGMA table_info(requests)` is compared and missing
+  columns are added with `ALTER TABLE ADD COLUMN`.
+- Writes go through a bounded in-memory queue and land in batches, never blocking the forwarding path; a full
+  queue drops rows and logs a warning.
+- Request/response bodies are truncated to 8 KB, and `authorization`, `api_key`, `token`, `password` and
+  similar fields are replaced with `***` before they are stored.
+- **`HEAD` requests are forwarded but not logged**: they carry no bodies, and uptime probes send them
+  constantly, so recording them would only bury real calls. Forwarding is unchanged; the only gate is
+  `logging_on = self._logging_on(cfg) and method != "HEAD"`. (With the default
+  `allowed_http_methods: [GET, POST]`, HEAD never reaches the proxy anyway — it gets a `405`.)
 
-**模型测速（bench，实现在 `app/bench.py` + `app/bench_store.py`）：**
+**Caller API keys (stored in SQLite, implemented in `app/key_store.py`):**
 
-口径与 `D:/apps/ollama/bench_llm.mjs` 一致，纯 Python 实现，不依赖 Node：
+A key is no longer a line in a key file but a row in the `api_keys` table of `llmhub.db`, minted and revoked
+from the console at any time:
 
-- **预热**：默认 1 轮不计入统计；正式 4 轮，取均值 / 标准差 / 最小 / 最大 / 变异系数。
-- **TTFT**：首 token 到达的墙钟时间（毫秒）。注意 Ollama 的非流式请求拿不到首 token 时刻，所以测速**始终走流式**。
-- **Decode（tok/s）**：优先用服务端回报的 `eval_duration`（Ollama `/api/chat`）或 `usage` + `timings.predicted_ms`（OpenAI 兼容），缺失时回落客户端墙钟；口径写在 `timing_source`：`server` / `client` / `client*`（流式但不带服务端计时）。
-- **Prefill（tok/s）**：`prompt_eval_duration` / `prompt_ms` → 提示 token 数 / 秒，同样回落客户端。
-- **思考模型**：模型名命中 `qwen3` / `deepseek-r1` / `reasoning` 等模式时自动加 `think: false`（Ollama）或最小推理预算，避免思考链把 decode 拉低；`think` 参数可显式覆盖（`auto` / `true` / `false`）。
-- **模型名对齐**：先请求上游的模型列表做 preflight，按「精确 → 归一化（去 `:latest`）→ 子串」顺序解析；找不到直接报错，不会静默测到别的模型。
-- **代理**：内部 `httpx.AsyncClient` 使用 `trust_env=False`，与网关主客户端一致——本机若导出 `HTTP_PROXY`，否则打上游的请求会被绕到代理上（表现为 `502`）。
-
-结果落在 `llmhub.db` 的 `bench_results` 表（与 `requests` 同库，WAL）：
-
-| 分类 | 字段 |
+| Field | Description |
 |------|------|
-| 标识 | `id`、`upstream`、`model`、`created_at`（任务完成时刻） |
-| 目标 | `server`（`ollama` / `lm`）、`host`、`port` |
-| 参数 | `rounds`、`warmup`、`max_tokens` |
-| 指标 | `decode_tok_s`（均值）、`decode_sd`、`prefill_tok_s`、`ttft_ms`、`timing_source`、`prompt_tokens`、`gen_tokens` |
-| 明细 | `payload`（完整 JSON：逐轮数据 + `steady` 汇总 + `config`） |
+| `id` | Autoincrement primary key, used by `DELETE /api-keys/{id}` |
+| `hash` | Lowercase hex `sha256(plaintext)`, `UNIQUE` — **no plaintext in the database** |
+| `masked` | Display mask, computed and stored at mint time so the list view reconstructs nothing |
+| `label` | Description (max 100 characters), required at mint time |
+| `source` | `console` = minted in the console; `file` = imported from the environment on first start |
+| `created_at` | Creation time, second-precision ISO UTC |
 
-每个 `(upstream, model)` **只保留最新 3 份**：写入后按 `created_at DESC, id DESC` 删除第 4 份及更早的记录。
-任务本身只存在内存（`_BENCH_JOBS`，上限 200 条，完成后被清扫），进程重启后旧 job_id 一律 `404`——历史成绩请走 `/bench/history`。
+- **Fixed format and length**: `sk-hub-` + 40 base62 characters (sampled from `secrets`) = **47 characters**,
+  about 238 bits of randomness. The prefix is not part of the secret; it makes a leaked string recognisable at
+  a glance in logs and client configs. The mask keeps the prefix plus the first and last 4 characters of the
+  body (`sk-hub-FNdc…SVvw`); keys imported from a file may have any shape (e.g. `sk-...`), so they degrade to
+  the first 8 and last 4 characters of the whole string, and anything 12 characters or shorter is all dots.
+- **Why SHA-256 and not bcrypt/argon2**: a generated key is 238 bits of randomness with no weak passphrase to
+  brute-force, and the gateway verifies a key on **every** client request; a slow KDF would add tens of
+  milliseconds to each call, turning the gateway into its own DoS target, without protecting a secret nobody
+  can guess. A database leak reproduces no usable credential either.
+- **Verification stays in memory**: `ApiKeyStore` loads every hash into a `frozenset` at startup and `verify()`
+  is a single set lookup, so the request path never touches SQLite. Every write (mint / revoke / import)
+  reloads the set, so a new key works immediately and a revoked one dies immediately, with no restart.
+- **Imported once, only into an empty table**: the first start writes the keys from `GATEWAY_API_KEYS` /
+  `GATEWAY_API_KEYS_FILE` (or `.keys` next to `CONFIG_PATH`) with `source: "file"`, and **the file is never
+  read again** — a key revoked in the console does not come back after a restart, and editing the file adds
+  nothing. With `auth.enabled` and zero keys in the table (and no IP allowlist) startup is refused, with an
+  error telling you to feed the empty table through the environment first. After the import, any key left in
+  the environment that is not in the table is logged at startup, masked, one by one, because those credentials
+  no longer work.
+- The legacy `auth.api_keys:` in `config.yaml` is still shown read-only; a key written there is ignored with a
+  warning. The secrets themselves never live in `config.yaml`.
 
-任务跑在**独立线程 + 独立事件循环**里，不占用 `POST /bench` 那个请求的生命周期；结果行先入写队列再置 `done`，
-`/bench/history` 读之前会先 flush 队列，所以「状态刚变 done 就查历史」也能读到记录。
+**Model speed test (bench, implemented in `app/bench.py` + `app/bench_store.py`):**
 
-**接口测试（api-test，实现在 `app/api_test.py`）：**
+The methodology matches `bench_llm.mjs`, in pure Python with no Node dependency:
 
-管理台每个 API 文档块的「请求参数」标题右侧都有一个**测试**按钮，点开是浮层里的测试窗口
-（不是嵌在文档下方），但浏览器不能直接调业务端点：`/api/generate`、
-`/v1/rerank` 这些路径校验的是**调用方** API Key，而管理台的会话 Cookie 故意不是（见
-`admin_auth.require_admin`）。所以请求在**服务端**执行——`POST /v1/management/api-test` 把
-页面填好的 body 重建成一个真实的 ASGI `Request`，交给网关处理该端点用的**同一个服务**
-（`ProxyService.forward` / `RerankService.handle` / `SystemOneService.handle` /
-`WebSearchService.handle`）。别名解析、固化参数注入、`num_ctx_overrides` 收窄、被封禁的
-路径、请求明细入库全都与外部调用者一致，页面显示的就是 API 真实行为。
+- **Warm-up**: one round by default, excluded from the stats; then 4 measured rounds, reported as mean /
+  standard deviation / min / max / coefficient of variation.
+- **TTFT**: wall-clock time until the first token (milliseconds). Note that a non-streaming Ollama request
+  never exposes that moment, so the test **always streams**.
+- **Decode (tok/s)**: prefers the server-reported `eval_duration` (Ollama `/api/chat`) or `usage` +
+  `timings.predicted_ms` (OpenAI-compatible), falling back to the client's wall clock; the basis is recorded in
+  `timing_source`: `server` / `client` / `client*` (streamed but without server timings).
+- **Prefill (tok/s)**: `prompt_eval_duration` / `prompt_ms` → prompt tokens per second, falling back the same
+  way.
+- **Thinking models**: when the model name matches patterns such as `qwen3` / `deepseek-r1` / `reasoning`, the
+  test adds `think: false` (Ollama) or a minimal reasoning budget so a chain of thought does not drag decode
+  down; the `think` parameter overrides this explicitly (`auto` / `true` / `false`).
+- **Model name alignment**: the upstream's model list is fetched first as a preflight, then resolved exact →
+  normalised (dropping `:latest`) → substring; no match is an error rather than silently testing another model.
+- **Proxy**: the internal `httpx.AsyncClient` uses `trust_env=False`, like the gateway's main client — with
+  `HTTP_PROXY` exported on the host, requests to the upstream would otherwise be routed through it
+  (manifesting as `502`).
 
-- `KINDS` 是**封闭白名单**（7 个 kind 映射到 `proxy` / `rerank` / `systemone` / `websearch`
-  四类执行器），每个 kind 的上游仍由正常路由决定，因此这一组路由不会被改写成访问任意地址的代理。
-- 模型选择框按 `api_models` 的家族收窄（见 USAGE 的配置参考）：每个选项**只列名字或别名**，
-  上游、设备与运行状态放在悬停提示里；被其它家族显式认领的名字不再出现在 generate/chat 里
-  （`api_models.embed` / `rerank` / `systemone` 与 `rerank.models`，比较时忽略 `:latest`）。
-  `api_models.websearch` 不算认领——搜索端点本质是聊天透传，托管 provider 的路由模型
-  （如 `opencode/auto`）必须继续可选；`systemone.model` 这类兜底同样不算。
-  `free_model`（`systemone` 的 laya-server 枚举、`websearch` 的 opencode-port 模型 id）的下拉
-  末尾多一项「自定义模型…」，选中后换成可手输的输入框，因为这两个端点本就不经网关解析模型；
-  再选回列表里的名字即可收起。测试窗口一打开就带着各参数的初始值，
-  「恢复默认值」重新填入，「清空」则把每一项置空。**模型同样可以清除**：字段旁的 ×（或下拉的
-  空白项）清空后请求体不带 `model`——需要模型的家族由窗口先拦下提示「请先选择模型」，
-  `systemone` / `websearch` 则交给端点决定（System One 仍按配置注入 `systemone.model`）。
-  「恢复默认值」会重新选中 `default_model`，「清空」也一并清掉模型。**有文档默认值的布尔参数渲染为复选框**，
-  勾选与否都会显式发送 `true` / `false`；其余空值不会出现在请求体里，端点于是使用自己的默认。
-  两个 LLM 窗口的 `stream` 初始为 `false`（端点缺省流式，测试窗口先要单个 JSON）；generate
-  另有 `think` 复选框（默认关闭，Ollama 原生顶层字段），chat 提供 OpenAI 兼容的
-  `reasoning_effort`（Ollama 用 `none` 关闭思考）。
-- 凭据永远不外泄：上游 `headers` 里的 key 与 `systemone.api_key_env` /
-  `websearch.api_key_env` 所指环境变量一律回报为 `••••••`，页面据此显示只读掩码行。
-- 响应最多回传 `max_response_bytes`（128 KB）并在 `truncated` 里标注——测试窗口是看回答的，
-  不是下载回答的。流式响应逐块收集，`ttft_ms` 是首块到达时刻；`_drain` 会关闭迭代器，
-  代理的生成器正是在 `aclose` 时写库，所以测试过的调用同样出现在「请求明细」里。
-- 信封里的 `stream` 是**网关选择的传输方式**，与请求明细的 `stream` 列同源：调用方没写
-  `stream` 时按 `proxy.STREAM_BY_DEFAULT` 决定。响应是否真的分块到达要看 `content_type`
-  是不是 `application/x-ndjson` / `text/event-stream`——管理台就是据此决定「流式」标签与
-  「首字」耗时是否显示，避免把一整个 JSON 对象说成流。
-- 网关与上游的拒绝答复不会被吞：`400`（请求体不合法）、`404`（模型路由不到 / 功能已停用）、
-  `413`（超大）、`503`（找不到 provider / provider 未部署）、`502`·`504`（上游连不上或超时）都原样
-  装进信封（`ok: false`、`error: "HTTP 404"`），页面与真实调用者看到同一件事。只有路由层自己的
-  拒绝才走 HTTP 状态（`kind` 不在白名单、该家族没给 `model` → `400`）。
+Results land in the `bench_results` table of `llmhub.db` (same file as `requests`, WAL):
 
-**网关边界：** `/v1/management` 与 `/admin` 一样不受 `security.path_allowlist` 限制（它使用
-独立的会话认证），但仍受 HTTP 方法白名单、客户端 IP 白名单与速率限制约束。管理台只读，
-不提供任何修改 `config.yaml` 的写接口。两组成员会**真的向外发请求**：测速（`/bench`）额外写
-`bench_results` 表，接口测试（`/api-test`）只像一次普通调用那样写请求明细，两者都不碰配置。
+| Group | Fields |
+|------|------|
+| Identity | `id`, `upstream`, `model`, `created_at` (when the job finished) |
+| Target | `server` (`ollama` / `lm`), `host`, `port` |
+| Parameters | `rounds`, `warmup`, `max_tokens` |
+| Metrics | `decode_tok_s` (mean), `decode_sd`, `prefill_tok_s`, `ttft_ms`, `timing_source`, `prompt_tokens`, `gen_tokens` |
+| Detail | `payload` (full JSON: per-round data + `steady` summary + `config`) |
+
+Only the newest **3** rows are kept per `(upstream, model)`: after each insert, rows from the 4th on are
+deleted by `created_at DESC, id DESC`. Jobs themselves live in memory only (`_BENCH_JOBS`, capped at 200
+entries, swept once finished), so old job ids return `404` after a restart — use `/bench/history` for past
+results.
+
+A job runs on its **own thread and event loop**, so it does not live inside the `POST /bench` request; the
+result row enters the write queue before the job turns `done`, and `/bench/history` flushes the queue before
+reading, so querying history the instant a job reports `done` still finds the row.
+
+**API tester (api-test, implemented in `app/api_test.py`):**
+
+Every API doc block in the console has a **Test** button to the right of its "Request parameters" heading,
+opening the tester in a popup (not inline under the docs). The browser cannot call a business endpoint
+directly: `/api/generate`, `/v1/rerank` and friends authenticate the **caller** with a gateway API key, and the
+console session cookie deliberately is not one (see `admin_auth.require_admin`). So the request runs
+**server-side** — `POST /v1/management/api-test` rebuilds the body from the form into a real ASGI `Request` and
+hands it to the **same service** the gateway uses for that endpoint (`ProxyService.forward` /
+`RerankService.handle` / `SystemOneService.handle` / `WebSearchService.handle` / `MessagesService.handle`).
+Alias resolution, pinned parameter injection, `num_ctx_overrides` clamping, blocked paths and request-log
+capture all behave exactly as they do for an external caller, so the page shows the API's real behaviour.
+
+- `KINDS` is a **closed allowlist** (8 kinds mapping onto `proxy` / `rerank` / `systemone` / `websearch` /
+  `messages` executors), and each kind's upstream is still chosen by normal routing, so this route cannot be
+  turned into a proxy for an arbitrary address.
+- The model selector is narrowed by the `api_models` family (see the config reference in USAGE): every option
+  shows **only a name or alias**, with upstream, device and running state in the tooltip; names explicitly
+  claimed by another family no longer appear under generate/chat (`api_models.embed` / `rerank` / `systemone`
+  plus `rerank.models`, comparing with `:latest` ignored). `api_models.websearch` does not count as a claim —
+  the search endpoint is chat passthrough at heart, so a managed provider's routing model (such as
+  `opencode/auto`) must stay selectable; fallbacks like `systemone.model` do not count either. For
+  `free_model` values (`systemone`'s laya-server enum, `websearch`'s opencode-port model ids) the dropdown ends
+  with a "custom model…" item that swaps into a free-text input, because those two endpoints never resolve the
+  model through the gateway; picking a listed name again collapses it. The tester opens pre-filled with each
+  parameter's initial value, "restore defaults" refills them and "clear" empties every field. **The model can be
+  cleared too**: after the × next to the field (or the blank item in the dropdown), the body carries no
+  `model` — families that need one are stopped by the tester with "pick a model first", while
+  `systemone` / `websearch` leave the decision to the endpoint (System One still injects `systemone.model` from
+  config). "Restore defaults" re-selects `default_model`, and "clear" clears the model as well. **Boolean
+  parameters with a documented default render as checkboxes**, and both states are sent explicitly as `true` /
+  `false`; other empty values are omitted from the body so the endpoint applies its own default. The three LLM
+  testers start with `stream` off (the endpoints stream by default; the tester wants one JSON object first);
+  generate also offers a `think` checkbox (off by default, Ollama's native top-level field), and chat offers
+  the OpenAI-compatible `reasoning_effort` (Ollama uses `none` to disable thinking).
+- Credentials never leak: keys in upstream `headers` and the environment variables named by
+  `systemone.api_key_env` / `websearch.api_key_env` are always reported as `••••••`, and the page renders them
+  as read-only mask rows.
+- Responses are capped at `max_response_bytes` (128 KB) with `truncated` set — a tester is for reading an
+  answer, not downloading one. A streaming response is collected chunk by chunk and `ttft_ms` is when the
+  first chunk arrived; `_drain` closes the iterator, and the proxy's generator writes the log row on
+  `aclose`, so tested calls show up in "request details" as well.
+- The envelope's `stream` is **the transport the gateway chose**, from the same source as the `stream` column
+  in the request log: when the caller sent no `stream`, `proxy.STREAM_BY_DEFAULT` decides. Whether the response
+  actually arrived in chunks is a question for `content_type` — `application/x-ndjson` / `text/event-stream` —
+  and the console keys the "streaming" badge and the first-token timing off that, so a single JSON object is
+  never described as a stream.
+- Gateway and upstream refusals are not swallowed: `400` (invalid body), `404` (model unroutable / feature
+  disabled), `413` (too large), `503` (no provider / provider not deployed), `502`·`504` (upstream unreachable
+  or timed out) all land in the envelope (`ok: false`, `error: "HTTP 404"`), so the page sees exactly what a
+  real caller would. Only refusals by the routing layer itself use the HTTP status (`kind` outside the
+  allowlist, or a model-requiring family without `model` → `400`).
+
+**Gateway boundary:** `/v1/management` is exempt from `security.path_allowlist` the same way `/admin` is (it
+uses session authentication of its own), but it is still subject to the HTTP method allowlist, the client IP
+allowlist and rate limiting. The console is read-only: it exposes no write endpoint for `config.yaml`. Two
+groups of endpoints **do** send real requests outward: the speed test (`/bench`) additionally writes to
+`bench_results`, and the API tester (`/api-test`) only writes a request-log row like any other call — neither
+touches the config.
 
 ---
 
-## 流式响应
+## Streaming responses
 
-### OpenAI 格式 (SSE)
+### OpenAI format (SSE)
 
-设置 `"stream": true` 启用流式响应：
+Set `"stream": true` to enable streaming:
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
@@ -1079,26 +1284,26 @@ curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
-    "messages": [{"role": "user", "content": "你好"}],
+    "messages": [{"role": "user", "content": "hello"}],
     "stream": true
   }'
 ```
 
-**响应格式 (Server-Sent Events)：**
+**Response format (Server-Sent Events):**
 
 ```
 data: {"id":"chatcmpl-abc","choices":[{"delta":{"role":"assistant","content":""},"index":0}]}
 
-data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":"你"},"index":0}]}
+data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":"he"},"index":0}]}
 
-data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":"好"},"index":0}]}
+data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":"llo"},"index":0}]}
 
 data: {"id":"chatcmpl-abc","choices":[{"finish_reason":"stop","index":0}]}
 
 data: [DONE]
 ```
 
-### Ollama 格式 (NDJSON)
+### Ollama format (NDJSON)
 
 ```bash
 curl http://localhost:8888/api/chat \
@@ -1106,51 +1311,62 @@ curl http://localhost:8888/api/chat \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
-    "messages": [{"role": "user", "content": "你好"}],
+    "messages": [{"role": "user", "content": "hello"}],
     "stream": true
   }'
 ```
 
-**响应格式 (NDJSON)：**
+**Response format (NDJSON):**
 
 ```json
-{"model":"qwen3:8b","message":{"role":"assistant","content":"你"},"done":false}
-{"model":"qwen3:8b","message":{"role":"assistant","content":"好"},"done":false}
+{"model":"qwen3:8b","message":{"role":"assistant","content":"he"},"done":false}
+{"model":"qwen3:8b","message":{"role":"assistant","content":"llo"},"done":false}
 {"model":"qwen3:8b","done":true,"done_reason":"stop"}
 ```
 
-`/api/generate`（`response` 字段）与 `/api/chat`、`/v1/chat/completions`、`/v1/completions`
-一样属于**缺省即流式**的端点：请求体不写 `stream` 时按流式转发，与 Ollama 行为一致。
+`/api/generate` (the `response` field), like `/api/chat`, `/v1/chat/completions` and `/v1/completions`, is a
+**stream-by-default** endpoint: omit `stream` and the request is forwarded as a stream, matching Ollama.
+
+### Anthropic Messages format (SSE)
+
+With `"stream": true` on `/v1/messages`, the gateway re-sequences the upstream chunks into the Anthropic event
+stream (`message_start` → `content_block_start` → `content_block_delta*` → `content_block_stop` →
+`message_delta` → `message_stop`). Each delta looks like this:
+
+```
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"he"}}
+```
 
 ---
 
-## 错误响应
+## Error responses
 
-所有错误响应遵循统一格式：
+Every error response follows one shape:
 
 ```json
 {
-  "detail": "错误描述信息"
+  "detail": "description of what went wrong"
 }
 ```
 
-### 错误状态码
+### Error status codes
 
-| 状态码 | 错误类型 | 说明 |
+| Status | Type | Description |
 |--------|----------|------|
-| `400` | Bad Request | 无效 JSON、缺少必填字段或请求格式错误 |
-| `401` | Unauthorized | 缺少 API 密钥 |
-| `403` | Forbidden | API 密钥无效、IP 不在白名单或端点被阻止 |
-| `404` | Not Found | 未知端点或模型未找到 |
-| `405` | Method Not Allowed | 不支持的 HTTP 方法（由 `security.allowed_http_methods` 决定，默认仅 GET/POST）；`/api/generate`、`/v1/rerank`、`/v1/systemone`、`/v1/tools/web-search` 这类只接受 POST 的端点还会带上 `Allow: POST` |
-| `413` | Request Entity Too Large | 请求体超过大小限制 (默认 32MB) |
-| `422` | Unprocessable Entity | 请求体验证失败 |
-| `502` | Bad Gateway | 上游不可达或返回错误 |
-| `504` | Gateway Timeout | 上游响应超时 |
+| `400` | Bad Request | Invalid JSON, a missing required field, or a malformed request |
+| `401` | Unauthorized | No API key supplied |
+| `403` | Forbidden | Invalid API key, IP outside the allowlist, or a blocked endpoint |
+| `404` | Not Found | Unknown endpoint, or the model was not found |
+| `405` | Method Not Allowed | Unsupported HTTP method (governed by `security.allowed_http_methods`, GET/POST only by default); POST-only endpoints such as `/api/generate`, `/v1/rerank`, `/v1/systemone` and `/v1/tools/web-search` also send `Allow: POST` |
+| `413` | Request Entity Too Large | Body exceeds the size limit (32 MB by default) |
+| `422` | Unprocessable Entity | Body validation failed |
+| `502` | Bad Gateway | The upstream is unreachable or returned an error |
+| `504` | Gateway Timeout | The upstream timed out |
 
-### 错误示例
+### Error examples
 
-**缺少 API 密钥 (401)：**
+**Missing API key (401):**
 
 ```bash
 curl http://localhost:8888/v1/models
@@ -1162,7 +1378,7 @@ curl http://localhost:8888/v1/models
 }
 ```
 
-**无效的 API 密钥 (403)：**
+**Invalid API key (403):**
 
 ```bash
 curl http://localhost:8888/v1/models -H "Authorization: Bearer wrong-key"
@@ -1174,7 +1390,7 @@ curl http://localhost:8888/v1/models -H "Authorization: Bearer wrong-key"
 }
 ```
 
-**模型未找到 (404)：**
+**Model not found (404):**
 
 ```bash
 curl http://localhost:8888/api/chat \
@@ -1188,7 +1404,7 @@ curl http://localhost:8888/api/chat \
 }
 ```
 
-**端点被阻止 (403)：**
+**Blocked endpoint (403):**
 
 ```bash
 curl http://localhost:8888/api/delete \
@@ -1202,7 +1418,7 @@ curl http://localhost:8888/api/delete \
 }
 ```
 
-**请求体过大 (413)：**
+**Body too large (413):**
 
 ```json
 {
@@ -1210,7 +1426,7 @@ curl http://localhost:8888/api/delete \
 }
 ```
 
-**上游不可达 (502)：**
+**Upstream unreachable (502):**
 
 ```json
 {
@@ -1218,7 +1434,7 @@ curl http://localhost:8888/api/delete \
 }
 ```
 
-**上游超时 (504)：**
+**Upstream timeout (504):**
 
 ```json
 {
@@ -1228,16 +1444,18 @@ curl http://localhost:8888/api/delete \
 
 ---
 
-## 别名参数注入
+## Alias parameter injection
 
-通过配置别名，可以自动替换模型名称并注入参数。
+An alias both renames the model and injects parameters.
 
-> 根 `aliases:` 声明的每一项都是**一个独立模型**：目标模型仍然可以直接调用、也仍按它自己的默认参数运行，
-> 而别名带自己的固化参数。Web 管理台因此把它单独列成一行（设备沿用目标模型所在实例，显存显示 `-`，
-> KPI 的运行中模型数不重复计数）。若只想给已有模型换一个短名、不注入任何参数，用
-> `upstreams[].model_aliases`——那只改显示名与调用名，不会新增模型。
+> Every entry under a root `aliases:` block is **a model of its own**: the target model stays callable and
+> keeps running with its own defaults, while the alias carries its own pinned parameters. That is why the
+> console lists it as a separate row (device inherited from the target's instance, VRAM shown as `-`, and not
+> counted twice in the KPI). If you only want a shorter name for an existing model with no injected
+> parameters, use `upstreams[].model_aliases` — that changes the display and call name without creating a new
+> model.
 
-**配置示例：**
+**Configuration example:**
 
 ```yaml
 aliases:
@@ -1247,10 +1465,10 @@ aliases:
       think: false
 ```
 
-**使用示例：**
+**Usage example:**
 
 ```bash
-# 使用别名（自动映射到 qwen3.5:4b 并注入 think=false）
+# Using the alias (mapped to qwen3.5:4b with think=false injected)
 curl http://localhost:8888/api/chat \
   -H "Authorization: Bearer sk-gateway-example-key" \
   -d '{
@@ -1262,11 +1480,11 @@ curl http://localhost:8888/api/chat \
 
 ---
 
-## 工具调用
+## Tool calling
 
-支持 OpenAI 格式的工具调用（tool_calls）。
+OpenAI-style tool calls (`tool_calls`) are supported.
 
-**请求示例：**
+**Request example:**
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
@@ -1274,17 +1492,17 @@ curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3:8b",
-    "messages": [{"role": "user", "content": "读取 main.py"}],
+    "messages": [{"role": "user", "content": "Read main.py"}],
     "tools": [
       {
         "type": "function",
         "function": {
           "name": "read_file",
-          "description": "读取文件内容",
+          "description": "Read a file's contents",
           "parameters": {
             "type": "object",
             "properties": {
-              "path": {"type": "string", "description": "文件路径"}
+              "path": {"type": "string", "description": "File path"}
             },
             "required": ["path"]
           }
@@ -1294,7 +1512,7 @@ curl http://localhost:8888/v1/chat/completions \
   }'
 ```
 
-**响应示例：**
+**Response example:**
 
 ```json
 {

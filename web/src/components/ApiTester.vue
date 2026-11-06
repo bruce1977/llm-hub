@@ -631,7 +631,6 @@ const truncationNote = computed(() => t('apiTester.truncated', { size: fmtInt(ma
 
 .check input {
   margin: 2px 0 0;
-  accent-color: var(--violet);
 }
 
 .key-name {

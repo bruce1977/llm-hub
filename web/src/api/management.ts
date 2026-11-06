@@ -2,6 +2,9 @@ import type { AxiosResponse } from 'axios'
 
 import { http } from './client'
 import type {
+  ApiKeyCreated,
+  ApiKeyDeleted,
+  ApiKeysResponse,
   ApiTestContext,
   ApiTestKind,
   ApiTestResult,
@@ -29,7 +32,8 @@ import type {
 } from '@/types/api'
 
 // One wrapper per management endpoint. Every route is a read-only GET except the three auth
-// routes, the speed test and the API testers; see docs/API.md "管理 API（Web 管理台）".
+// routes, the speed test, the API testers and the API key list (which mints and revokes);
+// see docs/API.md "管理 API（Web 管理台）".
 // The generics are what gives every view a typed `data` - a renamed backend field becomes a
 // compile error here first.
 export const api = {
@@ -87,4 +91,12 @@ export const api = {
   configGet: (): Promise<AxiosResponse<ConfigPayload>> => http.get<ConfigPayload>('/config'),
   configSave: (config: ConfigPayload): Promise<AxiosResponse<{ ok: boolean; reloaded: boolean }>> =>
     http.put('/config', { config }, { timeout: 20000 }),
+
+  // Caller API keys. The list is masked (only hashes are stored); creating one returns the
+  // plaintext exactly once, and revoking is the only other action the console offers.
+  apiKeys: (): Promise<AxiosResponse<ApiKeysResponse>> => http.get<ApiKeysResponse>('/api-keys'),
+  apiKeyCreate: (label: string): Promise<AxiosResponse<ApiKeyCreated>> =>
+    http.post<ApiKeyCreated>('/api-keys', { label }),
+  apiKeyDelete: (id: number): Promise<AxiosResponse<ApiKeyDeleted>> =>
+    http.delete<ApiKeyDeleted>(`/api-keys/${id}`),
 }

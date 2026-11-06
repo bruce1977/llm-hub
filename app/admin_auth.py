@@ -8,10 +8,14 @@ protected admin routes depend on ``require_admin``.
 
 ``require_admin`` accepts two credentials:
   * the signed session cookie (what the console uses -- it never sees the password);
-  * a gateway API key from ``auth.api_keys``, presented as ``Authorization: Bearer`` or
+  * a gateway API key from the ``api_keys`` table, presented as ``Authorization: Bearer`` or
     ``X-API-Key`` (what scripts and headless calls use).
 The admin password itself is never a request credential: sending it in those headers is
 a 401, because it would defeat the point of a login page.
+
+``require_admin_session`` is the cookie-only variant, used by the routes that mint or revoke
+those keys: a client key is what an already-issued caller holds, so accepting one there would
+let any client hand out more of itself.
 
 Design notes:
   * No external dependencies. The session token is ``<expiry>.<signature>`` where the
@@ -32,8 +36,9 @@ import hmac
 import os
 import time
 
-from auth import extract_api_key, key_matches
+from auth import extract_api_key
 from fastapi import Cookie, HTTPException, Request, status
+from key_store import get_store
 
 ADMIN_COOKIE_NAME = "llmhub_admin"
 ADMIN_USERNAME = "admin"
@@ -77,10 +82,11 @@ def _gateway_key_authorized(request: Request) -> bool:
     """
     manager = getattr(request.app.state, "manager", None)
     cfg = getattr(manager, "config", None)
-    if cfg is None or not cfg.auth.enabled or not cfg.auth.api_keys:
+    store = get_store()
+    if cfg is None or not cfg.auth.enabled or store is None or store.count() == 0:
         return False
     candidate = extract_api_key(request)
-    return bool(candidate) and key_matches(candidate, cfg.auth.api_keys)
+    return bool(candidate) and store.verify(candidate)
 
 
 async def require_admin(
@@ -105,4 +111,27 @@ async def require_admin(
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Admin authentication required: sign in, or send a gateway API key.",
+    )
+
+
+async def require_admin_session(
+    admin_cookie: str | None = Cookie(default=None, alias=ADMIN_COOKIE_NAME),
+) -> None:
+    """FastAPI dependency for the routes that mint or revoke API keys.
+
+    Only the signed session cookie counts here: a gateway API key is what any client already
+    holds, so accepting one would let that client issue itself more access. A request that
+    arrives with a key but no console session is told to sign in.
+    """
+    key = get_admin_password()
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin is not configured: set the ADMIN_PASSWORD environment variable.",
+        )
+    if verify_admin_token(admin_cookie, key):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Console sign-in required: this endpoint creates or revokes credentials.",
     )

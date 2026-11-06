@@ -1267,11 +1267,29 @@ tr:last-child td {
   min-width: 150px;
 }
 
+/* Every control that shares a row measures the same box. Element's default component size
+   (the datetime pickers on Dashboard and Requests) and a native `select` both come out at
+   32px; the text inputs and the filter buttons are pinned to it so one row cannot mix heights.
+   `input.inp` rather than `.inp` because Settings and the upstream card use that class on
+   `<textarea>`s, which must keep the height their `rows` give them. */
+.sel,
+input.inp,
+.filters .btn {
+  height: 32px;
+}
+
 .sel:focus,
 .inp:focus,
 .dt:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+/* A native checkbox otherwise keeps the browser's own accent - a purple that belongs to no
+   part of this console - so every checked box, in the API testers and in Settings alike, takes
+   the theme accent like the buttons, links and focus rings beside it do. */
+input[type='checkbox'] {
+  accent-color: var(--accent);
 }
 
 /* ---------- native form layout (Settings console) ---------- */

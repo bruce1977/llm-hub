@@ -7,6 +7,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (caller API keys stored as hashes in SQLite, with a console page to mint and revoke)
+
+- **API keys moved out of the file and into the database.** `app/key_store.py` keeps one row per key in
+  the `api_keys` table of `llmhub.db` and stores only `sha256(<plaintext>)` (lowercase hex) plus a
+  display mask — **the database never holds a secret**, so a copied `.db` cannot be replayed. A slow
+  KDF (bcrypt/argon2) would only buy milliseconds of offline-cracking time against a 238-bit random
+  string while costing every single request, so a plain SHA-256 comparison against an in-memory
+  `frozenset` is what the gateway uses. Verification happens entirely in memory: `auth.py` asks
+  `get_store().verify(key)` and the hot path never opens sqlite
+- **New key format**: `sk-hub-` + 40 base62 characters — 47 characters in total, generated with
+  `secrets.choice`. The mask keeps the prefix plus the first 4 and last 4 characters
+  (`sk-hub-7Kp2…Q9df`); a legacy key that does not match the format masks head 8 / tail 4, and
+  anything 12 characters or shorter is shown as `••••••` with nothing of it visible
+- **`GATEWAY_API_KEYS` / the `.keys` file now only seed an empty table.** On the very first start, when
+  the table has no row, the environment keys are imported (`source: "file"`, no label) and logged as
+  seeded. Afterwards the file is not read for authentication: editing it changes nothing, and a key
+  revoked in the console stays revoked across restarts. Keys in the environment that no row serves
+  are reported once at startup as masks
+- **Three new management routes** — `GET /v1/management/api-keys` (list: `id` / `masked` / `label` /
+  `source` / `created_at`, newest first), `POST` (body `{label}`, label required → **201** with
+  `{item, secret}`; blank → **400**, over 100 characters → **422**) and `DELETE /api-keys/{id}`
+  (**200**, unknown or already-revoked id → **404**). A minted key authenticates gateway calls
+  immediately, and revoking one takes effect immediately too. Unlike every other management route,
+  these three accept the console **session cookie only** (`require_admin_session`): a gateway API key is
+  what any client already holds, so accepting one here would let a caller issue itself more access
+- **Console page ⚿ API Key 管理** (`/admin/api-keys`, entered from the account menu, no sidebar row):
+  the list shows mask, description and creation time (`source` stays in the API payload but gets no
+  column); *New key* opens a modal
+  that asks for a description and then displays the plaintext **exactly once**, with a copy button that
+  falls back to `execCommand('copy')` and then to selecting the field when the clipboard is refused.
+  Closing that modal loses the plaintext for good. Revoking is deliberately two-step (the row's button
+  becomes *Confirm revoke* / *Cancel*), and a fourth card states the format, what is stored, how it is
+  checked and where the keys came from
+
+### Added (Anthropic Messages API: `POST /v1/messages`, plus the `Models · LLM → API 用法` doc and tester)
+
+- **New caller endpoint `POST /v1/messages`** (Anthropic Messages compatible), with the singular alias
+  `POST /v1/message`. The gateway translates the request into the OpenAI chat shape and forwards it to
+  the upstream — Ollama `/api/chat` or `/v1/chat/completions` — then wraps the answer back in the
+  Anthropic envelope (`id` / `type: message` / `role` / `content: [{type:text,text}]` /
+  `stop_reason` / `usage:{input_tokens,output_tokens}`). Accepts `Authorization: Bearer` or `x-api-key`
+- **Streaming follows the Anthropic SSE order** (`message_start` → `content_block_start` →
+  `content_block_delta*` → `content_block_stop` → `message_delta` → `message_stop`); an upstream error is
+  surfaced as an `event: error` rather than a dropped connection. `usage` is rebuilt from the upstream's
+  native token counts (`prompt_eval_count`/`eval_count` for Ollama, `prompt_tokens`/`completion_tokens`
+  for OpenAI-compatible)
+- **`model` defaults to `auto`** (the default upstream's first declared model). An unset `default_upstream`
+  now means *no* default: an unresolvable model returns `404` instead of silently routing to the first
+  upstream — `config.default_upstream_obj()` was changed to return `None` when no default is configured
+- **Console: `Models · LLM → API 用法`** gained a third entry — Messages (Anthropic compatible) — with a
+  parameter table, request/response examples, and an inline **Test** window that runs server-side through
+  the same `MessagesService` the gateway uses (alias resolution, parameter injection and the request log
+  behave exactly like an external call). The API tab counter now reads 3
+- Docs: `docs/API.md` has a new Messages section; `docs/USAGE.md` / `docs/USAGE_CN.md` note the third
+  generation endpoint
+
+### Changed (docs: API and DEPLOY are bilingual, one changelog)
+
+- **`docs/API.md` and `docs/DEPLOY.md` now exist in both languages.** The unsuffixed file is English and
+  the Chinese text moved to `docs/API_CN.md` / `docs/DEPLOY_CN.md` (`git mv`, so history follows), matching
+  the `USAGE.md` / `USAGE_CN.md` convention that was already in place. Internal links were relocalised:
+  `USAGE.md` points at English anchors (`#web-search-opencode-gateway-proxy`,
+  `#messages-anthropic-compatible`), `USAGE_CN.md` at `API_CN.md`, and the README doc map now lists
+  `API_CN.md` / `DEPLOY_CN.md` on the Chinese side
+- **`CHANGELOG_CN.md` removed** — the changelog is English only from here on. The README language strip and
+  the directory tree in AGENTS.md point at the single file
+- **`DEPLOY` grew a local-run path**: the Windows launcher that used to hide under the build-script section
+  is now a top-level "Running locally (no Docker)" section with the manual `venv` + `uvicorn` steps, and the
+  console-bundle section is a sibling of it rather than a subsection of the scripts
+- **AGENTS.md gains a Documentation section** with the rules this cleanup settled on: one language pair per
+  doc with the English file unsuffixed, changelog English only, a three-row README doc map showing file
+  names without paths, descriptions that match the target's real headings, README images in `docs/images/`,
+  identical heading structure and anchors across a pair, code copied rather than translated, and cross-links
+  updated in the same pass. "Adding New Endpoint" now spells out the two-language documentation step and the
+  console-tester wiring
+
+### Changed (request statistics count API calls only)
+
+- The Requests list, its statistics bar and the Dashboard timeseries/distribution charts now scope
+  every query with `path LIKE '/v1/%' OR path LIKE '/api/%'` (`request_log.API_PATH_SCOPE`). Rows for
+  other paths (the health check, monitoring probes) are still captured and still open by `id` —
+  `GET /v1/management/requests/{id}` is deliberately unscoped — they simply no longer dilute request
+  counts, P50/P95/P99 and the error rate, which used to be dominated by a HEAD or a `/health` poll
+  every second
+
+### Added (console: Traditional Chinese)
+
+- A third locale, `web/src/i18n/messages/zh-TW.ts`. All three message files share one schema
+  (`MessageSchema = typeof zhCN`), so a missing key in 繁體中文 or English is a `vue-tsc` error rather
+  than a silent fallback, and `npm run build` fails before a half-translated bundle ships
+- The language submenu (account menu → 语言 / Language) now lists **简体中文 / 繁體中文 / English** —
+  the `soon` placeholder is gone — from one data-driven `SUPPORTED_LOCALES` list whose labels stay in
+  their own language. The current locale gets a `✓`, the choice persists in `localStorage`, `<html lang>`
+  follows it and Element Plus' own widgets (date panel, pagination) switch with it, because the
+  `zh-cn` / `zh-tw` / `en` locale bundles are wired through `el-config-provider`
+- A browser `zh-TW` / `zh-HK` / `zh-MO` / `zh-Hant` tag now opens the console in Traditional Chinese
+  (`localeFromTag()`); a bare `zh` keeps Simplified, as before
+
+### Fixed (console: checkbox accent colour and one control height)
+
+- Native checkboxes inherited the browser's own accent — a purple that belongs to nothing else in this
+  console. Every checked box in the API testers and on the Settings page now takes
+  `accent-color: var(--accent)`, so it matches the buttons, links and focus rings beside it
+- Controls sharing a row are one box high. The datetime range pickers on Dashboard and Requests render
+  at Element Plus' default 32px while the text inputs, native selects and filter buttons did not, so
+  the Requests filter row visibly stepped. `.sel`, `input.inp` and `.filters .btn` are pinned to 32px
+  (`input.inp`, not `.inp`, because that class is also on Settings' `<textarea>`s, which must keep the
+  height their `rows` give them)
+
+### Changed (console: alias table layout, and Upstreams rows stay open together)
+
+- **The 别名与派生模型 table on Models · LLM lost its 说明 column**: the description is now the native
+  tooltip on the **name** and **target model** cells, and the five remaining columns are pinned to
+  24% / 12% / 24% / 14% / 26% with `table-layout: fixed` + `colgroup`, so a long name clips to an
+  ellipsis instead of pushing the whole table apart
+- **`Display name` and `Derived model` share one chip style** (`.chip.s2`); the text is the only
+  difference. Previously one was grey and the other violet, which read as two levels of importance
+- **Expanding an Upstreams row no longer collapses the others.** `expanded` and `detailBusy` became
+  arrays of upstream names, so several instances stay open at once, concurrent probes each keep their
+  own "probing" line, and clicking a row again closes only that row. The once-a-minute refresh now
+  re-probes every open row (`Promise.all`) instead of only the last one clicked
+
 ### Added (per-endpoint API testers on every `API 用法` tab, plus `api_models`)
 
 - **Every documented endpoint can now be called from the console**: the `API 用法` tab of Models · LLM,

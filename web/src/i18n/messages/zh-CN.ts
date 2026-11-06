@@ -22,6 +22,7 @@ const zhCN = {
     modelsSystemOne: '模型 · System One',
     toolsWebSearch: '工具 · 联网检索',
     settings: '设置',
+    apiKeys: 'API Key',
     about: '关于',
   },
 
@@ -35,11 +36,11 @@ const zhCN = {
     tools: '工具',
     language: '语言 / Language',
     languageAria: '语言',
-    languageSoon: '翻译中',
     darkMode: '深色模式',
     lightMode: '浅色模式',
     settings: '设置',
     about: '关于',
+    apiKeys: 'API Key 管理',
     signOut: '退出登录',
   },
 
@@ -309,7 +310,6 @@ const zhCN = {
       kindDerived: '派生模型',
       target: '目标模型',
       params: '固化参数',
-      description: '说明',
       upstream: '上游',
       empty: '未配置别名',
       note: '「显示别名」来自 upstreams[].model_aliases，只是给模型换个叫法，原名称照样能用；「派生模型」来自 aliases 节点，带自己的固化参数，是一个可以单独调用的新模型。',
@@ -320,7 +320,7 @@ const zhCN = {
       empty: '未固化任何模型的 num_ctx',
     },
     apiLead: {
-      body: '两个端点都由网关按 {model} 路由（别名解析 + 参数注入 + {overrides} 裁剪），响应原样透传。{strong}，与 Ollama 自身行为一致；非 {method} 方法一律 {code}。',
+      body: '三个端点都由网关按 {model} 路由（别名解析 + 参数注入 + {overrides} 裁剪），响应原样透传。{strong}，与上游自身行为一致；非 {method} 方法一律 {code}。',
       streamNote: '不写 {stream} 时按流式转发',
     },
     docs: {
@@ -330,6 +330,9 @@ const zhCN = {
       chatTitle: '聊天补全（OpenAI 兼容）',
       chatNote:
         '由 catch-all 透传，请求体除别名解析与参数注入外不改写；工具调用的 function.arguments 若被客户端写成 JSON 对象，网关会规范化为 Ollama gin 解析器要求的字符串。',
+      messagesTitle: '消息补全（Anthropic 兼容）',
+      messagesNote:
+        '网关把 Anthropic Messages 请求转换成 OpenAI 聊天格式再转发给上游（Ollama /api/chat 或 /v1/chat/completions），响应逆向包回 Anthropic 信封。支持 Bearer 或 x-api-key 鉴权，model 留空或 auto 时回落到默认上游首个模型。',
     },
     generateParams: {
       model: '网关路由名：config.yaml 声明的模型名或别名，先解析再转发',
@@ -356,6 +359,17 @@ const zhCN = {
       reasoningEffort: '思考强度（OpenAI 兼容）：none 关闭思考（Ollama），不设置则由后端决定',
       tools: '工具定义列表；function.arguments 必须是 JSON 字符串',
     },
+    messagesParams: {
+      model: '网关路由名：config.yaml 声明的模型名或别名；留空或 auto 时解析到默认上游首个模型',
+      system: '系统提示：字符串，或文本块数组 [{\'{\'}type:text, text{\'}\'}]',
+      messages: '消息列表，元素为 {\'{\'}role, content{\'}\'}（role ∈ user / assistant）；content 可为字符串或块数组（含 image 块）',
+      maxTokens: '最大生成 token 数（必填，>0）',
+      temperature: '采样温度（0-2）',
+      topP: '核采样概率上限（0-1）',
+      topK: '保留的候选 token 数（仅 Ollama 生效）',
+      stopSequences: '停止序列列表，命中即结束生成',
+      stream: '缺省 false，返回单个 JSON 信封；true 时返回 Anthropic SSE 事件流',
+    },
     /** Descriptions for the nested parameters the tester splits out on its own - the table
      *  above documents `options` as a single object. The input's own label already shows the
      *  dotted key, so these stay short. */
@@ -369,6 +383,7 @@ const zhCN = {
     responses: {
       generateNote: 'stream 缺省或为 true：每行一个 JSON 对象，最后一行 done: true',
       chatNote: 'stream 为 true 时改为 SSE，逐块 data: {\'{\'}...delta...{\'}\'}，以 data: [DONE] 结束',
+      messagesNote: 'stream 为 true 时返回 Anthropic SSE 事件流（message_start → content_block_delta* → message_stop）；false 时返回单个 JSON 信封，usage 由上游原生 token 计数重建（Ollama prompt_eval_count/eval_count，OpenAI prompt_tokens/completion_tokens）',
     },
     source: {
       server: '服务端计时',
@@ -772,6 +787,63 @@ const zhCN = {
       upstream: '上游',
       api_key_env: 'API Key 环境变量',
       path: '路径',
+    },
+  },
+
+  /** 调用方密钥（api_keys 表）：只存哈希，明文仅在生成的那一次可见。 */
+  apiKeys: {
+    sub: '调用方密钥的生成与撤销',
+    intro: {
+      title: '功能介绍',
+      tag: 'overview',
+      body: 'API Key 是调用网关时出示的凭证，保存在 llmhub.db 的 api_keys 表里。库里只存密钥的 SHA-256 哈希和一段掩码，明文只在你点击「生成密钥」的那次弹窗里出现一次，关闭之后就再也看不到；清单上能看到的是掩码、描述和创建时间，随时可以撤销。环境变量与 .keys 文件里的旧密钥只在表为空时导入一次，之后一律以数据库为准。',
+    },
+    list: {
+      title: '密钥清单',
+      tag: 'keys',
+      create: '新建密钥',
+      colKey: '密钥（掩码）',
+      colLabel: '描述',
+      colCreated: '创建时间',
+      colAction: '操作',
+      noLabel: '（无描述）',
+      revoke: '撤销',
+      confirmRevoke: '确认撤销',
+      revoking: '撤销中…',
+      cancel: '取消',
+      empty: '还没有密钥，点「新建密钥」生成一个。',
+      loadFailed: '无法读取密钥列表。',
+      note: '列表只显示掩码：库里存的是哈希，密钥丢了只能重新生成。',
+    },
+    format: {
+      title: '密钥格式与存储',
+      tag: 'format',
+      shape: '格式',
+      shapeValue: 'sk-hub- + 40 位随机字符，共 47 位',
+      stored: '数据库存储',
+      storedValue: 'SHA-256(明文) 与掩码，不含明文',
+      checked: '校验方式',
+      checkedValue: '请求时比对内存中的哈希，不查询数据库',
+      seeded: '首次导入',
+      seededValue: '环境变量与 .keys 只在表为空时导入一次，之后以数据库为准',
+    },
+    modal: {
+      title: '新建 API Key',
+      sub: '先写一句描述，日后才知道这把密钥给谁用。',
+      created: '已生成',
+      label: '描述',
+      labelPlaceholder: '例如：本地开发机 / CI 流水线',
+      labelHelp: '描述会显示在清单里，最长 100 个字符。',
+      generate: '生成密钥',
+      generating: '生成中…',
+      cancel: '取消',
+      close: '关闭',
+      secretWarn: '这是完整密钥唯一一次显示，请立即复制保存；关闭后无法再次查看。',
+      copy: '复制',
+      copied: '已复制',
+      copyFailed: '浏览器不允许复制，请手动选中文本再复制。',
+      masked: '掩码',
+      done: '我已保存',
     },
   },
 }

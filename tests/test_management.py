@@ -892,6 +892,47 @@ def run() -> int:
             str(r.json()["kpi"]),
         )
 
+        # ------------------------------------------------- stats path scope ---
+        # Anything outside /v1 and /api is a probe, a docs fetch or bot noise: still recorded,
+        # never counted. See request_log.API_PATH_SCOPE.
+        print("[6b] only /v1/* and /api/* are counted")
+
+        def counted() -> int:
+            return client.get("/v1/management/requests").json()["pagination"]["total"]
+
+        def raw_rows() -> list[tuple[int, str]]:
+            with sqlite3.connect(os.environ["REQUEST_LOG_DB"]) as conn:
+                return list(conn.execute("SELECT id, path FROM requests"))
+
+        scoped_total = counted()
+        scoped_ts = sum(p["count"] for p in client.get("/v1/management/stats/timeseries").json()["points"])
+        scoped_today = client.get("/v1/management/overview").json()["kpi"]["requests_today"]
+        before_raw = len(raw_rows())
+
+        for _ in range(3):
+            client.get("/metrics-probe", headers=GW)
+        time.sleep(0.8)  # the batched writer flushes within 0.5s
+
+        check("a non-API call is still recorded", len(raw_rows()) == before_raw + 3, f"{before_raw} -> {len(raw_rows())}")
+        check("the request list ignores it", counted() == scoped_total, f"{scoped_total} -> {counted()}")
+        check("the list filter cannot reach it", client.get("/v1/management/requests", params={"path": "metrics-probe"}).json()["rows"] == [])
+        check("the timeseries ignores it", sum(p["count"] for p in client.get("/v1/management/stats/timeseries").json()["points"]) == scoped_ts)
+        check("the distribution ignores it", sum(i["count"] for i in client.get("/v1/management/stats/distribution").json()["items"]) == scoped_total)
+        check("today's request KPI ignores it", client.get("/v1/management/overview").json()["kpi"]["requests_today"] == scoped_today)
+        check("the failures view ignores it", all("metrics-probe" not in str(s.get("path")) for s in client.get("/v1/management/stats/failures").json()["samples"]))
+
+        extra_id = next(id_ for id_, path in raw_rows() if path == "/metrics-probe")
+        deep = client.get(f"/v1/management/requests/{extra_id}")
+        check("a direct link to such a row still opens", deep.status_code == 200 and deep.json()["path"] == "/metrics-probe", f"got {deep.status_code}")
+
+        # And the scope must not distort what it keeps: an API path still counts.
+        client.post(
+            "/api/chat",
+            headers=GW,
+            json={"model": "qwen3:8b", "messages": [{"role": "user", "content": "scoped-api-check"}], "stream": False},
+        )
+        check("an API call still counts", counted() == scoped_total + 1, f"{scoped_total} -> {counted()}")
+
         # ------------------------------------------- allowlist exemption ---
         print("[7] perimeter exemptions")
         sec = client.app.state.manager.config.security
@@ -1058,7 +1099,7 @@ def run() -> int:
         kinds = ctx["kinds"]
         check(
             "one context block per documented endpoint",
-            set(kinds) == {"generate", "chat", "embed_ollama", "embed_openai", "rerank", "systemone", "websearch"},
+            set(kinds) == {"generate", "chat", "embed_ollama", "embed_openai", "rerank", "systemone", "websearch", "messages"},
             str(sorted(kinds)),
         )
         check("context publishes the response cap", ctx["max_response_bytes"] == 128 * 1024, str(ctx.get("max_response_bytes")))
@@ -1095,6 +1136,112 @@ def run() -> int:
             "the context never carries a credential value",
             "upstream-secret" not in r.text and "systemone-secret" not in r.text,
         )
+
+        ms = kinds["messages"]
+        check("messages shares the generate family", ms["family"] == "generate" and ms["endpoint"] == "/v1/messages", str(ms))
+        check("messages offers the chat model pool", "qwen3:8b" in {m["model"] for m in ms["models"]}, str([m["model"] for m in ms["models"]]))
+        check("messages requires a model", ms["model_required"] is True)
+
+        print("[10a] messages API (POST /v1/messages)")
+        # Non-stream: the default upstream is Ollama, so the mock answers on /api/chat and the
+        # gateway wraps it in the Anthropic Messages envelope.
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "qwen3:8b", "max_tokens": 64, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages non-stream -> 200", r.status_code == 200, r.text[:200])
+        body = r.json()
+        check("messages envelope type=message", body.get("type") == "message", str(body)[:200])
+        check(
+            "messages content is a text block",
+            body.get("content") == [{"type": "text", "text": "pong"}], str(body.get("content")),
+        )
+        check(
+            "messages usage mapped from Ollama",
+            body.get("usage") == {"input_tokens": 5, "output_tokens": 7}, str(body.get("usage")),
+        )
+        check("messages stop_reason end_turn", body.get("stop_reason") == "end_turn", str(body.get("stop_reason")))
+
+        # model: auto resolves to the default upstream's first declared model.
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"max_tokens": 64, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages model=auto -> 200", r.status_code == 200, r.text[:200])
+
+        # An alias (q35 -> qwen3:8b + think:False) is resolved before forwarding.
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "q35", "max_tokens": 64, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages alias model -> 200", r.status_code == 200, r.text[:200])
+
+        # Validation: missing messages / max_tokens.
+        r = client.post("/v1/messages", headers=GW, json={"model": "qwen3:8b", "max_tokens": 64})
+        check("messages missing messages -> 400", r.status_code == 400, f"got {r.status_code}")
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "qwen3:8b", "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages missing max_tokens -> 400", r.status_code == 400, f"got {r.status_code}")
+        # With strict=False an undeclared model falls back to the default upstream (the mock
+        # answers it), so 404 only fires when no default upstream exists.
+        patch_config(default_upstream="")
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "nope:9b", "max_tokens": 64, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages unknown model without default upstream -> 404", r.status_code == 404, f"got {r.status_code}")
+        patch_config(default_upstream="mock-ollama")
+
+        # The singular alias /v1/message also works.
+        r = client.post(
+            "/v1/message", headers=GW,
+            json={"model": "qwen3:8b", "max_tokens": 64, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages singular alias -> 200", r.status_code == 200, r.text[:200])
+
+        # Streaming: Ollama NDJSON from the mock becomes the Anthropic SSE event sequence.
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "qwen3:8b", "max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages stream -> 200", r.status_code == 200, f"got {r.status_code}")
+        sse_text = r.text
+        check("stream has message_start", "event: message_start" in sse_text, sse_text[:120])
+        check("stream has content_block_delta", "event: content_block_delta" in sse_text, sse_text[:120])
+        # Ollama streams token fragments ("po" then "ng") as separate deltas, so the text is
+        # not one contiguous substring - check the fragments reach the client instead.
+        check("stream carries first fragment", '"text":"po"' in sse_text, sse_text[:200])
+        check("stream carries second fragment", '"text":"ng"' in sse_text, sse_text[:200])
+        check("stream has message_stop", "event: message_stop" in sse_text, sse_text[:120])
+
+        # Messages through the server-side api-test executor (same path the console uses).
+        r = client.post(
+            "/v1/management/api-test", headers=GW,
+            json={"kind": "messages", "body": {"model": "qwen3:8b", "max_tokens": 64, "messages": [{"role": "user", "content": "ping"}]}},
+        )
+        check("api-test messages kind -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
+        at = r.json()
+        check("api-test messages status 200", at.get("status") == 200, str(at)[:200])
+        at_body = at.get("body") or {}
+        check(
+            "api-test messages returns Anthropic envelope",
+            at_body.get("type") == "message" and at_body.get("content") == [{"type": "text", "text": "pong"}],
+            str(at_body)[:200],
+        )
+
+        # OpenAI-compatible path: a temporary lmstudio upstream answers on /v1/chat/completions.
+        openai_up = {"name": "mock-openai", "type": "lmstudio", "base_url": f"http://127.0.0.1:{MOCK_PORT}", "models": ["lm-model:1b"]}
+        patch_config(upstreams=[*_CONFIG["upstreams"], openai_up])
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "lm-model:1b", "max_tokens": 64, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages OpenAI path -> 200", r.status_code == 200, r.text[:200])
+        ob = r.json()
+        check("messages OpenAI usage mapped", ob.get("usage") == {"input_tokens": 4, "output_tokens": 8}, str(ob.get("usage")))
+        patch_config(upstreams=_CONFIG["upstreams"])
 
         try:
             patch_config(api_models={"generate": ["q8", "qwen3:4b", "not:declared"]})
@@ -1255,6 +1402,94 @@ def run() -> int:
         )
         check("the test call itself never needed a caller API key", any(row.get("status") == 200 for row in logged), str(logged[:2]))
 
+        # --------------------------------------------------- caller API keys ---
+        print("[10c] caller API keys (management routes)")
+        import string
+
+        from key_store import KEY_LENGTH, KEY_PREFIX, LABEL_MAX_CHARS, ApiKeyStore, hash_key, mask_key
+
+        client.post("/v1/management/auth/logout")
+        check(
+            "a gateway API key cannot list the keys",
+            client.get("/v1/management/api-keys", headers=GW).status_code == 401,
+        )
+        check(
+            "a gateway API key cannot create a key",
+            client.post("/v1/management/api-keys", headers=GW, json={"label": "escalation"}).status_code == 401,
+        )
+        check(
+            "a gateway API key cannot revoke a key",
+            client.delete("/v1/management/api-keys/1", headers=GW).status_code == 401,
+        )
+        r = client.post("/v1/management/auth/login", json={"password": "admin-secret-pw"})
+        check("signing in opens the key console", r.status_code == 200, f"got {r.status_code}")
+
+        r = client.get("/v1/management/api-keys")
+        listing = r.json()
+        check("key list with the session cookie -> 200", r.status_code == 200, f"got {r.status_code}")
+        imported = [item for item in listing["items"] if item["source"] == "file"]
+        check("the environment key was imported on first start", len(imported) >= 1, str(listing)[:200])
+        check("an imported key reports the file as its source", all(i["source"] == "file" for i in imported))
+        check("an imported key carries no label", all(i["label"] == "" for i in imported))
+        check(
+            "the list shows a mask, never the plaintext",
+            API_KEY not in json.dumps(listing) and imported and imported[0]["masked"].endswith(API_KEY[-4:]),
+            str(imported),
+        )
+
+        r = client.post("/v1/management/api-keys", json={"label": "  console issued  "})
+        created = r.json()
+        check("create with a label -> 201", r.status_code == 201, f"got {r.status_code} {r.text[:160]}")
+        secret = created.get("secret", "")
+        item = created.get("item", {})
+        check("the generated key uses the sk-hub- prefix", secret.startswith(KEY_PREFIX), secret[:12])
+        check("the generated key has the fixed length", len(secret) == KEY_LENGTH, str(len(secret)))
+        check(
+            "the secret part is base62",
+            all(c in string.digits + string.ascii_letters for c in secret[len(KEY_PREFIX):]),
+            secret,
+        )
+        check("the label is trimmed on the way in", item.get("label") == "console issued", str(item))
+        check("the row records its source and creation time",
+              item.get("source") == "console" and "T" in str(item.get("created_at")), str(item))
+        check("the row only ever reports the mask", item.get("masked") == mask_key(secret) and secret not in json.dumps(item), str(item))
+        check(
+            "the plaintext appears in no later listing",
+            secret not in json.dumps(client.get("/v1/management/api-keys").json()),
+        )
+        check("a blank label -> 400", client.post("/v1/management/api-keys", json={"label": "   "}).status_code == 400)
+        check(
+            "an over-long label is rejected by validation",
+            client.post("/v1/management/api-keys", json={"label": "x" * (LABEL_MAX_CHARS + 1)}).status_code == 422,
+        )
+
+        bearer = {"Authorization": f"Bearer {secret}"}
+        check(
+            "a fresh key authenticates a gateway call at once",
+            client.get("/api/tags", headers=bearer).status_code == 200,
+        )
+        check("a fresh key opens the management API too", client.get("/v1/management/auth/ping", headers=bearer).status_code == 200)
+        check(
+            "the store verifies by hash, not by plaintext",
+            main.app.state.api_keys.verify(secret) and hash_key(secret) != secret,
+        )
+        check("a tampered key fails verification", not main.app.state.api_keys.verify(secret[:-1] + ("a" if secret[-1] != "a" else "b")))
+
+        key_id = item["id"]
+        check("revoke -> 200", client.delete(f"/v1/management/api-keys/{key_id}").status_code == 200)
+        check("revoking the same id twice -> 404", client.delete(f"/v1/management/api-keys/{key_id}").status_code == 404)
+        check("unknown id -> 404", client.delete("/v1/management/api-keys/999999").status_code == 404)
+        check("the revoked row disappears from the list", key_id not in {i["id"] for i in client.get("/v1/management/api-keys").json()["items"]})
+
+        # Signed out, so the remaining checks test the key itself rather than the session cookie.
+        client.post("/v1/management/auth/logout")
+        check("a revoked key stops authenticating", client.get("/api/tags", headers=bearer).status_code == 403)
+        check("a revoked key stops opening the management API", client.get("/v1/management/auth/ping", headers=bearer).status_code == 401)
+        check("without any credential the key list is closed", client.get("/v1/management/api-keys").status_code == 401)
+        check("the original environment key still works", client.get("/api/tags", headers=GW).status_code == 200)
+        # Later sections read the management API through the session cookie, so put it back.
+        client.post("/v1/management/auth/login", json={"password": "admin-secret-pw"})
+
     print("[11] tools/websearch projection")
 
 
@@ -1381,6 +1616,73 @@ def run() -> int:
         check("503 explains how to build", "npm run build" in r.json().get("detail", ""), r.text[:160])
     finally:
         main.CONSOLE_DIST = original_dist
+
+    # ---------------------------------------------------- key store unit ---
+    print("[14] API key store behaviour")
+    import asyncio
+    import string as _string
+
+    from key_store import (
+        KEY_LENGTH as _LEN,
+        KEY_PREFIX as _PREFIX,
+        LABEL_MAX_CHARS as _LABEL_MAX,
+        ApiKeyStore as _Store,
+        generate_key as _generate,
+        hash_key as _hash,
+        mask_key as _mask,
+    )
+
+    keys = [_generate() for _ in range(50)]
+    check("every generated key uses the prefix", all(k.startswith(_PREFIX) for k in keys))
+    check("every generated key has the fixed length", all(len(k) == _LEN for k in keys), str({len(k) for k in keys}))
+    check("the secret part is base62", all(c in _string.digits + _string.ascii_letters for k in keys for c in k[len(_PREFIX):]))
+    check("generated keys never repeat", len(set(keys)) == 50)
+    check("the hash is sha256 hex", len(_hash("x")) == 64 and _hash("x") == _hash("x") and _hash("x") != _hash("y"))
+    check(
+        "a generated mask keeps the prefix and 4+4 characters",
+        _mask(keys[0]) == f"{_PREFIX}{keys[0][len(_PREFIX):len(_PREFIX) + 4]}…{keys[0][-4:]}",
+        _mask(keys[0]),
+    )
+    check("an old-style key masks head and tail", _mask("sk-legacy-value-1234") == "sk-legac…1234", _mask("sk-legacy-value-1234"))
+    check("a short key is covered completely", _mask("abc123") == "••••••" and "abc123" not in _mask("abc123"))
+
+    unit_store = _Store(db_path=os.path.join(_TMP_DIR, "unit-keys.db"))
+
+    async def _unit() -> None:
+        await unit_store.start()
+        check("a fresh store holds no key", unit_store.count() == 0)
+        row, secret = await unit_store.create("unit issued")
+        check("create returns the row plus the plaintext", row["label"] == "unit issued" and len(secret) == _LEN)
+        check("the row is stored masked", row["masked"] == _mask(secret) and secret not in str(row))
+        check("the row records the console as its source", row["source"] == "console")
+        check("create makes the key verifiable at once", unit_store.verify(secret) is True)
+        check("verification is by hash, so the row is not the secret", unit_store.verify(secret + "x") is False)
+        check("a blank label is allowed but stays empty", (await unit_store.create("   "))[0]["label"] == "")
+        long_row = (await unit_store.create("x" * 500))[0]
+        check("an over-long label is truncated", len(long_row["label"]) == _LABEL_MAX, str(len(long_row["label"])))
+        listed = await unit_store.list_keys()
+        check("the list is newest first", listed[0]["id"] >= listed[-1]["id"] and len(listed) == 3, str(len(listed)))
+        check("listing exposes only the safe columns", set(listed[0]) == {"id", "masked", "label", "source", "created_at"}, str(set(listed[0])))
+        check("the newest row is not the plaintext", all("hash" not in item for item in listed))
+
+        imported = await unit_store.import_plaintext(["sk-from-file-a", "sk-from-file-b", "sk-from-file-a"])
+        check("importing skips a duplicate", imported == 2, str(imported))
+        again = await unit_store.import_plaintext(["sk-from-file-a", "sk-from-file-b"])
+        check("importing what is already stored adds nothing", again == 0, str(again))
+        file_rows = [item for item in await unit_store.list_keys() if item["source"] == "file"]
+        check("imported rows say so and carry no label", len(file_rows) == 2 and all(i["label"] == "" for i in file_rows))
+        check("an imported key verifies", unit_store.verify("sk-from-file-a") is True)
+        unserved = unit_store.unserved_env_keys(["sk-from-file-a", "sk-gone", ""])
+        check("the startup warning names only unserved keys", len(unserved) == 1, str(unserved))
+        check("the warning is a mask, never the key", unserved and "sk-gone" not in unserved[0], str(unserved))
+
+        removed = await unit_store.delete(row["id"])
+        check("delete answers True for a real id", removed is True)
+        check("a deleted key stops verifying", unit_store.verify(secret) is False)
+        check("deleting an unknown id answers False", await unit_store.delete(424242) is False)
+        check("the count follows the table", unit_store.count() == len(await unit_store.list_keys()))
+
+    asyncio.run(_unit())
 
     print(f"\n{'=' * 60}\nPASSED: {PASSED}  FAILED: {FAILED}\n{'=' * 60}")
     return 0 if FAILED == 0 else 1

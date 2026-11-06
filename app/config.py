@@ -577,12 +577,15 @@ class Config(BaseModel):
         return None
 
     def default_upstream_obj(self) -> UpstreamConfig | None:
-        if self.default_upstream:
-            found = self.get_upstream(self.default_upstream)
-            if found:
-                return found
-        # Falls back to the first upstream when not specified
-        return self.upstreams[0] if self.upstreams else None
+        """The explicitly configured default upstream, or ``None`` if none is set.
+
+        Unlike a silent "first upstream" fallback, an unset ``default_upstream`` means there
+        is no default: callers (proxy routing, the Messages API) then return 404 rather than
+        routing to an arbitrary upstream the operator never chose.
+        """
+        if not self.default_upstream:
+            return None
+        return self.get_upstream(self.default_upstream)
 
     def websearch_upstream_obj(self) -> UpstreamConfig | None:
         """Locate the upstream that provides web search.
@@ -865,7 +868,12 @@ class ConfigManager:
                 logger.info("Default config written to %s (edit upstreams and aliases as needed)", path)
             except Exception as exc:  # pragma: no cover
                 logger.error("Failed to write the default config: %s", exc)
-            return Config(**build_default_config())
+            cfg = Config(**build_default_config())
+            # The template is a first-run deployment, and a first run is exactly when the
+            # environment keys are seeded into the api_keys table - so they have to be applied
+            # here too, not only on the branch below that reads an existing file.
+            set_api_keys(collect_env_api_keys())
+            return cfg
 
         try:
             raw = yaml.safe_load(path.read_text(encoding="utf-8"))

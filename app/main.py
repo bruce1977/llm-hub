@@ -39,12 +39,14 @@ from config import CONFIG_PATH, ConfigManager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from key_store import ApiKeyStore, set_store
 from management import AdminLogin
 from management import login as admin_login
 from management import logout as admin_logout
 from management import router as management_router
 from proxy import ProxyService
 from bench_store import BenchStore
+from messages import MessagesService
 from request_log import RequestLog
 from rerank import RerankService
 from systemone import SystemOneService
@@ -101,15 +103,40 @@ async def lifespan(app: FastAPI):
     app.state.rerank = RerankService(manager, client)
     app.state.systemone = SystemOneService(manager, client)
     app.state.websearch = WebSearchService(manager, client)
+    app.state.messages = MessagesService(manager, client)
     app.state.bench_store = BenchStore()
     await app.state.bench_store.start()
+    app.state.api_keys = ApiKeyStore()
+    await app.state.api_keys.start()
+    set_store(app.state.api_keys)
     app.state.started_at = time.time()
+
+    # Caller keys are rows of `api_keys` in llmhub.db, kept as SHA-256 hashes. The environment
+    # (GATEWAY_API_KEYS / GATEWAY_API_KEYS_FILE / data/.keys) only seeds an *empty* table, so an
+    # existing deployment upgrades itself on its first run and, from then on, the file is never
+    # read again: a key revoked in the console stays revoked across restarts.
+    env_keys = [key for key in cfg.auth.api_keys if key]
+    if app.state.api_keys.count() == 0 and env_keys:
+        seeded = await app.state.api_keys.import_plaintext(env_keys)
+        logger.info(
+            "Seeded %d API key(s) from the environment into %s; manage them at /admin from now on",
+            seeded,
+            app.state.api_keys.db_path,
+        )
+    elif stale := app.state.api_keys.unserved_env_keys(env_keys):
+        logger.warning(
+            "Ignoring %d environment key(s) (%s): the api_keys table in %s became the source of "
+            "truth at first start, so create or revoke keys in the console",
+            len(stale),
+            ", ".join(stale),
+            app.state.api_keys.db_path,
+        )
 
     # Security self-check: never serve an authenticated gateway without any key - unless an
     # IP whitelist is configured, which is an explicit "trusted network" deployment: those
     # addresses skip the key check anyway (see auth._authorize), so refusing to start would
     # make a keys-free / docs-only setup impossible.
-    if cfg.auth.enabled and not cfg.auth.api_keys:
+    if cfg.auth.enabled and app.state.api_keys.count() == 0:
         if cfg.auth.allow_access_ip_whitelist:
             logger.warning(
                 "auth.enabled with no API key: running in trusted-network mode, only "
@@ -119,14 +146,15 @@ async def lifespan(app: FastAPI):
             )
         else:
             raise RuntimeError(
-                "Refusing to start: auth.enabled is true but no API key is configured. "
-                "Supply keys through the GATEWAY_API_KEYS environment variable (comma separated) "
-                "or GATEWAY_API_KEYS_FILE (path to a secret file such as data/.keys), "
-                "or turn auth off with auth.enabled=false."
+                "Refusing to start: auth.enabled is true but the api_keys table holds no key. "
+                "Seed the empty table with the GATEWAY_API_KEYS environment variable (comma "
+                "separated) or GATEWAY_API_KEYS_FILE (a secret file such as data/.keys) and "
+                "restart, then manage keys at /admin; or turn auth off with auth.enabled=false."
             )
 
     # Security self-check: refuse to start with weak/placeholder keys on a public gateway.
-    weak = find_weak_keys(cfg.auth.api_keys)
+    # Console-generated keys are 238-bit random, so only the environment ones can be weak.
+    weak = find_weak_keys(env_keys)
     if weak and cfg.security.fail_on_weak_keys:
         raise RuntimeError(
             "Refusing to start: weak/placeholder API keys detected -> "
@@ -779,6 +807,72 @@ async def route_models(request: Request, _auth=Depends(require_api_key)):
 @app.post("/api/rerank", include_in_schema=True, summary="Rerank documents (alias)", tags=["rerank"])
 async def route_rerank(request: Request, _auth=Depends(require_api_key)):
     return await rerank_response(request)
+
+
+# Anthropic Messages API bridge. The gateway translates the Anthropic request into the OpenAI
+# chat format each backend understands (Ollama /api/chat or /v1/chat/completions) and converts
+# the answer back. `POST /v1/message` is a singular alias of the standard `/v1/messages`.
+@app.post(
+    "/v1/messages",
+    include_in_schema=True,
+    summary="Anthropic Messages API (compatible)",
+    tags=["messages"],
+    openapi_extra={
+        "description": (
+            "Anthropic-compatible Messages endpoint. The gateway converts the request to the "
+            "OpenAI chat format for the resolved upstream and converts the reply back into the "
+            "Anthropic Messages envelope (id / type: message / role / content / stop_reason / "
+            "usage). stream=true emits the Anthropic SSE event sequence "
+            "(message_start -> content_block_delta -> message_stop)."
+        ),
+        "requestBody": {
+            "required": True,
+            "description": "Anthropic Messages request. 'messages' and 'max_tokens' are required.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["messages", "max_tokens"],
+                        "properties": {
+                            "model": {"type": "string", "default": "auto", "description": "Target model, or 'auto' for the default upstream's first model."},
+                            "max_tokens": {"type": "integer", "exclusiveMinimum": 0, "description": "Max tokens to generate."},
+                            "system": {
+                                "description": "System prompt (string or array of text blocks).",
+                                "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "object"}}],
+                            },
+                            "messages": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["role", "content"],
+                                    "properties": {
+                                        "role": {"type": "string", "enum": ["user", "assistant"]},
+                                        "content": {
+                                            "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "object"}}]
+                                        },
+                                    },
+                                },
+                            },
+                            "stream": {"type": "boolean", "default": False},
+                            "temperature": {"type": "number"},
+                            "top_p": {"type": "number"},
+                            "top_k": {"type": "integer"},
+                            "stop_sequences": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                }
+            },
+        },
+    },
+)
+@app.post("/v1/message", include_in_schema=True, summary="Anthropic Messages API (alias)", tags=["messages"])
+async def route_messages(request: Request, _auth=Depends(require_api_key)):
+    return await messages_response(request)
+
+
+async def messages_response(request: Request):
+    return await request.app.state.messages.handle(request)
 
 
 @app.get("/api/tags", include_in_schema=True, summary="List aggregated models (Ollama format)", tags=["models"])

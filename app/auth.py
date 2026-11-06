@@ -6,8 +6,9 @@ Supported key transports:
   - X-API-Key: <key>
   - ?api_key=<key>  (only when security.allow_query_api_key is enabled; disabled by default)
 
-Multiple keys are supported and compared in constant time to avoid timing side channels. The
-keys themselves come from the environment only (GATEWAY_API_KEYS / GATEWAY_API_KEYS_FILE).
+Multiple keys are supported. They live in the ``api_keys`` table of ``llmhub.db`` as SHA-256
+hashes (see ``key_store.py``) and are verified through that store's in-memory set, so no client
+request touches sqlite; the environment only seeds an empty table on first start.
 
 `auth.allow_access_ip_whitelist` holds regexes for client addresses that are exempt from the
 key check and may open /docs. It is matched against the TCP peer, never X-Forwarded-For.
@@ -15,13 +16,13 @@ key check and may open /docs. It is matched against the TCP peer, never X-Forwar
 
 from __future__ import annotations
 
-import hmac
 import ipaddress
 import logging
 import re
 from collections.abc import Iterable
 
 from fastapi import HTTPException, Request, status
+from key_store import get_store
 
 logger = logging.getLogger("llm_hub")
 
@@ -75,15 +76,6 @@ def extract_api_key(request: Request, allow_query: bool = False) -> str | None:
             return query_key.strip()
 
     return None
-
-
-def key_matches(candidate: str, valid_keys: Iterable[str]) -> bool:
-    """Constant-time comparison across all configured keys."""
-    matched = False
-    for key in valid_keys:
-        if hmac.compare_digest(candidate, key):
-            matched = True
-    return matched
 
 
 def is_weak_key(key: str) -> str | None:
@@ -199,7 +191,8 @@ async def _authorize(request: Request, cfg) -> str | None:
             headers={"WWW-Authenticate": WWW_AUTHENTICATE},
         )
 
-    if not key_matches(key, cfg.auth.api_keys):
+    store = get_store()
+    if store is None or not store.verify(key):
         logger.warning("Invalid API key: %s %s", request.method, path)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

@@ -319,6 +319,66 @@ const chatResponse = computed<ApiResponseSpec>(() => ({
   },
 }))
 
+const messagesParams = computed<ApiParam[]>(() => [
+  { name: 'model', type: 'string', required: false, desc: t('modelsLlm.messagesParams.model') },
+  { name: 'system', type: 'string | array', required: false, desc: t('modelsLlm.messagesParams.system') },
+  { name: 'messages', type: 'array', required: true, desc: t('modelsLlm.messagesParams.messages') },
+  { name: 'max_tokens', type: 'integer', required: true, desc: t('modelsLlm.messagesParams.maxTokens') },
+  { name: 'temperature', type: 'number', required: false, desc: t('modelsLlm.messagesParams.temperature') },
+  { name: 'top_p', type: 'number', required: false, desc: t('modelsLlm.messagesParams.topP') },
+  { name: 'top_k', type: 'integer', required: false, desc: t('modelsLlm.messagesParams.topK') },
+  { name: 'stop_sequences', type: 'string[]', required: false, desc: t('modelsLlm.messagesParams.stopSequences') },
+  { name: 'stream', type: 'boolean', required: false, desc: t('modelsLlm.messagesParams.stream') },
+])
+
+const messagesRequest = computed<ApiRequestSpec>(() => ({
+  method: 'POST',
+  path: '/v1/messages',
+  headers: authHeaders,
+  body: {
+    model: 'qwen3:8b',
+    max_tokens: 256,
+    system: '你是一个有帮助的助手',
+    messages: [{ role: 'user', content: '什么是机器学习？' }],
+    stream: false,
+  },
+}))
+
+const messagesResponse = computed<ApiResponseSpec>(() => ({
+  status: '200',
+  contentType: 'application/json',
+  note: t('modelsLlm.responses.messagesNote'),
+  body: {
+    id: 'msg_abc123',
+    type: 'message',
+    role: 'assistant',
+    model: 'qwen3:8b',
+    content: [{ type: 'text', text: '机器学习是人工智能的一个分支...' }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: 25, output_tokens: 100 },
+  },
+}))
+
+// The tester mirrors the parameter table above, minus `model` (the selector owns it).
+const messagesFields = computed<TestField[]>(() => [
+  {
+    key: 'messages',
+    label: t('modelsLlm.messagesParams.messages'),
+    type: 'json',
+    required: true,
+    def: '[{"role":"user","content":"Hello"}]',
+    wide: true,
+  },
+  { key: 'system', label: t('modelsLlm.messagesParams.system'), type: 'textarea', wide: true },
+  { key: 'max_tokens', label: t('modelsLlm.messagesParams.maxTokens'), type: 'number', def: '256' },
+  { key: 'temperature', label: t('modelsLlm.messagesParams.temperature'), type: 'number' },
+  { key: 'top_p', label: t('modelsLlm.messagesParams.topP'), type: 'number' },
+  { key: 'top_k', label: t('modelsLlm.messagesParams.topK'), type: 'number' },
+  { key: 'stop_sequences', label: t('modelsLlm.messagesParams.stopSequences'), type: 'lines', hint: t('common.onePerLine') },
+  { key: 'stream', label: t('modelsLlm.messagesParams.stream'), type: 'bool', def: 'false', hint: t('modelsLlm.tester.streamHint') },
+])
+
 // The tester forms mirror the parameter tables above, minus `model` (the selector owns it).
 // `def` is the value the window starts with; a boolean that has one is a checkbox and is always
 // sent explicitly, while an input left empty is kept out of the body.
@@ -410,7 +470,7 @@ onMounted(load)
       @click="tab = 'api'"
     >
       {{ t('modelsLlm.tabs.api') }}
-      <span class="count">2</span>
+      <span class="count">3</span>
     </button>
   </div>
 
@@ -496,7 +556,14 @@ onMounted(load)
         <span class="tag">config.yaml · aliases + upstreams[].model_aliases</span>
       </div>
       <div class="card tight">
-        <table>
+        <table class="alias-table">
+          <colgroup>
+            <col class="c-name" />
+            <col class="c-kind" />
+            <col class="c-target" />
+            <col class="c-upstream" />
+            <col class="c-params" />
+          </colgroup>
           <thead>
             <tr>
               <th>{{ t('modelsLlm.aliases.alias') }}</th>
@@ -504,24 +571,22 @@ onMounted(load)
               <th>{{ t('modelsLlm.aliases.target') }}</th>
               <th>{{ t('modelsLlm.aliases.upstream') }}</th>
               <th>{{ t('modelsLlm.aliases.params') }}</th>
-              <th>{{ t('modelsLlm.aliases.description') }}</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="a in data.aliases" :key="a.alias">
-              <td class="mono">{{ a.alias }}</td>
+              <td class="mono" :title="a.description || undefined">{{ a.alias }}</td>
               <td>
-                <span class="chip" :class="{ s2: a.kind === 'rename' }">{{
+                <span class="chip s2">{{
                   a.kind === 'rename' ? t('modelsLlm.aliases.kindRename') : t('modelsLlm.aliases.kindDerived')
                 }}</span>
               </td>
-              <td class="mono">{{ a.target }}</td>
+              <td class="mono" :title="a.description || undefined">{{ a.target }}</td>
               <td>{{ a.upstream || '—' }}</td>
               <td class="mono">{{ paramsText(a.params) || '—' }}</td>
-              <td>{{ a.description || '—' }}</td>
             </tr>
             <tr v-if="!data.aliases.length">
-              <td colspan="6" class="empty">{{ loaded ? t('modelsLlm.aliases.empty') : t('common.loading') }}</td>
+              <td colspan="5" class="empty">{{ loaded ? t('modelsLlm.aliases.empty') : t('common.loading') }}</td>
             </tr>
           </tbody>
         </table>
@@ -588,6 +653,16 @@ onMounted(load)
       :response="chatResponse"
       :note="t('modelsLlm.docs.chatNote')"
       :tester="{ kind: 'chat', fields: chatFields }"
+    />
+
+    <ApiDoc
+      :title="t('modelsLlm.docs.messagesTitle')"
+      tag="/v1/messages"
+      :params="messagesParams"
+      :request="messagesRequest"
+      :response="messagesResponse"
+      :note="t('modelsLlm.docs.messagesNote')"
+      :tester="{ kind: 'messages', fields: messagesFields }"
     />
   </template>
 
@@ -1020,5 +1095,35 @@ onMounted(load)
 
 .tip-err {
   color: var(--red);
+}
+
+.alias-table {
+  table-layout: fixed;
+}
+.alias-table .c-name,
+.alias-table .c-target {
+  width: 24%;
+}
+.alias-table .c-kind {
+  width: 120px;
+}
+.alias-table th:nth-child(2),
+.alias-table td:nth-child(2) {
+  text-align: center;
+}
+.alias-table td:nth-child(2) .chip.s2 {
+  margin-left: 0;
+}
+.alias-table .c-upstream {
+  width: 14%;
+}
+.alias-table .c-params {
+  width: 26%;
+}
+.alias-table th,
+.alias-table td {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 </style>

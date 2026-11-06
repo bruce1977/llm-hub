@@ -14,12 +14,12 @@ const upstreams = ref<ProbeResult[]>([])
 const lastUpdated = ref('')
 const loadError = ref('')
 const refreshing = ref(false)
-const expanded = ref('')
+const expanded = ref<string[]>([])
 // name -> probe + the models declared for it in config.yaml + what is resident in memory.
 // The 503 "unreachable" answer carries only a subset, hence Partial: the template guards
 // on `unreachable` before reading the model list.
 const details = ref<Record<string, Partial<UpstreamDetail>>>({})
-const detailBusy = ref('')
+const detailBusy = ref<string[]>([])
 let timer: ReturnType<typeof setInterval> | null = null
 
 async function load() {
@@ -30,8 +30,8 @@ async function load() {
     upstreams.value = data.upstreams ?? []
     lastUpdated.value = fmtClock(data.generated_at)
     loadError.value = ''
-    // Keep an open row in sync with the refreshed list.
-    if (expanded.value) await loadDetail(expanded.value)
+    // Keep every open row in sync with the refreshed list.
+    if (expanded.value.length) await Promise.all(expanded.value.map(loadDetail))
   } catch (error) {
     if (statusOf(error) !== 401) loadError.value = errorDetail(error)
   } finally {
@@ -40,7 +40,7 @@ async function load() {
 }
 
 async function loadDetail(name: string) {
-  detailBusy.value = name
+  detailBusy.value = [...detailBusy.value, name]
   try {
     const { data } = await api.upstream(name)
     details.value = { ...details.value, [name]: data }
@@ -56,16 +56,16 @@ async function loadDetail(name: string) {
       },
     }
   } finally {
-    detailBusy.value = ''
+    detailBusy.value = detailBusy.value.filter((n) => n !== name)
   }
 }
 
 async function toggle(name: string) {
-  if (expanded.value === name) {
-    expanded.value = ''
+  if (expanded.value.includes(name)) {
+    expanded.value = expanded.value.filter((n) => n !== name)
     return
   }
-  expanded.value = name
+  expanded.value = [...expanded.value, name]
   await loadDetail(name)
 }
 
@@ -184,9 +184,9 @@ onBeforeUnmount(() => {
               <td class="mono">{{ vramText(u) }}</td>
               <td class="mono">{{ u.reachable ? `${u.probe_ms} ms` : t('common.timeout') }}</td>
             </tr>
-            <tr v-if="expanded === u.name" class="row-expand">
+            <tr v-if="expanded.includes(u.name)" class="row-expand">
               <td colspan="6">
-                <div v-if="detailBusy === u.name && !details[u.name]" class="meta" style="color: var(--text-dim)">
+                <div v-if="detailBusy.includes(u.name) && !details[u.name]" class="meta" style="color: var(--text-dim)">
                   {{ t('upstreams.probing') }}
                 </div>
                 <div v-else-if="details[u.name]?.unreachable" class="meta" style="color: var(--red)">

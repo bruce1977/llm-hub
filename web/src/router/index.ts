@@ -29,6 +29,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'tools/websearch', name: 'tools-websearch', component: () => import('@/views/ToolsWebSearchView.vue') },
       { path: 'requests', name: 'requests', component: () => import('@/views/RequestsView.vue') },
       { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
+      { path: 'api-keys', name: 'api-keys', component: () => import('@/views/ApiKeysView.vue') },
       { path: 'about', name: 'about', component: () => import('@/views/AboutView.vue') },
     ],
   },

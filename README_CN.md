@@ -1,13 +1,20 @@
 # LLM Hub
 
-**在你所有模型前面放一个统一入口。** LLM Hub 夹在客户端（WorkBuddy、WeKnora、SDK、`curl`）和
-你已有的后端（多个 Ollama 实例、LM Studio、OpenCode 网关）之间：客户端只看到一个地址、一把
-API Key、一份模型列表，网关自己判断哪个实例真的有这个模型并转发过去。同时补齐 Ollama 缺的
-能力：**Rerank API**、**联网检索代理**、按别名强制注入参数（如 `think: false`），以及一个能看到
-上游状态和请求明细的**Web 管理台**。
+**LLM Hub 是一个自托管的 FastAPI 网关，把分散在多台机器、多张显卡上的本地大模型后端，收敛成一个 OpenAI 兼容的统一入口。**
 
-[English](README.md) · [完整使用手册](docs/USAGE_CN.md) · [接口文档](docs/API.md) ·
-[部署说明](docs/DEPLOY.md) · [更新日志](CHANGELOG_CN.md)
+本地跑大模型时，Ollama 实例往往不止一个：桌面独显一套、核显一套，NAS 上内网和公网
+再各挂一套，是再正常不过的部署。让每个客户端（WorkBuddy、WeKnora、SDK 或 `curl`）
+逐个去记端口、逐个去配密钥，维护起来很累；而 Ollama 原生又缺几样上层应用要用的能力
+——给 RAG 用的 rerank、联网检索，以及 Anthropic 风格的 Messages 接口。
+
+LLM Hub 把这些收敛成一个 `base_url`、一把密钥、一份模型清单：你只管在请求里写
+`model: "qwen3.5:4b-nothink"`，网关负责解析别名、挑出真正持有该模型的上游、注入固化
+参数，再把回答原样流式返回。除了路由，它还补齐了 Ollama 缺的三类接口（rerank、web
+search、Messages），支持按别名强制注入参数（如 `think: false`），并附带一个 Vue 管理台，
+提供实时请求明细、每模型测速与密钥管理。
+
+[English](README.md) · [完整使用手册](docs/USAGE_CN.md) · [接口文档](docs/API_CN.md) ·
+[部署说明](docs/DEPLOY_CN.md) · [更新日志](CHANGELOG.md)
 
 ![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
@@ -15,48 +22,50 @@ API Key、一份模型列表，网关自己判断哪个实例真的有这个模�
 ![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)
 ![i18n](https://img.shields.io/badge/i18n-中文%20%7C%20English-8B5CF6)
 
-```text
-clients                              llm-hub                                 backends
-┌────────────────────┐              ┌────────────────────┐              ┌────────────────────┐
-│ WorkBuddy          │              │ one base_url       │              │ Ollama GPU 11434   │
-│ WeKnora            │── one key ──▶│ one API key        │── model ────▶│ Ollama iGPU 11435  │
-│ curl / SDK         │              │ one model list     │              │ LM Studio          │
-│                    │              │ /admin console     │              │ OpenCode gateway   │
-└────────────────────┘              └────────────────────┘              └────────────────────┘
+<img src="docs/images/architecture-zh.png" width="820" alt="架构">
+
+## 管理网站
+
+网关的所有能力都能在 `/admin` 的 Vue 控制台里查看和操作：上游健康与显存、模型清单（含每模型
+测速：TTFT、decode / prefill 速度、最近三次）、可按条件筛选到单条请求的 SQLite 明细、Rerank
+的密钥与配置投影、API Key 的签发与吊销（列表只显示掩码），以及每个文档化接口参数表右上角的
+**测试**按钮。界面支持简体中文 / 繁體中文 / English，在左下角账户菜单切换。
+
+**总览** —— 上下游健康、显存占用、运行中的模型与请求趋势。
+
+<img src="docs/images/dashboard-zh.jpg" width="900" alt="总览 —— 上下游健康、显存、运行中模型、请求趋势">
+
+**模型 · LLM** —— 模型清单、运行态设备与显存、单模型测速。
+
+<img src="docs/images/models-llm-zh.jpg" width="900" alt="模型 · LLM —— 清单、运行态设备/显存、测速">
+
+## 如何部署
+
+### 本地部署（不经 Docker）
+
+```bash
+# 1. 安装依赖与准备配置
+pip install -r requirements.txt
+cp data/config.example.yaml data/config.yaml   # 上游、别名、rerank……
+cp .env.example .env                           # GATEWAY_API_KEYS、ADMIN_PASSWORD……
+# 编辑这两个文件：填真实上游地址和真实密钥
+
+# 2. 启动（自动加载 ../.env，保存即热重载）
+cd app
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 ```
 
-## 它解决什么
+Windows 可直接用 `scripts\start-local.bat`（首次加 `-Install`），它做同样的启动前检查并拉起
+uvicorn。打开 **<http://localhost:8000/admin/>**，用 `admin` + `ADMIN_PASSWORD` 登录；不设这个
+变量时管理台显示「未启用」，所有管理接口返回 503。改 `config.yaml` 约 1 秒热重载，不用重启。
 
-| | |
-|---|---|
-| **按模型路由** | 请求体里的 `model` 决定去哪个上游，客户端不用记端口。同一模型多处部署时按 `priority` 最小者优先。 |
-| **一层统一鉴权** | 多 Key 并存、常量时间比较、兼容 `Bearer` / `X-API-Key`。Key 只来自环境变量或密钥文件，不落 `config.yaml`。 |
-| **补齐 Ollama 缺的接口** | `POST /v1/rerank`（logprobs 或向量打分）与 `POST /v1/tools/web-search`，都路由到能提供服务的那个上游。 |
-| **别名与参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并注入 `think: false`；`aliases` 里的每一项都是一个独立模型，管理台单独列成一行，`model_aliases` 只负责改名。还可按模型固定 `num_ctx`，避免 Ollama 反复重建。 |
-| **流式原样透传** | NDJSON（`/api/chat`、`/api/generate`）与 SSE（`/v1/chat/completions`）不改写，计时字段一并保留。 |
-| **管理台 + 观测** | `/admin` 上的 Vue 控制台、SQLite 请求明细、每模型**测速**（TTFT、decode / prefill 速度、保留最近 3 次）、每个文档化接口都在参数表右上角提供**测试**按钮（浮层表单，默认值已填好），界面支持中文 / English。 |
-
-## 界面截图
-
-以下都是构建产物（`app/web`）连真实网关跑出来的实拍，不是设计稿：英文版在
-`docs/screenshots/en/`，中文版在 `docs/screenshots/zh/`（用
-`node docs/web-management/capture-live.js` 可重新生成）。语言在左下角账户菜单里切换。
-
-| 总览 —— 上下游健康、显存、运行中模型、请求趋势 | 上游 —— 探测延迟与声明的模型 |
-|:--:|:--:|
-| [![总览](docs/screenshots/zh/dashboard.jpg)](docs/screenshots/zh/dashboard.jpg) | [![上游](docs/screenshots/zh/upstreams.jpg)](docs/screenshots/zh/upstreams.jpg) |
-| **模型 · LLM** —— 清单、运行态设备/显存、测速 | **请求** —— SQLite 明细、筛选、单条详情 |
-| [![模型](docs/screenshots/zh/models-llm.jpg)](docs/screenshots/zh/models-llm.jpg) | [![请求](docs/screenshots/zh/requests.jpg)](docs/screenshots/zh/requests.jpg) |
-| **模型 · Rerank** —— 配置投影，密钥打码 | **登录门禁** —— 密码换 12 小时 HttpOnly Cookie |
-| [![Rerank](docs/screenshots/zh/models-rerank.jpg)](docs/screenshots/zh/models-rerank.jpg) | [![登录](docs/screenshots/zh/login.jpg)](docs/screenshots/zh/login.jpg) |
-
-## 快速开始
+### Docker 部署（推荐）
 
 ```bash
 # 1. 配置与密钥（都是挂载进去的，不打进镜像）
 mkdir -p llm-hub/data
-cp data/config.example.yaml llm-hub/data/config.yaml   # 上游、别名、rerank……
-cp .env.example llm-hub/.env                           # GATEWAY_API_KEYS、ADMIN_PASSWORD……
+cp data/config.example.yaml llm-hub/data/config.yaml
+cp .env.example llm-hub/.env
 # 编辑这两个文件：填真实上游地址和真实密钥
 
 # 2. 启动
@@ -68,14 +77,10 @@ docker run -d --name llm-hub -p 8888:8000 \
 curl http://localhost:8888/health          # {"ok":true}
 ```
 
-然后打开 **<http://localhost:8888/admin/>**，用 `admin` + 环境变量 `ADMIN_PASSWORD` 登录；
-不设这个变量时管理台显示「未启用」，所有管理接口返回 503。改 `config.yaml` 约 1 秒热重载，
-不用重启。
+打开 **<http://localhost:8888/admin/>**，同样用 `admin` + `ADMIN_PASSWORD` 登录。想从源码构建镜像：
+`docker build -t llm-hub:latest .`；镜像自带管理台产物（`app/web` 已提交），构建不需要 Node。
 
-想从源码构建镜像：`docker build -t llm-hub:latest .`；不想用 Docker 也可以裸跑，
-两种方式都写在[使用手册](docs/USAGE_CN.md#快速开始)里。
-
-## 怎么调用
+### 调用方式
 
 ```bash
 KEY=sk-your-gateway-key
@@ -88,6 +93,11 @@ curl http://localhost:8888/api/chat -H "X-API-Key: $KEY" \
 curl http://localhost:8888/v1/chat/completions -H "X-API-Key: $KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.5:4b","messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic Messages（Claude SDK / Claude Code 用的信封）
+curl http://localhost:8888/v1/messages -H "x-api-key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5:4b","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
 
 # Rerank —— Ollama 本身没有这个接口
 curl http://localhost:8888/v1/rerank -H "X-API-Key: $KEY" \
@@ -103,12 +113,17 @@ curl http://localhost:8888/health
 
 | 文档 | 内容 |
 |---|---|
-| [USAGE_CN.md](docs/USAGE_CN.md) | 全部细节：配置详解（`server` / `auth` / `upstreams` / `routing` / `aliases` / `api_models` / `rerank` / `websearch` / `request_log`）、集成 LM Studio、管理台实现、完整接口说明、常见问题、公网安全清单、本地开发 |
-| [docs/API.md](docs/API.md) | 转发规则、错误码、请求/响应示例 |
-| [docs/DEPLOY.md](docs/DEPLOY.md) | 镜像构建与发布脚本、反向代理、挂载 |
-| [docs/TESTCASES.md](docs/TESTCASES.md) | 端到端测试矩阵（smoke / management / gateway） |
-| [docs/web-management/](docs/web-management/web-management-implementation.md) | 管理台如何实现、各页面说明、截图脚本 |
-| [CHANGELOG_CN.md](CHANGELOG_CN.md) | 版本变更记录 |
+| [USAGE_CN.md](docs/USAGE_CN.md) | 完整手册：`config.yaml` 各段配置详解、集成 LM Studio、管理台使用、调用示例、常见问题、公网安全清单、本地开发 |
+| [API_CN.md](docs/API_CN.md) | 全部端点（含 Anthropic Messages）的请求 / 响应示例、流式格式、错误码、别名参数注入、工具调用 |
+| [DEPLOY_CN.md](docs/DEPLOY_CN.md) | 部署：Docker 运行与目录挂载、本地 Python 运行、镜像构建 / 发布脚本、环境变量、常见问题与运维 |
 
-环境要求：Docker（或 Python 3.12 + `pip install -r requirements.txt`）。管理台产物已提交在
-`app/web`，镜像里不需要 Node 工具链。
+环境要求：Docker（或 Python 3.12 + `pip install -r requirements.txt`）。
+
+## 关注公众号与授权
+
+<img src="docs/images/wechat-qrcode.png" width="200" alt="微信公众号二维码">
+
+扫码关注公众号，获取版本更新、部署说明与答疑。
+
+**使用授权** —— 本项目以 [MIT License](LICENSE) 开源。
+

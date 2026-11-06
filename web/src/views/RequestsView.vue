@@ -223,7 +223,6 @@ onMounted(() => {
         format="YYYY-MM-DD HH:mm:ss"
         value-format="YYYY-MM-DDTHH:mm:ss"
         :clearable="false"
-        size="small"
       />
     </div>
     <div class="field">
@@ -235,7 +234,6 @@ onMounted(() => {
         format="YYYY-MM-DD HH:mm:ss"
         value-format="YYYY-MM-DDTHH:mm:ss"
         :clearable="false"
-        size="small"
       />
     </div>
     <div class="field">

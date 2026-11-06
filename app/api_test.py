@@ -33,7 +33,7 @@ logger = logging.getLogger("llm_hub")
 #: an answer, not for downloading one, so a runaway generation is cut short here.
 MAX_RESPONSE_BYTES = 128 * 1024
 
-Executor = Literal["proxy", "rerank", "systemone", "websearch"]
+Executor = Literal["proxy", "rerank", "systemone", "websearch", "messages"]
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,7 @@ KINDS: dict[str, Kind] = {
         Kind("rerank", "/v1/rerank", "rerank", "rerank", True),
         Kind("systemone", "/v1/systemone", "systemone", "systemone", False, free_model=True),
         Kind("websearch", "/v1/tools/web-search", "websearch", "websearch", False, free_model=True),
+        Kind("messages", "/v1/messages", "messages", "generate", True),
     )
 }
 
@@ -173,7 +174,7 @@ async def execute(app: Any, kind: Kind, body: dict[str, Any], client: tuple[str,
     # instead of leaving the caller to guess which name actually ran.
     requested = body.get("model")
     preview: dict[str, Any] = {"requested_model": requested, "model": None, "upstream": None, "injected": None}
-    if isinstance(requested, str) and requested and kind.executor in {"proxy", "rerank"}:
+    if isinstance(requested, str) and requested and requested != "auto" and kind.executor in {"proxy", "rerank", "messages"}:
         resolved = cfg.resolve(requested)
         preview["model"] = resolved.target
         preview["upstream"] = resolved.upstream.name if resolved.upstream else None
@@ -218,6 +219,8 @@ async def execute(app: Any, kind: Kind, body: dict[str, Any], client: tuple[str,
             request = _make_request(app, kind.endpoint, payload, client)
             if kind.executor == "proxy":
                 response = await app.state.proxy.forward(request, kind.endpoint.strip("/"))
+            elif kind.executor == "messages":
+                response = await app.state.messages.handle(request)
             else:
                 service = app.state.systemone if kind.executor == "systemone" else app.state.websearch
                 response = await service.handle(request)

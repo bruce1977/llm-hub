@@ -285,7 +285,6 @@ onBeforeUnmount(() => {
           format="YYYY-MM-DD HH:mm:ss"
           value-format="YYYY-MM-DDTHH:mm:ss"
           :clearable="false"
-          size="small"
         />
         <span class="arrow">→</span>
         <el-date-picker
@@ -294,7 +293,6 @@ onBeforeUnmount(() => {
           format="YYYY-MM-DD HH:mm:ss"
           value-format="YYYY-MM-DDTHH:mm:ss"
           :clearable="false"
-          size="small"
         />
         <button class="apply" @click="refresh()">{{ t('common.apply') }}</button>
       </div>
@@ -504,7 +502,10 @@ onBeforeUnmount(() => {
   background: var(--accent-soft);
   color: var(--accent);
   border-radius: 7px;
-  padding: 5px 13px;
+  /* Same box as the two pickers beside it (Element's default control height, which is also
+     what the native `.sel` / `.inp` measures). */
+  height: 32px;
+  padding: 0 13px;
   font-size: 11.5px;
   cursor: pointer;
   font-weight: 600;

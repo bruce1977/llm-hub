@@ -21,6 +21,7 @@ const en: MessageSchema = {
     modelsSystemOne: 'Models · System One',
     toolsWebSearch: 'Tools · Web Search',
     settings: 'Settings',
+    apiKeys: 'API Keys',
     about: 'About',
   },
 
@@ -34,11 +35,11 @@ const en: MessageSchema = {
     tools: 'Tools',
     language: 'Language / 语言',
     languageAria: 'Language',
-    languageSoon: 'in progress',
     darkMode: 'Dark mode',
     lightMode: 'Light mode',
     settings: 'Settings',
     about: 'About',
+    apiKeys: 'API keys',
     signOut: 'Sign out',
   },
 
@@ -308,7 +309,6 @@ const en: MessageSchema = {
       kindDerived: 'Derived model',
       target: 'Target model',
       params: 'Pinned params',
-      description: 'Description',
       upstream: 'Upstream',
       empty: 'No aliases configured',
       note: 'A display name comes from upstreams[].model_aliases and only renames the model - the real id still works. A derived model comes from the aliases node with its own pinned parameters, so it is a separate model you call by name.',
@@ -319,7 +319,7 @@ const en: MessageSchema = {
       empty: 'No num_ctx overrides configured',
     },
     apiLead: {
-      body: 'Both endpoints are routed by the gateway on {model} (alias resolution + parameter injection + {overrides} clipping) and the response is passed through untouched. {strong}, matching Ollama itself; any method other than {method} returns {code}.',
+      body: 'All three endpoints are routed by the gateway on {model} (alias resolution + parameter injection + {overrides} clipping) and the response is passed through untouched. {strong}, matching the upstream; any method other than {method} returns {code}.',
       streamNote: 'Omitting {stream} forwards as a stream',
     },
     docs: {
@@ -329,6 +329,9 @@ const en: MessageSchema = {
       chatTitle: 'Chat completions (OpenAI compatible)',
       chatNote:
         'Forwarded by the catch-all; apart from alias resolution and parameter injection the body is untouched. If a client sends tool-call function.arguments as a JSON object, the gateway normalises it to the string that Ollama’s gin parser expects.',
+      messagesTitle: 'Messages (Anthropic compatible)',
+      messagesNote:
+        'The gateway translates the Anthropic Messages request into the OpenAI chat shape and forwards it to the upstream (Ollama /api/chat or /v1/chat/completions), then wraps the answer back in the Anthropic envelope. Accepts Bearer or x-api-key. An empty model or auto resolves to the default upstream’s first model.',
     },
     generateParams: {
       model: 'Gateway route name: a model name or alias declared in config.yaml, resolved before forwarding',
@@ -355,6 +358,17 @@ const en: MessageSchema = {
       reasoningEffort: 'Reasoning effort (OpenAI-compatible): none disables thinking on Ollama, unset lets the backend decide',
       tools: 'Tool definitions; function.arguments must be a JSON string',
     },
+    messagesParams: {
+      model: 'Gateway route name: a model name or alias declared in config.yaml; empty or auto resolves to the default upstream’s first model',
+      system: 'System prompt: a string, or an array of text blocks [{\'{\'}type:text, text{\'}\'}]',
+      messages: 'Message list of {\'{\'}role, content{\'}\'} entries (role ∈ user / assistant); content may be a string or a block array (including image blocks)',
+      maxTokens: 'Maximum number of tokens to generate (required, >0)',
+      temperature: 'Sampling temperature (0-2)',
+      topP: 'Nucleus sampling probability cap (0-1)',
+      topK: 'Number of candidate tokens kept (Ollama only)',
+      stopSequences: 'Stop sequences; generation ends on a match',
+      stream: 'Defaults to false (single JSON envelope); true returns the Anthropic SSE event stream',
+    },
     /** Descriptions for the nested parameters the tester splits out on its own - the table
      *  above documents `options` as a single object. The input's own label already shows the
      *  dotted key, so these stay short. */
@@ -368,6 +382,7 @@ const en: MessageSchema = {
     responses: {
       generateNote: 'stream omitted or true: one JSON object per line, with done: true on the last line',
       chatNote: 'With stream true this becomes SSE, one data: {\'{\'}...delta...{\'}\'} chunk at a time, ending with data: [DONE]',
+      messagesNote: 'With stream true this returns the Anthropic SSE event stream (message_start → content_block_delta* → message_stop); false returns a single JSON envelope, with usage rebuilt from the upstream’s native token counts (Ollama prompt_eval_count/eval_count, OpenAI prompt_tokens/completion_tokens)',
     },
     source: {
       server: 'Server timing',
@@ -773,6 +788,63 @@ const en: MessageSchema = {
       upstream: 'Upstream',
       api_key_env: 'API key env var',
       path: 'Path',
+    },
+  },
+
+  /** Caller credentials (the api_keys table): hashes only, plaintext shown once. */
+  apiKeys: {
+    sub: 'Issue and revoke caller credentials',
+    intro: {
+      title: 'What this page is for',
+      tag: 'overview',
+      body: 'An API key is the credential a caller presents to the gateway. The keys live in the api_keys table of llmhub.db, which holds only the SHA-256 hash of a key plus a display mask - the plaintext appears once, in the dialog that created it, and is gone when that dialog closes. The list shows the mask, the label and the creation time, and any key can be revoked here. Keys found in the environment or in the .keys file are imported once, only while the table is still empty; after that the database is the source of truth.',
+    },
+    list: {
+      title: 'Keys',
+      tag: 'keys',
+      create: 'New key',
+      colKey: 'Key (masked)',
+      colLabel: 'Label',
+      colCreated: 'Created',
+      colAction: 'Action',
+      noLabel: '(no label)',
+      revoke: 'Revoke',
+      confirmRevoke: 'Confirm revoke',
+      revoking: 'Revoking…',
+      cancel: 'Cancel',
+      empty: 'No keys yet - choose "New key" to generate one.',
+      loadFailed: 'The key list could not be read.',
+      note: 'Only the mask is listed: the database keeps hashes, so a lost key is replaced rather than recovered.',
+    },
+    format: {
+      title: 'Format and storage',
+      tag: 'format',
+      shape: 'Format',
+      shapeValue: 'sk-hub- + 40 random characters, 47 in total',
+      stored: 'Stored in the database',
+      storedValue: 'SHA-256(plaintext) plus a mask, never the plaintext',
+      checked: 'How a key is checked',
+      checkedValue: 'A hash lookup in memory - no database read per request',
+      seeded: 'First-start import',
+      seededValue: 'Environment and .keys values are imported once, only while the table is empty',
+    },
+    modal: {
+      title: 'New API key',
+      sub: 'Give it a label - that is how you will recognise it later.',
+      created: 'Created',
+      label: 'Label',
+      labelPlaceholder: 'e.g. dev laptop / CI pipeline',
+      labelHelp: 'Shown in the list; up to 100 characters.',
+      generate: 'Generate key',
+      generating: 'Generating…',
+      cancel: 'Cancel',
+      close: 'Close',
+      secretWarn: 'This is the only time the full key is shown. Copy it now - it cannot be read back after closing.',
+      copy: 'Copy',
+      copied: 'Copied',
+      copyFailed: 'The browser refused to copy. Select the text and copy it manually.',
+      masked: 'Mask',
+      done: 'I have saved it',
     },
   },
 }

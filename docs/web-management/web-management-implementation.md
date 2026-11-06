@@ -3,8 +3,8 @@
 > 版本：v1.1（已落地：后端 API + `web/` 前端，挂在 `/admin`）
 > 日期：2026-11-04
 > 范围：本文档覆盖 Web 管理台的**页面功能点分析**、**API 设计（统一前缀 `/v1/management`）**、**数据模型**与**UI 截图索引**。
-> 实现状态：只读阶段全部完成——`app/management.py` + `app/request_log.py` 提供接口与明细库，`web/src` 构建为 `app/web` 后由网关在 `/admin` 提供服务；模型清单以 `config.yaml` 的 `upstreams[].models` 为准（`model_aliases` 短名优先显示，前缀通配按上游模型列表展开，根 `aliases:` 的派生模型单独成行，`api_models` 按 API 家族收窄测试窗口的可选模型且只列名字/别名，`/api/...` 原生窗口只列 Ollama 上游的模型），每个「API 用法」标签页里「请求参数」标题右侧的**测试**按钮会打开浮层测试窗口，经 `app/api_test.py` 在**服务端**真实发出这一笔请求（表单打开即带初始值，布尔参数为复选框）；回归测试见 `tests/test_management.py`（297 项）与 `docs/TESTCASES.md` 测试 34-42，落地细节与设计差异见第 5 节。
-> 关联文件：`dashboard-mockup.html`（全页面风格稿）、`dashboard-login-mockup.html`（登录门禁页风格稿）、`images/*.png`（各页面 UI 截图，风格稿阶段的存档）。**当前版本的实拍截图**在 `docs/screenshots/{en,zh}/`，由 `capture-live.js` 连真实网关抓取，README 的「界面截图」一节直接引用。
+> 实现状态：只读阶段全部完成——`app/management.py` + `app/request_log.py` 提供接口与明细库，`web/src` 构建为 `app/web` 后由网关在 `/admin` 提供服务；模型清单以 `config.yaml` 的 `upstreams[].models` 为准（`model_aliases` 短名优先显示，前缀通配按上游模型列表展开，根 `aliases:` 的派生模型单独成行，`api_models` 按 API 家族收窄测试窗口的可选模型且只列名字/别名，`/api/...` 原生窗口只列 Ollama 上游的模型），每个「API 用法」标签页里「请求参数」标题右侧的**测试**按钮会打开浮层测试窗口，经 `app/api_test.py` 在**服务端**真实发出这一笔请求（表单打开即带初始值，布尔参数为复选框）；调用方 API Key 已改为**数据库管理**：`app/key_store.py` 把 Key 存进 `llmhub.db` 的 `api_keys` 表（只存 `sha256` 摘要与掩码），管理台新增 **API Key 管理**页（账户菜单进入）负责生成与撤销，环境变量只负责首次启动喂一次空表；请求明细的列表与统计只计 `/v1/*`、`/api/*` 的调用。回归测试见 `tests/test_management.py`（366 项）与 `docs/TESTCASES.md` 测试 34-43，落地细节与设计差异见第 5 节。
+> 关联文件：`dashboard-mockup.html`（全页面风格稿）、`dashboard-login-mockup.html`（登录门禁页风格稿）、`images/*.png`（各页面 UI 截图，风格稿阶段的存档）。**当前版本的实拍截图**在 `docs/screenshots/{en,zh}/`，由 `capture-live.js` 连真实网关抓取；README 的「管理网站」一节用的是其中两张的副本（`docs/images/dashboard-*.jpg`、`models-llm-*.jpg`）。
 
 ---
 
@@ -18,21 +18,28 @@
 
 ### 1.2 技术约束
 - **前端**：Vue 3 单页应用，源码在 `web/src`（Vite + Element Plus + axios + ECharts，全部本地依赖，无第三方 CDN）。`npm run build` 把产物写进 **`app/web`** 并随仓库提交，由网关自己以静态文件形式挂在 **`/admin`**（见 `app/main.py` 的 `route_console`）——产物与模块同级，本地 `app/web` 与镜像 `/app/web` 是同一个解析路径，`Dockerfile` 只做 `COPY app/web /app/web`，不含 node 工具链。趋势图与饼图用 ECharts 渲染，颜色取自 CSS 变量，因此主题切换时图表同步换色。
-- **后端**：在现有 FastAPI 应用中新增只读接口，统一挂在 `/v1/management` 前缀下；复用 `ADMIN_PASSWORD` 环境变量鉴权（HMAC 会话 Cookie；密码仅用于登录，不是请求凭据）。
-- **样式**：内容区固定宽度 1180px（四周留白不撑满）、面板最小高度 `max(640px, calc(100vh - 48px))` 以填满视口、深/浅主题切换并持久化在 `localStorage`（开关在左下角账户菜单），整页使用 CSS 变量，侧边栏可折叠（见 UI 截图）。
-- **多语言**：`vue-i18n@11`（Composition 模式，`legacy: false`）。文案在 `web/src/i18n/messages/zh-CN.ts` / `en.ts`，按页面分命名空间；`en.ts` 用 `const en: MessageSchema = {...}` 绑定中文导出的类型，键少一个/多一个都会让 `vue-tsc` 报错。语言持久化在 `localStorage` 键 `llmhub-console-locale`，首次访问按 `navigator.language` 猜（`en*` → 英文，其余 → 中文），并同步 `<html lang>` 与 Element Plus 的 locale（`App.vue` 的 `el-config-provider`）。切换入口在左下角账户菜单「语言 / Language」。
-- **埋点**：请求明细写入 SQLite（`data/llmhub.db`，WAL 模式），异步批量落盘，不阻塞转发主链路。
+- **后端**：在现有 FastAPI 应用中新增只读接口，统一挂在 `/v1/management` 前缀下；复用 `ADMIN_PASSWORD` 环境变量鉴权（HMAC 会话 Cookie；密码仅用于登录，不是请求凭据）。除设置页保存 `config.yaml`（`PUT /v1/management/config`）之外，会真正产生副作用的还有三类：模型测速（写 `bench_results`）、接口测试（留下一笔普通请求的明细行）与 API Key 管理（`api_keys` 表的增删）——后三类都不写 `config.yaml`。
+- **样式**：内容区固定宽度 1180px（四周留白不撑满）、面板最小高度 `max(640px, calc(100vh - 48px))` 以填满视口、深/浅主题切换并持久化在 `localStorage`（开关在左下角账户菜单），整页使用 CSS 变量，侧边栏可折叠（见 UI 截图）。同一行里的控件共用 32px 盒高（Element 默认的 `datetime` 选择器与原生 `select` 本就是 32px，文本框与筛选按钮被钉到同一个值，一行里不会再出现两种高度）；原生复选框统一 `accent-color: var(--accent)`，勾选色与旁边的按钮、链接、聚焦环一致，而不是浏览器自带的紫。
+- **多语言**：`vue-i18n@11`（Composition 模式，`legacy: false`）。文案在 `web/src/i18n/messages/zh-CN.ts` / `zh-TW.ts` / `en.ts`，按页面分命名空间；`zh-CN.ts` 是源语言，`zh-TW.ts` 与 `en.ts` 都以 `const x: MessageSchema = {...}`（`MessageSchema = typeof zhCN`）绑定它的类型，键少一个/多一个都会让 `vue-tsc` 报错，绝不会静默回落到中文。语言持久化在 `localStorage` 键 `llmhub-console-locale`，首次访问按 `navigator.language` 猜（`localeFromTag()`：`en*` → 英文，`zh-TW` / `zh-HK` / `zh-MO` / `zh-Hant*` → 繁体，其余 → 简体中文），并同步 `<html lang>` 与 Element Plus 的 locale 包（`zh-cn` / `zh-tw` / `en`，`App.vue` 的 `el-config-provider`）。可选项集中在 `SUPPORTED_LOCALES` 一处，切换入口在左下角账户菜单「语言 / Language」。
+- **埋点**：请求明细写入 SQLite（`data/llmhub.db`，WAL 模式），异步批量落盘，不阻塞转发主链路。同一个库里还有 `bench_results`（测速历史）与 `api_keys`（调用方 Key 的摘要与掩码）。
 
 ### 1.3 鉴权
-所有 `/v1/management/*` 接口均受 `require_admin` 保护（实现在 `app/admin_auth.py`），接受**两种凭据之一**：
+所有 `/v1/management/*` 接口均受保护（实现在 `app/admin_auth.py`），接受**两种凭据之一**：
 - 通过 `POST /v1/management/auth/login` 提交 `ADMIN_PASSWORD`（用户名固定 `admin`）换取 12h HttpOnly Session Cookie；
-- 或网关 API Key（`GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`，即 `.keys`），经 `Authorization: Bearer` / `X-API-Key`
+- 或网关 API Key——即 `llmhub.db` 的 `api_keys` 表里的任一 Key（首次启动由 `GATEWAY_API_KEYS` /
+  `GATEWAY_API_KEYS_FILE` 喂一次空表，此后在管理台生成与撤销），经 `Authorization: Bearer` / `X-API-Key`
   提交，便于脚本与 curl 复用已有凭据；
 - `ADMIN_PASSWORD` 本身**不是**请求凭据：把它放进 `Bearer` / `X-API-Key` 仍然返回 `401`；
   查询串里的 key 一律不接受（避免密钥进入访问日志与浏览器历史）；
-- 网关鉴权关闭（`auth.enabled: false` 或环境变量与密钥文件都没有 key）时没有可接受的 API Key，管理接口退回
-  Cookie-only，绝不会变成匿名访问；
+- **API Key 管理那三条路由（`GET` / `POST` / `DELETE /v1/management/api-keys`）是唯一的例外**，它们用
+  `require_admin_session`——只认会话 Cookie。理由写在函数注释里：网关 Key 是任何客户端都已经持有的东西，
+  接受它就等于让客户端给自己发权限；
+- 网关鉴权关闭（`auth.enabled: false`）或首次启动时环境变量与密钥文件都没有配置 Key（表因此一行都没有）时
+  没有可接受的 API Key，管理接口退回 Cookie-only，绝不会变成匿名访问；
 - 未配置 `ADMIN_PASSWORD` 时接口返回 `503 Service Unavailable`。
+- `/admin` 的静态壳层（`index.html` / `assets/*`）**故意不鉴权**，否则登录页打不开；页面内每一次
+  数据请求仍受上述保护。SPA 深链与编码后的 `../` 都回退到壳层，路径经 `resolve()` +
+  `is_relative_to()` 校验，无法跳出构建目录。
 - `/admin` 的静态壳层（`index.html` / `assets/*`）**故意不鉴权**，否则登录页打不开；页面内每一次
   数据请求仍受上述保护。SPA 深链与编码后的 `../` 都回退到壳层，路径经 `resolve()` +
   `is_relative_to()` 校验，无法跳出构建目录。
@@ -41,13 +48,17 @@
 
 ## 2. 页面功能点分析
 
-导航结构：左侧固定栏 `Dashboard / Upstreams / Requests / Models(LLM · Embed · Rerank · System one) / Tools(Web Search)`，点击切换视图（见 `images/nav-overview.png` 与下文各页截图）。`Settings` 与 `About` 都不占侧栏位，入口移到左下角账户菜单（见「账户菜单」）。**入口为独立登录页（见 2.8）**：未登录访问任意内部页均重定向至登录门禁，登录后凭 Session Cookie 进入带侧栏的内部视图。侧栏高亮只认 `router-link-exact-active`：Dashboard 挂在 `/`，是所有路由的祖先，用 `router-link-active` 会让它在每一页都亮着。
+导航结构：左侧固定栏 `Dashboard / Upstreams / Requests / Models(LLM · Embed · Rerank · System one) / Tools(Web Search)`，点击切换视图（见 `images/nav-overview.png` 与下文各页截图）。`Settings`、`About` 与 `API Key 管理` 都不占侧栏位，入口移到左下角账户菜单（见「账户菜单」）。**入口为独立登录页（见 2.8）**：未登录访问任意内部页均重定向至登录门禁，登录后凭 Session Cookie 进入带侧栏的内部视图。侧栏高亮只认 `router-link-exact-active`：Dashboard 挂在 `/`，是所有路由的祖先，用 `router-link-active` 会让它在每一页都亮着。
 
 **账户菜单**：左下角固定账户卡（渐变圆形头像 + 用户名 `admin` + `Administrator`）。卡片相对居中的 1180px 壳层定位（`left: max(38px, calc((100vw - 1180px)/2 + 18px))`、`bottom: 34px`），滚动页面时不跟随内容移出视野；壳层最小高度为 `max(640px, calc(100vh - 48px))`，短页面下卡片也落在面板内部而不是悬在面板外。点击卡片弹出菜单，条目依次为：
 
-- **语言 / Language**：悬停或点击展开**右侧子菜单**（不撑开当前菜单），当前仅 `中文` 可选，`English` 标 `soon` 占位，界面翻译完成后再启用。
-- **深色模式**：开关形态，切换 `theme.mode`（沿用 `localStorage` 持久化 + `html.dark`），图标随当前模式显示 ☾ / ☀。
+- **语言 / Language**（图标「文」）：悬停或点击展开**右侧子菜单**（不撑开当前菜单），三项来自
+  `SUPPORTED_LOCALES`——`简体中文` / `繁體中文` / `English`，`label` 恒用本语言自称（不随当前界面翻译）。
+  子项是 `role="menuitemradio"`，当前语言那项前面是 `✓` 并带 `.um-item.on` 高亮，其余是 `·`；主菜单行的
+  右侧显示当前语言名。选择即 `setLocale()` 生效并写进 `localStorage`，同时关掉子菜单。
+- **深色模式 / 浅色模式**：开关形态，切换 `theme.mode`（沿用 `localStorage` 持久化 + `html.dark`），图标随当前模式显示 ☾ / ☀。
 - **设置**：跳转 `/admin/settings`，原侧栏入口已移除。
+- **⚿ API Key 管理**：跳转 `/admin/api-keys`（调用方 Key 的列表、生成与撤销，见 2.11）。
 - **关于**：跳转 `/admin/about`（项目简介、主要功能、动态版本信息、GitHub 地址与公众号二维码，见 2.10）。
 - **退出登录**：调用 `signOut()` 后回到登录门禁。
 
@@ -60,7 +71,7 @@
 | 首次加载 | 数据未到位前 KPI 卡显示 shimmer 骨架屏、图表区显示「加载中…」，避免用 `0` 或空表误导 | 前端 |
 | 上游实例表 | 多实例表格：名称 / 类型 / 状态 / 已加载模型 / 显存占用 / 探测延迟；含 ollama、lmstudio、离线态范例 | `/v1/management/upstreams` |
 | 运行中模型 | 模型（`model_aliases` 短名作为显示名，`alias` 角标 + 悬停给出真实 id；根 `aliases:` 声明的派生模型是**独立一行**，带 `derived` 角标，悬停提示它运行在哪个目标模型上）/ 上游 / 设备（GPU / 部分 / 纯 CPU / Cloud，不显示百分比）/ 上下文长度。除 `/api/ps` 的驻留模型外，还列出托管上游（OpenCode）探测成功时它声明的模型，这些行设备显示 **Cloud**、显存与占用为 `-`；派生模型行设备沿用目标模型所在实例、显存同样显示 `-`（那份显存已计在目标模型名下），KPI「运行中模型数」只统计真实模型，不会重复计数 | `/v1/management/overview` |
-| 趋势图（起止时间） | 标题区提供 `起始时间 → 结束时间` 两个 `datetime-local` + 应用按钮，柱=每小时请求数，折线=P95 延迟（ECharts） | `/v1/management/stats/timeseries` |
+| 趋势图（起止时间） | 标题区提供 `起始时间 → 结束时间` 两个 `datetime-local` + 应用按钮（三者同为 32px 盒高），柱=每小时请求数，折线=P95 延迟（ECharts）；时间范围与 Requests 页一样只统计 `/v1/*`、`/api/*` 的调用 | `/v1/management/stats/timeseries` |
 | 分布饼图 · Upstream | 实心饼图（不是圆环），饼上不再画标签；名称与数量收在**图形下方一行一条**的可滚动图例里，字号 9.5px、行高 10.5px，名称超 16 字截断并附计数——长模型 id 既不会压到图形，也不会横向挤成一行 | `/v1/management/stats/distribution?group_by=upstream` |
 | 分布饼图 · Model | 同上，按 model 分组 | `/v1/management/stats/distribution?group_by=model` |
 | 分布饼图 · 成功/失败 | 同上，成功 `ok` 绿 / 失败 `error` 红 | `/v1/management/stats/distribution?group_by=status` |
@@ -74,7 +85,7 @@
 | 功能点 | 说明 | 数据来源 |
 |---|---|---|
 | 实例表 | 同 Dashboard 的上游表格 | `/v1/management/upstreams` |
-| 行展开 | 点击任意行展开该实例的「模型」表，每次展开都重新探测。一张**合并表**：行集合以 config.yaml 的 `upstreams[].models` 为准（`model_aliases` 短名作为显示名，前缀通配经上游模型端点展开成命中的具体模型），每行再并上 `/api/ps` 的运行态（设备 / 上下文 / 显存·占用）；已声明但未加载的行标「未加载」，实例里在跑却未声明的模型追加在末尾。根 `aliases:` 声明的派生模型是**独立一行**（带 `derived` 角标、设备沿用目标模型、显存 `-`），排在归属上游的声明名之后。`opencode` 类型探测有效即整批在线（标签「在线（探测有效）」、设备 **Cloud**）。未声明任何模型时提示「该上游未在 config.yaml 中声明任何模型」 | `/v1/management/upstreams/{name}` |
+| 行展开 | 点击任意行展开该实例的「模型」表，每次展开都重新探测；**再点一次只收起自己**，多行可以同时展开（`expanded` 是名字数组，`detailBusy` 同样按名字计数，所以两行并发探测时各自的「探测中」互不覆盖）。展开中的行在每分钟自动刷新时会被逐个重新探测（`Promise.all`）。一张**合并表**：行集合以 config.yaml 的 `upstreams[].models` 为准（`model_aliases` 短名作为显示名，前缀通配经上游模型端点展开成命中的具体模型），每行再并上 `/api/ps` 的运行态（设备 / 上下文 / 显存·占用）；已声明但未加载的行标「未加载」，实例里在跑却未声明的模型追加在末尾。根 `aliases:` 声明的派生模型是**独立一行**（带 `derived` 角标、设备沿用目标模型、显存 `-`），排在归属上游的声明名之后。`opencode` 类型探测有效即整批在线（标签「在线（探测有效）」、设备 **Cloud**）。未声明任何模型时提示「该上游未在 config.yaml 中声明任何模型」 | `/v1/management/upstreams/{name}` |
 | 多类型兼容 | ollama（有 ps）、lmstudio（无 ps，标注「不支持 /api/ps」）、离线实例（标注「不可达」） | 后端探测 |
 | 设备判定 | 运行中模型按 `size_vram / size` 标注 GPU / 部分 / 纯 CPU（不显示百分比），并给出「显存 / 占用」(GiB) 与上下文长度；托管 provider 无加载状态，设备显示 **Cloud**、显存显示「—」 | 后端计算 |
 
@@ -87,7 +98,7 @@
 |---|---|---|
 | Tab · 模型清单 | | |
 | 上游模型映射 | 模型名 / 上游 / 类型 / num_ctx / 设备 / 显存 · 占用 (GiB) / 运行态。行集合来自 **`config.yaml` 的 `upstreams[].models`**（实例里装了但没声明的模型不列，网关本来就路由不到它们）；前缀通配（`opencode/*`）按与路由同一个发现结果展开成具体模型并带 `wildcard` 角标。`model_aliases` 短名行显示 `display`（悬停给出真实 id，`alias` 角标）；根 `aliases:` 声明的派生模型是**独立一行**，紧跟在它的目标模型后面，带 `derived` 角标（悬停「运行在 {target} 上」）、设备沿用目标模型的实例、显存 `-`。设备与内存只在 Ollama 运行时给值，托管上游（OpenCode）探测有效即全部「在线」，设备显示 **Cloud**、内存为 `-` | `/v1/management/models/llm` |
-| 别名与派生模型 | 名称 / 类型（`显示别名` = `upstreams[].model_aliases`，只改名；`派生模型` = 根 `aliases:`，是带独立固化参数的新模型）/ 目标模型 / 上游 / 固化参数（`think=false` 形式）/ 说明 | 同上（`aliases[].kind`） |
+| 别名与派生模型 | 名称 / 类型 / 目标模型 / 上游 / 固化参数（`think=false` 形式）**五列**；`table-layout: fixed` + `colgroup` 定宽（24% / 12% / 24% / 14% / 26%），超长的名字与参数按省略号裁剪。类型徽标 `显示别名`（= `upstreams[].model_aliases`，只改名）与 `派生模型`（= 根 `aliases:`，带独立固化参数的新模型）**用同一套 `.chip.s2` 样式**，只靠文字区分，不再给两种颜色。原先的「说明」列已删除，`description` 改为悬停在**名称**或**目标模型**单元格上的原生 `title` | 同上（`aliases[].kind` / `aliases[].description`） |
 | 上下文固化 | 模型 → `num_ctx` | `num_ctx_overrides` |
 | 测速（每行按钮） | 「操作」列每行一个 `测速` 按钮（**所有模型都可点**）。点击后 `POST /v1/management/bench` 拿 `job_id`，弹出模态框并每秒轮询 `/bench/{job_id}`：跑的过程中显示「测速中 · 第 x/y 轮」与进度条，结束后展示 Decode / Prefill / TTFT 三张统计卡（均值，副行给出 ±标准差、最小/最大、变异系数）与逐轮明细表（轮次 / 类型 / Decode / Prefill / TTFT / 生成 tokens）；失败时展示后端 `error` 原文并提供「重新测速」。同时只允许一个任务在跑，弹窗关闭即停止轮询。**派生模型行测的是它的目标模型**（上游并不认识别名名），并把别名 `params.think` 作为 `think` 一起提交，所以「nothink 变体」的测速结果与真实调用口径一致 | `POST /bench` + `GET /bench/{job_id}`（`app/bench.py`） |
 | 悬停测速历史 | 鼠标停在任意模型行（250 ms 防抖）浮出小卡片，显示该 `upstream` + `model` **最近 3 份**记录：时间 · 计时口径徽标 + Decode / Prefill / TTFT；同一行的结果在会话内缓存，不重复请求。无记录时提示「暂无测速记录」，读取失败显示错误原文。**派生模型行按目标模型查询**，所以它读到的是同一份实例测速记录 | `GET /bench/history?upstream=&model=`（`bench_results` 表） |
@@ -142,7 +153,8 @@
 ### 2.6 Requests（请求明细）
 | 功能点 | 说明 | 数据来源 |
 |---|---|---|
-| 筛选栏 | 起始/结束时间、**上游**（在模型前）、模型、状态（全部/2xx/3xx/4xx/5xx）、路径关键字 + 应用/重置 | `/v1/management/requests` |
+| 筛选栏 | 起始/结束时间、**上游**（在模型前）、模型、状态（全部/2xx/3xx/4xx/5xx）、路径关键字 + 应用/重置。一行里 datetime 选择器、原生 `select`、文本框与两个按钮**同为 32px 盒高**（`theme.css` 把 `.sel` / `input.inp` / `.filters .btn` 钉到 Element 默认尺寸） | `/v1/management/requests` |
+| 统计口径 | 列表、`stats`、分页 `total` 只计 **API 调用**（`path LIKE '/v1/%' OR path LIKE '/api/%'`，即 `request_log.API_PATH_SCOPE`）；非 API 路径（`/health`、监控探针等）照常入库、照常返回 `200`，只是不进来数——健康检查刷屏会把 QPS、P95、错误率全部稀释。详情抽屉按 `id` 取，故意不带这个条件，任何一行都还打得开 | `/v1/management/requests` |
 | 模型下拉随上游收敛 | 选定上游后，模型只列该上游在 config.yaml 里声明的名字（`upstreams[].models`，前缀通配按上游模型端点展开，不列出实例里未声明的模型）；标签变成「模型 · <上游>」；不选上游时给出全量并附加所有别名。别名归属其目标模型所在的每个上游；根 `aliases:` 的派生模型既是一行模型也是别名，选项按名字去重。换上游会让不再可选的已选模型自动清空 | `/v1/management/models/llm` |
 | 统计条 | 区间请求数、P50、P95、P99、错误率 | 同上（随筛选实时计算） |
 | 明细表 | 时间 / 方法 / 路径·模型 / 上游 / 状态 / 耗时 / 流式 / 操作（详情） | 同上 |
@@ -154,8 +166,15 @@
 > `requested_model` 三行）。改动 mockup 后重跑 `node docs/web-management/capture.js` 即可刷新，
 > 脚本已改为按自身位置解析 HTML 与输出目录。
 
-### 2.7 Settings（即将开放，占位）
-入口在左下角账户菜单的「设置」，侧栏不再保留该项。页面列出后续将开放的写入口：API Keys 管理、Rerank 配置、Security 规则、Playground 调试、上游增删改。本期为占位页。
+### 2.7 Settings（配置编辑）
+入口在左下角账户菜单的「设置」，侧栏不再保留该项。这一页是管理台里**唯一写 `config.yaml`** 的地方：
+四个标签页 **上游 / Rerank / System One / Web Search**，字段直接绑在 `GET /v1/management/config`
+返回的结构化配置上（上游用 `UpstreamCard` 增删改，Rerank 的 `models` / `stop` 用标签编辑器、
+`options` 用键值编辑器）；数字字段在发送前统一收敛（纯整数的 `keep_alive` 作为秒数发、`3m` / `-1`
+原样保留）。保存要过一道**二次确认**弹窗，再由 `PUT /v1/management/config` 校验并原子覆盖文件、热重载；请求里只有
+上述四段会被取用，其它顶层键（`aliases`、`routing`、`security`……）从磁盘原样保留，所以控制台没暴露的
+高级配置不会被抹掉。校验失败（`422` 带 `detail.segments`）时按段回显错误并自动跳到第一个出问题的标签页。
+调用方 API Key 不在这一页——它在 2.11 的 API Key 管理页。
 
 > 截图：`images/settings.png`
 
@@ -200,11 +219,32 @@
 | 公众号 | 二维码图片来自 `web/public/wechat-qr.jpg`，构建时原样复制进 `app/web/`，经 `/admin/wechat-qr.jpg` 服务（CSP `img-src 'self' data:` 允许同源图片）；文件缺失时卡片给出补齐说明而不是破图 | 静态资源 |
 | 刷新 | 顶栏 `↻` 重新拉取 overview，`refreshing` 复用在版本圆点与顶栏进度上 | 前端 |
 
+### 2.11 API Key 管理（`/admin/api-keys`）
+入口在左下角账户菜单的「⚿ API Key 管理」，不占侧栏位（`ApiKeysView.vue`）。这一页管的是**调用方
+API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那串），与管理台登录密码
+`ADMIN_PASSWORD` 是两套凭据。功能点：
+
+| 功能点 | 说明 | 数据来源 |
+|---|---|---|
+| 功能介绍卡 | `.feature-intro` 一段说明：Key 存在哪里、为什么只显示掩码、签发后该做什么 | 静态文案 |
+| 密钥清单 | 表头 密钥 / 描述 / 创建时间 / 操作。密钥列是等宽字体的**掩码**（`sk-hub-7Kp2…Q9df`），永远不是明文；描述为空显示淡色「（无描述）」；创建时间按本地时区格式化。接口响应里的 `source`（`console` 本页签发 / `file` 首次启动从环境变量或密钥文件导入）**只留在 API 里，不再占一列** | `GET /v1/management/api-keys` |
+| 新建立密钥 | 卡片标题右侧主按钮，打开浮层弹窗：填**描述**（必填，最长 100 字，回车即提交）→ 生成。空描述时按钮禁用 | `POST /v1/management/api-keys` |
+| 明文只显示一次 | 生成成功后弹窗切到第二段：警示条 + 只读 `textarea` 里的完整 Key + 复制按钮 + 描述与掩码。关闭后再进来，列表里只剩掩码——这是设计上唯一的查看窗口 | 同上（`secret` 字段） |
+| 复制 | 优先 `navigator.clipboard`，被拒绝（非安全上下文 / 无权限）时回落 `execCommand('copy')`，再失败就聚焦并选中那个只读框，让操作者用 Ctrl+C 自己完成；三条路都没走通才提示复制失败 | 前端 |
+| 撤销 | 两步式：第一下把该行按钮换成红色「确认撤销」+「取消」，第二下才真正删除（`confirming` 只存一个 id，`load()` 结束即复位）。删除后列表立刻重取；弹窗关闭时若刚生成过 Key 也会重取一次，新行才会出现 | `DELETE /v1/management/api-keys/{id}` |
+| 密钥格式与存储卡 | 四条 kv：格式（`sk-hub-` + 40 位 base62，共 47 字符）、库里存什么（`sha256(明文)` 摘要 + 掩码，不存明文）、怎么校验（请求路径比对内存里的摘要集合，不碰 sqlite）、怎么来的（首次启动导入空表一次，此后只认数据库） | 静态文案 |
+| 错误与空态 | 列表取不到显示告警条；一行都没有时表格给出空态文案；签发/撤销的失败单独显示在页面顶部，不会打断已加载的内容 | 前端 |
+
+> 这一页只有三条管理接口，全部 **Cookie-only**（见 1.3）；未登录访问 `/admin/api-keys` 会被路由挡到登录页，
+> 带着网关 Key 但没有会话 Cookie 调用这三条接口返回 `401`。关闭页面、刷新浏览器都拿不到已签发 Key 的明文。
+
 ---
 
 ## 3. API 设计（`/v1/management`）
 
-> 统一前缀 `/v1/management`；全部 `GET`（除登录/登出）；均受 `require_admin` 保护（会话 Cookie **或**网关 API Key）；错误码沿用 HTTP 标准（`400` 参数错误、`401` 未认证、`403` 禁止、`404` 资源不存在、`503` 未配置密码 / 上游不可达 / 前端未构建）。
+> 统一前缀 `/v1/management`；除登录/登出与 API Key 的签发/撤销外全部 `GET`；除 `/api-keys`（只认会话
+> Cookie）以外均接受**两种凭据之一**（会话 Cookie **或** `api_keys` 表里的网关 API Key）；错误码沿用 HTTP
+> 标准（`400` 参数错误、`401` 未认证、`403` 禁止、`404` 资源不存在、`503` 未配置密码 / 上游不可达 / 前端未构建）。
 
 ### 3.1 鉴权
 | 方法 | 路径 | 说明 |
@@ -339,8 +379,8 @@
 ### 3.4 请求明细与统计
 | 方法 | 路径 | 查询参数 | 说明 |
 |---|---|---|---|
-| GET | `/v1/management/requests` | `start`,`end`(ISO8601),`upstream`,`model`,`status`(2xx\|4xx\|5xx),`path`(关键字),`page`,`page_size` | 返回 `stats` + `rows` + `pagination` |
-| GET | `/v1/management/requests/{id}` | — | 单条详情（含 `request_body` / `response_body`，已截断与脱敏） |
+| GET | `/v1/management/requests` | `start`,`end`(ISO8601),`upstream`,`model`,`status`(2xx\|3xx\|4xx\|5xx),`path`(关键字),`page`,`page_size` | 返回 `stats` + `rows` + `pagination`。四个查询接口（列表 / `stats` / timeseries / distribution）都额外带 `request_log.API_PATH_SCOPE`（`path LIKE '/v1/%' OR path LIKE '/api/%'`），只统计真正的 API 调用 |
+| GET | `/v1/management/requests/{id}` | — | 单条详情（含 `request_body` / `response_body`，已截断与脱敏）。**故意不带**上面的路径范围：任何一行都能按 id 打开 |
 | GET | `/v1/management/stats/timeseries` | `start`,`end`,`bucket`(hour\|day，默认 hour) | 时序聚合：每桶 `count` / `p95` / `errors`（驱动 Dashboard 趋势图） |
 | GET | `/v1/management/stats/distribution` | `start`,`end`,`group_by`(upstream\|model\|status) | 分组计数分布：分别驱动 Dashboard 三张饼图（各 Upstream / 各 Model / 成功失败） |
 
@@ -427,6 +467,20 @@
 > 窗口的 `stream` 默认 `false`（先拿到单个 JSON），generate 另有默认关闭的 `think` 复选框，
 > chat 提供 `reasoning_effort`。
 
+### 3.6 调用方 API Key 管理（api-keys）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/v1/management/api-keys` | `{items: [{id, masked, label, source, created_at}], total}`，按 `created_at DESC, id DESC`（新→旧）。**没有** `hash`、也没有明文：`masked` 是 `sk-hub-` + 头 4 + `…` + 尾 4（旧式非该前缀的 Key 头 8 尾 4，长度 ≤ 12 的整体是 `••••••`），`source` 为 `console` / `file` |
+| POST | `/v1/management/api-keys` | Body `{label}`（`strip()` 后必须非空，上限 100 字）→ **201** `{item, secret}`；`secret` 是本次唯一的明文，之后任何接口都不再返回。空白标签 **400**，超长 **422** |
+| DELETE | `/v1/management/api-keys/{id}` | 撤销 → **200** `{deleted: id}`；同一个 id 再删或不存在的 id → **404** |
+
+> 三条路由都依赖 `require_admin_session`（`app/admin_auth.py`）——**只认登录会话 Cookie**，网关 API
+> Key 在这里一律 `401`：那串 Key 是任何客户端都已持有的凭据，接受它就等于让调用方给自己继续发权限。
+> 校验走 `app/key_store.py` 的 `ApiKeyStore.verify()`：库里存 `sha256(明文)` 小写十六进制，比对的是
+> 进程内的一份 `frozenset` 摘要集合，每次签发/撤销/导入后重载，所以转发路径上不查 sqlite。新建与撤销
+> **立即生效**（无需重启）：被撤销的 Key 走网关是 `403`、走管理接口是 `401`。
+
 ---
 
 ## 4. 数据模型
@@ -468,6 +522,31 @@
 ### 4.2 配置只读投影
 全部来自 `ConfigManager`（config.yaml）经 Pydantic 校验后的安全子集，绝不回显 API Key 明文。
 
+### 4.3 SQLite 表 `api_keys`（调用方 Key）
+
+与 `requests`、`bench_results` 同一个 `llmhub.db`（`LLMHUB_DB` 可单独指定，默认仍是
+`CONFIG_PATH` 同目录）；建表即建索引，`hash` 上带 `UNIQUE`，重复导入直接跳过。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | INTEGER PK | 自增，撤销按它定位 |
+| `hash` | TEXT UNIQUE | `sha256(明文)` 的小写十六进制——库里唯一的比对依据，**明文永不落盘** |
+| `masked` | TEXT | 展示用掩码（`sk-hub-` + 头 4 `…` 尾 4；旧式 Key 头 8 尾 4；过短则整体 `••••••`） |
+| `label` | TEXT | 描述，默认空串；导入的行为空，管理台签发时必填（上限 100 字） |
+| `source` | TEXT | `console`（管理台签发）/ `file`（首次启动从 `GATEWAY_API_KEYS` 或密钥文件导入） |
+| `created_at` | TEXT | ISO8601 UTC，列表按它倒序 |
+
+- **为什么是 SHA-256 而不是 bcrypt/argon2**：Key 是 47 字符、约 238 bit 的随机串（`sk-hub-` + 40 位
+  base62，`secrets.choice` 生成），不在任何字典里，离线爆破不可行；慢哈希只会把每次请求的校验变成
+  几十毫秒的开销。要防的是「数据库被整包拷走还能直接用」，那正是摘要比对解决的事。
+- 校验走内存：`ApiKeyStore` 维护一份摘要 `frozenset`，`create` / `delete` / `import_plaintext` 之后
+  整体重载，转发路径不查 sqlite；因此签发与撤销**不需要重启**就生效。
+- 首次启动 `count() == 0` 且环境变量里有 Key 时才导入（`import_plaintext`，日志写明「Seeded N API
+  key(s) … manage them at /admin from now on」）；之后环境变量再改只产生一条掩码警告
+  （`unserved_env_keys()`），既不会把管理台撤销的 Key 复活，也不会让明文重新进表。
+- `auth.enabled: true` 且喂完种子后表仍然为空时，网关按原有规则拒绝启动，除非
+  `auth.allow_access_ip_whitelist` 非空（可信网络模式，白名单内的来源本来就跳过 Key 校验）。
+
 ---
 
 ## 5. 实施记录（已落地）
@@ -495,9 +574,19 @@
    模型选项**只显示名字或别名**，上游/设备/运行状态在 `title` 提示里。上下文（可选模型、默认项、
    `free_model`、掩码密钥、`enabled`）来自模块级共享的 `useApiTestContext()`，一次探测全站复用，
    只有首次与「重新探测」才会再打 `/api-test/models`。
-9. `web/src/`：前端页面（依 `dashboard-mockup.html` 风格稿与 `images/*.png` 实现，9 视图 + 详情抽屉 +
+9. `app/key_store.py`：调用方 API Key 的存储与校验（`api_keys` 表 + 进程内摘要集合，见 4.3）。
+   明文只在 `create()` 的返回值里存在一次；`hash_key()` / `mask_key()` / `generate_key()` 是纯函数，
+   `verify()` 只比摘要。`app/auth.py` 改成向 `get_store()` 要答案（集合命中即通过，否则 `403`），
+   `app/main.py` 负责启动时建表、首次导入与「表空 + 开启鉴权」的拒绝启动/白名单警告，
+   `app/management.py` 挂出三条路由（`GET` / `POST` / `DELETE /api-keys`，全用
+   `require_admin_session`）。
+10. `web/src/views/ApiKeysView.vue`：API Key 管理页（路由 `/admin/api-keys`，入口在账户菜单
+    「⚿ API Key 管理」，见 2.11）；`web/src/i18n/messages/zh-TW.ts` 加入繁体中文（三套文案共用
+    `MessageSchema`，可选项集中在 `SUPPORTED_LOCALES`），`web/src/styles/theme.css` 把同一行的控件
+    统一到 32px 盒高并给原生复选框加 `accent-color: var(--accent)`。
+11. `web/src/`：前端页面（依 `dashboard-mockup.html` 风格稿与 `images/*.png` 实现，9 视图 + 详情抽屉 +
    深/浅主题 + 侧栏折叠 + **ECharts** 图表 + 关键字/时间筛选 + 分页）。
-10. 文档同步：`.env.example`、`config.example.yaml`、`README`、`CHANGELOG`、`docs/API.md`、
+12. 文档同步：`.env.example`、`config.example.yaml`、`README`、`CHANGELOG`、`docs/API.md`、
     `docs/TESTCASES.md`、`docs/DEPLOY.md`、`AGENTS.md`。
 
 与设计稿的实现差异（均为有意选择）：
@@ -524,6 +613,13 @@
 - **静态资源**：`web/public/` 里的文件（目前是 `favicon.svg`）由 Vite 原样复制进 `app/web/`，
   与哈希产物同居一层，因此同一套 `/admin/{asset_path}` 路由即可服务；`index.html` 里的
   `/favicon.svg` 会按 `base` 改写成 `/admin/favicon.svg`。
+- **凭据来源**：设计稿里调用方 API Key 一直住在环境变量 / `.keys` 文件；现在 `llmhub.db` 的
+  `api_keys` 表是唯一真源（只存摘要与掩码），环境变量与 `.keys` 只在表为空的首次启动喂一次数据，
+  签发与撤销都在管理台完成。因此「网关 Key 也能进管理接口」这条便利规则保留，但
+  `/api-keys` 自身反过来只认会话 Cookie，否则任何一个可用 Key 都能自我扩权。
+- **统计范围**：设计稿的统计是「所有请求」；实现里列表与统计只计 `/v1/*`、`/api/*` 的 API 调用
+  （`request_log.API_PATH_SCOPE`），健康检查与监控探针照常入库但不进图表——否则 QPS、P95 与错误率
+  会被每秒一次的 HEAD/GET 淹没。
 - 401 一律登出并跳回登录页（保留 `redirect`），503 视为业务答复而非鉴权失败。
 
 ---

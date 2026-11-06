@@ -32,6 +32,7 @@ from admin_auth import (
     create_admin_token,
     get_admin_password,
     require_admin,
+    require_admin_session,
 )
 from api_test import MAX_RESPONSE_BYTES, KINDS, execute, get_kind
 from auth import client_ip
@@ -40,6 +41,7 @@ from bench_store import BenchStore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi import status as http_status
 from fastapi.responses import JSONResponse
+from key_store import LABEL_MAX_CHARS, ApiKeyStore, get_store
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from request_log import _DISTRIBUTION_KEYS, MAX_PAGE_SIZE, normalize_ts, now_ts
 
@@ -1271,6 +1273,55 @@ def _format_validation_error(exc: ValidationError) -> str:
         msg = err.get("msg", "invalid")
         parts.append(f"{loc}: {msg}" if loc else msg)
     return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# API keys (the console mints and revokes the credentials callers present)
+# --------------------------------------------------------------------------- #
+# These three routes are the only place a credential is created or destroyed, so they take the
+# console session cookie and never a gateway API key: a key is what every caller already holds,
+# and accepting one here would let any client issue itself another. What the list returns is a
+# mask, a label, a source and a creation time -- the hash stays in the database and the
+# plaintext exists only in the response of the call that created it.
+
+
+class ApiKeyCreate(BaseModel):
+    label: str = Field(default="", max_length=LABEL_MAX_CHARS)
+
+
+def _key_store() -> ApiKeyStore:
+    store = get_store()
+    if store is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API key store is not ready.",
+        )
+    return store
+
+
+@router.get("/api-keys", summary="Caller API keys, masked", tags=["management"])
+async def api_keys_list(_=Depends(require_admin_session)) -> dict[str, Any]:
+    items = await _key_store().list_keys()
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/api-keys", status_code=http_status.HTTP_201_CREATED, summary="Create a caller API key", tags=["management"])
+async def api_keys_create(body: ApiKeyCreate, _=Depends(require_admin_session)) -> dict[str, Any]:
+    label = body.label.strip()
+    if not label:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="A label is required, so the key is recognisable later.",
+        )
+    item, secret = await _key_store().create(label)
+    return {"item": item, "secret": secret}
+
+
+@router.delete("/api-keys/{key_id}", summary="Revoke a caller API key", tags=["management"])
+async def api_keys_delete(key_id: int, _=Depends(require_admin_session)) -> dict[str, Any]:
+    if not await _key_store().delete(key_id):
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="No such API key.")
+    return {"deleted": key_id}
 
 
 def _clean_config_dict(cfg: Config) -> dict[str, Any]:
