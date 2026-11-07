@@ -447,6 +447,8 @@ const en: MessageSchema = {
       model: 'Model',
       type: 'Type',
       endpoint: 'Endpoint',
+      empty: 'No embedding models available. Declare one under api_models.embed or upstreams[].models in config.yaml.',
+      sourceNote: 'Read live from {source} — the same /api-test/models payload the two testers below use. Refresh the page or hit "Re-probe" after a config change.',
     },
     availableNote:
       'Embedding models share {models} / {aliases} with LLMs. Pass a model from the table above as {model}; an undeclared model (not covered by a prefix wildcard) fails routing with {code}, and an upstream that has not pulled the model reports the error from Ollama.',
@@ -561,9 +563,11 @@ const en: MessageSchema = {
       model: 'Model',
       type: 'Type',
       endpoint: 'Endpoint',
+      empty: 'No decision models available. Declare them under api_models.systemone in config.yaml, or leave that list empty to derive them from systemone.model / upstreams[].models.',
+      sourceNote: 'Read live from {source} — the same /api-test/models payload the tester below uses. Refresh the page or hit "Re-probe" after a config change.',
     },
     availableNote:
-      'The list holds model names the decision backend accepts; pick one via {model} in the request body. When omitted the gateway injects {injected} from configuration ({local} means no injection). Whether a call actually works depends on the backend (laya-server or Ollama 0.40+) having that model deployed.',
+      'The list comes from api_models.systemone (derived when left empty); pick one via {model} in the request body. When omitted the gateway injects {injected} from configuration ({local} means no injection). Whether a call actually works depends on the backend (laya-server or Ollama 0.40+) having that model deployed.',
     params: {
       state: 'Free-form structure carrying the context to decide on (e.g. message), forwarded to the backend untouched',
       questions: 'Question id → question definition, at least one; type determines the decision shape',

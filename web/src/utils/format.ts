@@ -74,6 +74,16 @@ export function memoryText(vram: number | null | undefined, size: number | null 
   return vram === null || vram === undefined ? '—' : `${fmtGib(vram)} / ${fmtGib(size)}`
 }
 
+/** Upstream VRAM gauge. The unit belongs to the value itself: `vram_total_gib` is optional
+ *  (not discoverable over the API), so without a configured total the tile used to show a
+ *  bare number with no GiB anywhere on it. */
+export function vramText(used: number | null | undefined, total: number | null | undefined): string {
+  if (used === null || used === undefined) return '—'
+  const value = Number(used)
+  if (!Number.isFinite(value)) return '—'
+  return total ? `${value.toFixed(1)} / ${Number(total).toFixed(1)} GiB` : `${value.toFixed(1)} GiB`
+}
+
 export function fmtBytes(value: number | null | undefined): string {
   if (value === null || value === undefined) return '—'
   if (value < 1024) return `${value} B`

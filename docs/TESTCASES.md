@@ -1353,10 +1353,10 @@ curl -b cookie.txt "http://localhost:8000/v1/management/stats/failures?start=202
 - 时间桶格式：`hour` 为 `YYYY-MM-DDTHH:00`，`day` 为 `YYYY-MM-DD`
 - P95 为**桶内**分位数（窗口函数），不是整段时间的全局值
 - `distribution` 的 `group_by` 只接受 `upstream` / `model` / `status`（其他 -> `400`），按 `count` 倒序返回
-- `group_by=status` 只分两桶：`ok`（`status < 400`）与 `error`（`status >= 400`）
+- `group_by=status` 只分两桶：`ok`（`status < 500`，含 4xx）与 `error`（`status >= 500`），阈值与错误率、趋势图错误柱、失败统计一致
 - 未命中上游的行（被拦截 403 / 过大 413 / 无可用上游 404）在 `upstream`、`model` 分组里计入 `-`，
   因此 `items` 相加恒等于同期 `/requests` 的 `pagination.total`
-- `failures` 只统计 `status >= 400` 的请求，按状态码与上游聚合，另附最近 20 条样本
+- `failures` 只统计 `status >= 500` 的请求，按状态码与上游聚合，另附最近 20 条样本
 - 数据存于同一 SQLite 库（默认 `llmhub.db`，可用 `REQUEST_LOG_DB` 覆盖），
   `REQUEST_LOG_RETENTION_DAYS` 控制保留天数（`0` = 永久，默认 30 天，按小时清理）
 
@@ -1589,6 +1589,13 @@ curl -b cookie.txt http://localhost:8000/v1/management/api-test \
   `source` 回报这次用了哪个来源；`models[].display` 有别名显示别名、没有就显示配置名，但选择框里
   **只显示这个名字**，上游/设备/运行状态放在悬停提示；写了没有任何上游服务的名字时该行保留并标
   `unknown: true`（配置错误要显示出来而不是被藏掉）
+- **非空列表是封闭集合**：`source = api_models.<family>`，既不被 `websearch.upstream` 的 provider
+  过滤改写（`test_management.py` 断言 `websearch: ["qwen3:8b"]` 时 `source` 仍是
+  `api_models.websearch`），也把该家族的 `free_model` 置为 `false`。`- ''` / 纯空白行被忽略，
+  不会出现空白 `<option>`；整列都是占位符时等同留空，继续走推导
+- 页内其它模型展示同样读这份数据：`Models · Embedding` / `Models · SystemOne` 的「可用模型」表、
+  `Models · LLM` 三个请求/响应示例里的 `model`、`Tools · Web Search` 响应示例里的 `model`，
+  都不再写死模型名，改配置后同步变化
 - `api_models.generate` 为空时，被**其它家族显式认领**的名字（连同解析后的目标名）不会出现在
   generate/chat 里：`api_models.embed` / `rerank` / `systemone` 与 `rerank.models` 都算，空字符串
   条目不算认领；匹配忽略结尾的 `:latest`（`systemone: ["tev1"]` 能挡住声明的 `tev1:latest`）。
@@ -1608,9 +1615,10 @@ curl -b cookie.txt http://localhost:8000/v1/management/api-test \
   仍是三态下拉（System One 的可选 `stream` 因此还能留空）。两个 LLM 窗口的 `stream` 默认 `false`，
   请求体预览里能直接看到 `"stream": false`；generate 窗口的 `think` 默认 `false`，chat 窗口的
   `reasoning_effort` 默认不设置（`none` 在 Ollama 上关闭思考）。其余清空的字段不会进入请求体
-- **模型用真正的下拉框选择**：打开时选中 `default_model`，选项即该家族的候选列表；`free_model`
-  家族（System One / Web Search）在下拉末尾多一项「自定义模型…」，选中后在下方出现手输输入框
-  （自动聚焦、带 `<datalist>` 候选），再选回列表里的名字就收起。旧版把默认值填在输入框里，
+- **模型用真正的下拉框选择**：打开时选中 `default_model`，选项即该家族的候选列表；**留空推导**的
+  `free_model` 家族（System One / Web Search）在下拉末尾多一项「自定义模型…」，选中后在下方出现手输
+  输入框（自动聚焦、带 `<datalist>` 候选），再选回列表里的名字就收起；一旦 `api_models` 明确列出该
+  家族的名字，`free_model=false`，这一项消失。旧版把默认值填在输入框里，
   Chromium 按框内文字过滤 datalist，其它候选根本看不见
 - **模型可以清除**：字段旁的 ×（或 select 里的空白项）把它清掉后，请求体预览里没有 `model`；
   `model_required` 的家族在发送前被本地拦下（「请先选择模型」），`free_model` 家族则把请求

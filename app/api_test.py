@@ -49,8 +49,9 @@ class Kind:
     family: str
     #: Whether the endpoint needs a model at all (web search lets the provider choose).
     model_required: bool
-    #: Whether a name outside the selector is legal (a laya-server routing enum, an
-    #: opencode-port model id), which makes the console select accept free input.
+    #: Whether a name outside the selector may be legal (a laya-server routing enum, an
+    #: opencode-port model id). Only honoured when the family's choices were derived; an
+    #: explicit `api_models` list is a closed set and the console hides the free-text entry.
     free_model: bool = False
     #: Whether the endpoint speaks Ollama's native dialect (`/api/...`). An `lmstudio` or
     #: `opencode` upstream answers only the `/v1` side, so its models must not be offered.

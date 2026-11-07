@@ -31,6 +31,7 @@ import {
   fmtPct,
   fromInputValue,
   todayEndInput,
+  vramText,
 } from '@/utils/format'
 
 const POLL_MS = 60000
@@ -75,6 +76,15 @@ const vramPct = computed(() => {
   const total = kpi.value.vram_total_gib
   if (!used || !total) return 0
   return Math.min(100, Math.round((used / total) * 100))
+})
+// The KPI tile splits the value into a large number and a smaller suffix. Keep the unit
+// in that suffix even when no vram_total_gib is configured, otherwise the card is a bare
+// number with no unit at all.
+const vramUnitSuffix = computed(() => {
+  const used = kpi.value.vram_used_gib
+  if (used === null || used === undefined) return ''
+  const total = kpi.value.vram_total_gib
+  return total ? ` / ${Number(total).toFixed(1)} GiB` : ' GiB'
 })
 
 async function loadOverview() {
@@ -333,7 +343,7 @@ onBeforeUnmount(() => {
       <div class="label">{{ t('dashboard.kpi.vram') }}</div>
       <div v-if="overview" class="val">
         {{ kpi.vram_used_gib === undefined ? '—' : Number(kpi.vram_used_gib).toFixed(1)
-        }}<small v-if="kpi.vram_total_gib"> / {{ Number(kpi.vram_total_gib).toFixed(1) }} GiB</small>
+        }}<small>{{ vramUnitSuffix }}</small>
       </div>
       <div v-else class="val"><span class="skeleton"></span></div>
       <div class="bar"><i :style="{ width: `${vramPct}%` }"></i></div>
@@ -373,10 +383,7 @@ onBeforeUnmount(() => {
               </span>
             </td>
             <td>{{ fmtInt(u.loaded) }}</td>
-            <td class="mono">
-              {{ u.vram_used_gib === null || u.vram_used_gib === undefined ? '—' : Number(u.vram_used_gib).toFixed(1) }}
-              <template v-if="u.vram_total_gib"> / {{ Number(u.vram_total_gib).toFixed(1) }} GiB</template>
-            </td>
+            <td class="mono">{{ vramText(u.vram_used_gib, u.vram_total_gib) }}</td>
             <td class="mono">{{ u.reachable ? `${u.probe_ms} ms` : t('common.timeout') }}</td>
           </tr>
           <tr v-if="!upstreams.length">

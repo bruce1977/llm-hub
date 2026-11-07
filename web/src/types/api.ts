@@ -4,7 +4,9 @@
 
 export type UpstreamType = 'ollama' | 'openai' | 'lmstudio' | 'opencode' | (string & {})
 export type UpstreamStatus = 'online' | 'offline'
-export type DeviceKind = 'gpu' | 'partial' | 'cpu'
+/** `/api/ps` classifies an Ollama resident model by size_vram/size; hosted providers
+ *  (opencode) have no load state and report `cloud` instead. */
+export type DeviceKind = 'gpu' | 'partial' | 'cpu' | 'cloud'
 export type DistributionKey = 'upstream' | 'model' | 'status'
 export type Bucket = 'hour' | 'day'
 
@@ -459,7 +461,8 @@ export interface ApiTestKindContext {
   endpoint: string
   family: string
   model_required: boolean
-  /** A name outside `models` is legal (a laya routing enum, an opencode-port model id). */
+  /** A derived family may accept a name outside `models` (a laya enum, an opencode-port id).
+   *  False once `api_models` explicitly listed the family's choices. */
   free_model: boolean
   enabled: boolean
   /** Which config block the list came from, shown so the user knows where to edit it. */

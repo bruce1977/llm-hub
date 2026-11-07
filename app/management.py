@@ -1066,8 +1066,14 @@ def _family_list(cfg, family: str) -> tuple[list[str], str]:
     `api_models.<family>` always wins; otherwise each family falls back to the block that
     already names its models (`rerank.models`, `systemone.model`), and with nothing declared
     the caller gets the whole pool (`upstreams[].models`) so a tester is never empty.
+
+    Blank entries are dropped: a `- ''` line in the YAML is a placeholder, not a model, and
+    letting it through would put an empty `<option>` in every selector. A list of nothing but
+    placeholders therefore counts as "not configured" and takes the fallback.
     """
-    explicit = list(getattr(cfg.api_models, family, []))
+    explicit = [
+        name for name in getattr(cfg.api_models, family, []) if isinstance(name, str) and name.strip()
+    ]
     if explicit:
         return explicit, f"api_models.{family}"
     if family == "rerank" and cfg.rerank.models:
@@ -1164,7 +1170,9 @@ def _claimed_names(cfg) -> set[str]:
     )
     claimed: set[str] = set()
     for name in declared:
-        if not name:
+        # Mirrors `_family_list`: a whitespace-only placeholder is not a name and must not
+        # become a claim (it would otherwise be compared against every real model).
+        if not name or not name.strip():
             continue
         claimed.add(_bare(name))
         claimed.add(_bare(cfg.resolve(name).target))
@@ -1222,7 +1230,11 @@ async def api_test_models(request: Request, _=Depends(require_admin)):
     kinds: dict[str, Any] = {}
     for name, kind in KINDS.items():
         rows, source = _family_rows(cfg, kind.family, pool, native=kind.native)
-        if kind.executor == "websearch" and ws_owner is not None:
+        # A family the config explicitly listed is a closed set: neither the web-search
+        # provider filter below nor a typed-in name may add or remove anything from it.
+        # Everything else is a derived pool, where both are still useful.
+        configured = source.startswith("api_models.")
+        if kind.executor == "websearch" and not configured and ws_owner is not None:
             provider_rows = [row for row in rows if row["upstream"] == ws_owner.name]
             if provider_rows:
                 rows, source = provider_rows, "upstreams[].models (search provider)"
@@ -1247,7 +1259,10 @@ async def api_test_models(request: Request, _=Depends(require_admin)):
             "endpoint": endpoint,
             "family": kind.family,
             "model_required": kind.model_required,
-            "free_model": kind.free_model,
+            # `free_model` is the escape hatch for a family whose names the gateway cannot
+            # know (laya enums, opencode-port ids). Once `api_models` spells the choices out,
+            # the selector offers exactly those and the custom entry disappears.
+            "free_model": kind.free_model and not configured,
             "enabled": enabled,
             "source": source,
             "models": rows,

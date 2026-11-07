@@ -7,6 +7,7 @@ import { api } from '@/api/management'
 import ApiDoc from '@/components/ApiDoc.vue'
 import ConfigCard from '@/components/ConfigCard.vue'
 import TopBar from '@/components/TopBar.vue'
+import { useApiTestContext } from '@/composables/apiTestContext'
 import type { LlmModel, ToolsWebSearch } from '@/types/api'
 import type { ApiParam, ConfigRow, TestField } from '@/types/ui'
 import { deviceBadge, fmtClock } from '@/utils/format'
@@ -14,6 +15,12 @@ import { deviceBadge, fmtClock } from '@/utils/format'
 type Tab = 'models' | 'api'
 
 const { t } = useI18n()
+const { error: contextError, load: loadContext, kindContext } = useApiTestContext()
+
+// The sample answer names the model the web-search tester can actually pick. `model` is
+// optional here, so the backend leaves the selector unselected; the first configured name
+// (api_models.websearch, or the derived provider pool) is the honest example.
+const exampleModel = computed(() => kindContext('websearch')?.models[0]?.model ?? '<model>')
 
 const cfg = ref<ToolsWebSearch | null>(null)
 // The provider is an ordinary upstream, so its models come from the same projection the
@@ -84,9 +91,9 @@ const requestExample = {
   synthesize: false,
 }
 
-const responseExample = {
+const responseExample = computed(() => ({
   query: 'llm-hub 网关 使用教程',
-  model: 'opencode/big-pickle',
+  model: exampleModel.value,
   engine: 'opencode-websearch',
   answer: null,
   truncated: true,
@@ -100,7 +107,7 @@ const responseExample = {
   ],
   text: '所有检索段落拼接，可直接塞进 prompt',
   sources: ['https://example.com/doc'],
-}
+}))
 
 const rows = computed<ConfigRow[]>(() => {
   const c = cfg.value
@@ -142,7 +149,10 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  void load()
+  void loadContext()
+})
 </script>
 
 <template>
@@ -156,6 +166,7 @@ onMounted(load)
   />
 
   <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
+  <div v-if="contextError" class="warn-strip">⚠ {{ contextError }}</div>
 
   <div class="tabs" role="tablist">
     <button

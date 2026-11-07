@@ -867,10 +867,28 @@ def run() -> int:
         check("distribution items sum to the log", sum(counts.values()) == total, f"{sum(counts.values())} vs {total}")
         check("distribution is ordered by count", list(counts) == [k for k, _ in sorted(counts.items(), key=lambda kv: -kv[1])], str(list(counts)))
 
-        status_items = client.get("/v1/management/stats/distribution", params={"group_by": "status"}).json()["items"]
+        wide = {"start": "2020-01-01T00:00:00", "end": "2030-01-01T00:00:00"}
+        status_items = client.get(
+            "/v1/management/stats/distribution", params={"group_by": "status", **wide}
+        ).json()["items"]
         status_counts = {item["key"]: item["count"] for item in status_items}
         check("status buckets into ok / error", set(status_counts) == {"ok", "error"}, str(status_counts))
-        check("status errors include 403 and 502", status_counts.get("error", 0) >= 2, str(status_counts))
+        # One error definition for the whole console: HTTP >= 500 only. The 403 from the
+        # blocked admin call above is a caller-side rejection and lands in `ok`; the 502 from
+        # the dead upstream is the only error, matching error_rate, timeseries and failures.
+        failures_wide = client.get("/v1/management/stats/failures", params=wide).json()
+        ts_wide = client.get("/v1/management/stats/timeseries", params=wide).json()
+        four_xx = client.get(
+            "/v1/management/requests", params={**wide, "status": "4xx", "page_size": 1}
+        ).json()["pagination"]["total"]
+        err = failures_wide["total"] - failures_wide["ok"]
+        check("status error counts only 5xx", status_counts.get("error", 0) == err, str(status_counts))
+        check(
+            "status error matches the timeseries bars",
+            sum(p["errors"] for p in ts_wide["points"]) == err,
+            str(ts_wide["points"])[:200],
+        )
+        check("4xx rows are not errors", four_xx >= 1 and status_counts.get("ok", 0) >= four_xx, str(status_counts))
 
         model_counts = {
             item["key"]: item["count"]
@@ -1204,6 +1222,7 @@ def run() -> int:
         check("systemone follows the enabled switch", so["enabled"] is True)
         ws = kinds["websearch"]
         check("web search leaves the model to the provider", ws["model_required"] is False and ws["default_model"] is None, str(ws))
+        check("a derived family still allows a typed model", ws["free_model"] is True, str(ws.get("free_model")))
         check("a disabled capability says so instead of hiding the tester", ws["enabled"] is False)
         check("an unconfigured provider key is shown as absent", ws["api_key"] is None, str(ws))
         check(
@@ -1346,6 +1365,26 @@ def run() -> int:
             check("web search still lists the names it was given",
                   {m["model"] for m in others["websearch"]["models"]} == {"qwen3:8b"},
                   str(others["websearch"]["models"]))
+            # An explicit list is a closed set: the search-provider filter must not replace
+            # it, and the custom-model entry must not let a name outside it in.
+            check("an explicit websearch list wins over the provider filter",
+                  others["websearch"]["source"] == "api_models.websearch", str(others["websearch"]["source"]))
+            check("an explicit list closes the custom-model entry",
+                  others["websearch"]["free_model"] is False and others["systemone"]["free_model"] is False,
+                  str({k: others[k]["free_model"] for k in ("websearch", "systemone")}))
+
+            # A `- ''` line in the YAML is a placeholder, not a model. Blank-only lists are
+            # "not configured", so they still take the derived pool.
+            patch_config(api_models={"websearch": ["", "  ", "qwen3:8b"]})
+            blanks = client.get("/v1/management/api-test/models").json()["kinds"]
+            check("blank api_models entries never become a selectable model",
+                  [m["model"] for m in blanks["websearch"]["models"]] == ["qwen3:8b"],
+                  str(blanks["websearch"]["models"]))
+            patch_config(api_models={"websearch": ["", "  "]})
+            all_blank = client.get("/v1/management/api-test/models").json()["kinds"]
+            check("a list of only blank entries still derives from the provider",
+                  all_blank["websearch"]["source"] != "api_models.websearch",
+                  str(all_blank["websearch"]["source"]))
 
             # Ollama reads `tagged` and `tagged:latest` as one model, so a tagless entry in
             # api_models still claims the declared name.

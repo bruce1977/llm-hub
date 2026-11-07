@@ -6,7 +6,7 @@ import { errorDetail, errorResponseBody, statusOf } from '@/api/client'
 import { api } from '@/api/management'
 import TopBar from '@/components/TopBar.vue'
 import type { ProbeResult, RunningModel, UpstreamDetail } from '@/types/api'
-import { deviceBadge, fmtClock, fmtInt, memoryText } from '@/utils/format'
+import { deviceBadge, fmtClock, fmtInt, memoryText, vramText } from '@/utils/format'
 
 const { t } = useI18n()
 
@@ -67,12 +67,6 @@ async function toggle(name: string) {
   }
   expanded.value = [...expanded.value, name]
   await loadDetail(name)
-}
-
-function vramText(u: ProbeResult): string {
-  if (u.vram_used_gib === null || u.vram_used_gib === undefined) return '—'
-  const used = Number(u.vram_used_gib).toFixed(1)
-  return u.vram_total_gib ? `${used} / ${Number(u.vram_total_gib).toFixed(1)} GiB` : `${used} GiB`
 }
 
 /** One row per model declared in config.yaml, left-joined with the live /api/ps state.
@@ -181,7 +175,7 @@ onBeforeUnmount(() => {
                 >
               </td>
               <td>{{ fmtInt(u.loaded) }}</td>
-              <td class="mono">{{ vramText(u) }}</td>
+              <td class="mono">{{ vramText(u.vram_used_gib, u.vram_total_gib) }}</td>
               <td class="mono">{{ u.reachable ? `${u.probe_ms} ms` : t('common.timeout') }}</td>
             </tr>
             <tr v-if="expanded.includes(u.name)" class="row-expand">

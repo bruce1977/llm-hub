@@ -6,6 +6,7 @@ import { errorDetail, statusOf } from '@/api/client'
 import { api } from '@/api/management'
 import ApiDoc from '@/components/ApiDoc.vue'
 import TopBar from '@/components/TopBar.vue'
+import { useApiTestContext } from '@/composables/apiTestContext'
 import type { BenchHistoryRecord, BenchJob, LlmModel, ModelsLlm } from '@/types/api'
 import type { ApiParam, ApiRequestSpec, ApiResponseSpec, TestField } from '@/types/ui'
 import { deviceBadge, fmtClock, fmtInt, memoryText } from '@/utils/format'
@@ -13,6 +14,14 @@ import { deviceBadge, fmtClock, fmtInt, memoryText } from '@/utils/format'
 type Tab = 'models' | 'api'
 
 const { t } = useI18n()
+const { error: contextError, load: loadContext, kindContext } = useApiTestContext()
+
+// Every sample body must name a model the matching tester can actually pick. That picker is
+// narrowed by api_models.generate and otherwise derived from the declared pool, so the
+// examples read the same /api-test/models payload instead of naming a model by hand.
+const exampleModel = computed(
+  () => kindContext('chat')?.default_model ?? kindContext('generate')?.default_model ?? '<model>',
+)
 
 const data = ref<ModelsLlm>({ models: [], aliases: [], num_ctx_overrides: {} })
 const lastUpdated = ref('')
@@ -254,7 +263,7 @@ const generateRequest = computed<ApiRequestSpec>(() => ({
   path: '/api/generate',
   headers: authHeaders,
   body: {
-    model: 'qwen3:8b',
+    model: exampleModel.value,
     prompt: '写一首关于编程的诗：',
     raw: true,
     stream: false,
@@ -268,8 +277,8 @@ const generateResponse = computed<ApiResponseSpec>(() => ({
   contentType: 'application/x-ndjson',
   note: t('modelsLlm.responses.generateNote'),
   body:
-    '{"model":"qwen3:8b","response":"代码","done":false}\n' +
-    '{"model":"qwen3:8b","response":"如诗行","done":true,"done_reason":"stop",' +
+    `{"model":"${exampleModel.value}","response":"代码","done":false}\n` +
+    `{"model":"${exampleModel.value}","response":"如诗行","done":true,"done_reason":"stop",` +
     '"prompt_eval_count":12,"eval_count":50}',
 }))
 
@@ -288,7 +297,7 @@ const chatRequest = computed<ApiRequestSpec>(() => ({
   path: '/v1/chat/completions',
   headers: authHeaders,
   body: {
-    model: 'qwen3:8b',
+    model: exampleModel.value,
     messages: [
       { role: 'system', content: '你是一个有帮助的助手' },
       { role: 'user', content: '什么是机器学习？' },
@@ -307,7 +316,7 @@ const chatResponse = computed<ApiResponseSpec>(() => ({
     id: 'chatcmpl-abc123',
     object: 'chat.completion',
     created: 1694000000,
-    model: 'qwen3:8b',
+    model: exampleModel.value,
     choices: [
       {
         index: 0,
@@ -336,7 +345,7 @@ const messagesRequest = computed<ApiRequestSpec>(() => ({
   path: '/v1/messages',
   headers: authHeaders,
   body: {
-    model: 'qwen3:8b',
+    model: exampleModel.value,
     max_tokens: 256,
     system: '你是一个有帮助的助手',
     messages: [{ role: 'user', content: '什么是机器学习？' }],
@@ -352,7 +361,7 @@ const messagesResponse = computed<ApiResponseSpec>(() => ({
     id: 'msg_abc123',
     type: 'message',
     role: 'assistant',
-    model: 'qwen3:8b',
+    model: exampleModel.value,
     content: [{ type: 'text', text: '机器学习是人工智能的一个分支...' }],
     stop_reason: 'end_turn',
     stop_sequence: null,
@@ -436,7 +445,10 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  void load()
+  void loadContext()
+})
 </script>
 
 <template>
@@ -450,6 +462,7 @@ onMounted(load)
   />
 
   <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
+  <div v-if="contextError" class="warn-strip">⚠ {{ contextError }}</div>
 
   <div class="tabs" role="tablist">
     <button

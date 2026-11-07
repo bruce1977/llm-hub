@@ -448,6 +448,8 @@ const zhCN = {
       model: '模型',
       type: '类型',
       endpoint: '调用端点',
+      empty: '未找到可用的嵌入模型。请在 config.yaml 的 api_models.embed 或 upstreams[].models 中声明。',
+      sourceNote: '清单实时取自 {source}，与页面下方两个测试窗口共用同一份 /api-test/models 数据；修改配置后刷新页面或点击「重新探测」即可更新。',
     },
     availableNote:
       '嵌入模型与 LLM 共用 {models} / {aliases}。调用时通过 {model} 指定上表模型；未声明（且未被前缀通配覆盖）时会 {code} 路由失败，上游未拉取该模型时由 Ollama 报错。',
@@ -560,9 +562,11 @@ const zhCN = {
       model: '模型',
       type: '类型',
       endpoint: '调用端点',
+      empty: '未找到可用的决策模型。请在 config.yaml 的 api_models.systemone 中声明，或留空让网关从 systemone.model / upstreams[].models 推导。',
+      sourceNote: '清单实时取自 {source}，与下方测试窗口共用同一份 /api-test/models 数据；修改配置后刷新页面或点击「重新探测」即可更新。',
     },
     availableNote:
-      '清单为决策后端可接受的模型名，由请求体 {model} 指定；缺省时网关按配置注入 {injected}（{local} 表示不注入）。实际能否调用取决于后端（laya-server 或 Ollama 0.40+）是否已部署该模型。',
+      '清单来自 api_models.systemone（留空时由网关推导），由请求体 {model} 指定；缺省时网关按配置注入 {injected}（{local} 表示不注入）。实际能否调用取决于后端（laya-server 或 Ollama 0.40+）是否已部署该模型。',
     params: {
       state: '自由结构，承载待判定的上下文（如 message），原样透传给后端',
       questions: '问题 id → 问题定义，至少 1 项；type 决定判定形态',

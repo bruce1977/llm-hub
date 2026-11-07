@@ -376,20 +376,27 @@ num_ctx_overrides:
 
 `upstreams[].models` says what an instance declares, not what role it plays: nothing there tells
 the console that `bge-m3` answers `/api/embed` while `qwen3:8b` answers `/api/generate`. This block
-is that missing statement - one optional list per API family, and the thing the model pickers on the
-`API usage` tabs read:
+is that missing statement - one optional list per API family. **Every** model picker on the
+`API usage` tabs reads it (or its documented fallback), and so do the "Available models" tables
+and the `model` in the request/response examples across the console: all of them share one
+`/v1/management/api-test/models` payload.
 
 ```yaml
 api_models:
-  generate: []                       # POST /api/generate + POST /v1/chat/completions
-  embed: [bge-m3:latest]             # POST /api/embed + POST /v1/embeddings
-  rerank: []                         # POST /v1/rerank
-  systemone: []                      # POST /v1/systemone
-  websearch: []                      # POST /v1/tools/web-search
+  generate: []                       # /api/generate · /v1/chat/completions · /v1/messages
+  embed: [bge-m3:latest]             # /api/embed · /v1/embeddings
+  rerank: []                         # /v1/rerank
+  systemone: []                      # /v1/systemone
+  websearch: []                      # /v1/tools/web-search
 ```
 
 - A list may name a real model id, a `upstreams[].model_aliases` short name or a root `aliases:`
   model. The alias stays the name that gets sent, so the gateway still injects its fixed parameters.
+- **A non-empty list is a closed set.** Its names are the family's entire picker, `source`
+  reports `api_models.<family>`, no provider-side narrowing is applied, and the
+  「Custom model…」 entry disappears - change the config to add or remove a model. Blank lines
+  (`- ''` or whitespace only) are placeholders and ignored; a list of nothing but placeholders
+  counts as empty.
 - **An empty list means "derive", not "none"** - a config written before this block existed needs
   no edit. `rerank` falls back to `rerank.models`, `systemone` to `systemone.model`, everything else
   to the whole set of declared (and alias) names. Each picker says which of these it read
@@ -409,10 +416,14 @@ api_models:
   `:latest`, since Ollama treats `tev1` and `tev1:latest` as one model. A fallback such as
   `systemone.model` is **not** a claim either: the same box may well answer decision requests, and
   it must stay selectable for chat.
-- `websearch` lists the search provider's own models. Its tester's dropdown ends in a
-  「Custom model…」 entry for any name, because opencode-port resolves `model` itself (omitting it
-  uses the provider's default). `systemone` offers the same entry, since a laya-server backend takes
-  a routing enum (`auto` / `english` / `multilingual` / `typed-decisions`) rather than a model id.
+- `websearch` lists the search provider's own models. **When left empty** (or filled only with
+  placeholders), the backend narrows the candidates to the models declared by
+  `websearch.upstream` and reports `source: "upstreams[].models (search provider)"`. An explicit
+  list is used as written, without that narrowing.
+- The 「Custom model…」 entry appears only for **derived** families: opencode-port resolves
+  `model` itself (omitting it uses the provider's default), and a laya-server backend takes a
+  routing enum (`auto` / `english` / `multilingual` / `typed-decisions`) rather than a model id.
+  Once `api_models` spells the choices out, the entry goes away - the picker offers exactly those.
 - A name nothing serves stays **visible** and marked `未被声明` / `Unserved`: a dead entry is a
   misconfiguration to show, not to hide.
 - These lists only narrow what the console offers. **Routing is untouched** - the gateway still
@@ -624,7 +635,8 @@ request and response examples, and the note that `POST /api/generate` and `POST 
 **stream by default** (omitting `stream` yields NDJSON and SSE respectively), while `POST /v1/messages`
 defaults to a single JSON envelope. Models · Embed
 (sits above Rerank) documents the two embedding pass-throughs - `POST /api/embed` (Ollama native) and
-`POST /v1/embeddings` (OpenAI-compatible) - and fetches no configuration because there is none.
+`POST /v1/embeddings` (OpenAI-compatible). Its "Available models" table and the `model` in its
+examples come from `api_models.embed`, just like its testers - no model name is hardcoded.
 Each of those documents carries a **`Test` button** at the right end of its *Request parameters*
 header; it opens the **API tester** in a popup over the page (closing and reopening keeps what you
 typed and the last answer). Its model picker is narrowed by `api_models`; models on an `lmstudio` or
@@ -636,9 +648,10 @@ upstream and runtime state in the hover tooltip and an unserved name still liste
 the popup opens**, plus `Restore defaults` / `Clear`, a `Show request body` preview, and the result -
 status, duration, first-token time for a real stream, the model the gateway actually routed to plus
 the parameters an alias injected, the answer pulled out of the JSON / NDJSON / SSE payload and the
-raw body. **The model is a real dropdown**, preset to the default and listing every candidate;
-`systemone` / `websearch` add a final 「Custom model…」 entry that swaps in a free-text box with
-the same suggestions, and re-picking a listed name closes it again. **It can be cleared**: the `×`
+raw body. **The model is a real dropdown**, preset to the default and listing every candidate. An explicit
+`api_models` list is a closed set and every sample body on the page uses those same names; only
+**derived** `systemone` / `websearch` families add a final 「Custom model…」 entry that swaps in a
+free-text box with the same suggestions, and re-picking a listed name closes it again. **It can be cleared**: the `×`
 next to the field (or the select's empty option) leaves it out of the body - a family that needs one
 answers the local 「pick a model first」 guard, while `systemone` / `websearch` let the endpoint
 decide (System One still injects `systemone.model`). `Restore defaults` re-selects `default_model`,

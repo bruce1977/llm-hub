@@ -1009,9 +1009,9 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
 | `GET` | `/v1/management/requests` | 请求明细：`start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`，返回 `stats` + `rows` + `pagination` + `request_log`（开关状态）。**只统计 API 调用**：查询始终带上 `request_log.API_PATH_SCOPE`（`path LIKE '/v1/%' OR path LIKE '/api/%'`），`/health`、`/metrics`、`/openapi.json`、`/admin/*` 等行照旧入库，但不出现在列表、图表、KPI 与失败统计里 |
 | `GET` | `/v1/management/requests/{id}` | 单条明细（含截断至 8 KB 的请求/响应体，敏感字段已脱敏） |
 | `GET` | `/v1/management/stats/timeseries` | 时序聚合：`bucket=hour\|day`，每桶 `count` / `errors` / `p95`。`tz_offset`（UTC 加多少分钟等于调用方本地时间，UTC+8 为 `480`，取值 -840..840）只影响 **day** 桶的分组，让每根柱子是一个本地自然日而不是 UTC 日；hour 桶保持 UTC，因为控制台是把它们当时间点渲染成本的 |
-| `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count}]}`；`status` 只分 `ok`(<400) / `error`(≥400)，未命中上游的行计入 `-` |
+| `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count}]}`；`status` 只分 `ok`(<500，含 4xx) / `error`(≥500)，与错误率、趋势图错误柱、`failures` 同一口径；未命中上游的行计入 `-` |
 | `GET` | `/v1/management/stats/failures` | 失败统计：`by_code` / `by_upstream` / `samples` |
-| `GET` | `/v1/management/api-test/models` | 每个 API 家族的可用模型、默认值与掩码密钥：`kinds` 以 `generate` / `chat` / `messages` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch` 为键，每键含 `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source`（选项来自哪个配置项）/ `models[]`（`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key`（掩码）/ `unknown`）/ `default_model` / `api_key`（掩码）/ `api_key_env`；顶层另有 `max_response_bytes`。`api_models` 为空时按配置推导；`/api/...` 原生端点（`generate`、`embed_ollama`）只列 `type: "ollama"` 上游的模型，`/v1/...` 端点（`chat`、`messages`、`embed_openai`）也列 `lmstudio` / `opencode` 的模型；显式 `api_models` 列表按原样返回。一次探测所有上游，所以前端整站共用一份缓存，只在首次打开与点击「重新探测」时取 |
+| `GET` | `/v1/management/api-test/models` | 每个 API 家族的可用模型、默认值与掩码密钥：`kinds` 以 `generate` / `chat` / `messages` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch` 为键，每键含 `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source`（选项来自哪个配置项）/ `models[]`（`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key`（掩码）/ `unknown`）/ `default_model` / `api_key`（掩码）/ `api_key_env`；顶层另有 `max_response_bytes`。`api_models` 为空时按配置推导；`/api/...` 原生端点（`generate`、`embed_ollama`）只列 `type: "ollama"` 上游的模型，`/v1/...` 端点（`chat`、`messages`、`embed_openai`）也列 `lmstudio` / `opencode` 的模型；显式 `api_models` 列表按原样返回（封闭集合，忽略 `- ''` 之类的空白占位符，且 `free_model=false`）。一次探测所有上游，所以前端整站共用一份缓存，只在首次打开与点击「重新探测」时取 |
 | `POST` | `/v1/management/api-test` | Body `{"kind": "generate", "body": {...}}`；服务端用网关自己的服务发出这一笔请求，返回信封 `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`。`kind` 不在白名单、或需要模型的家族没给 `model` → `400` |
 | `POST` | `/v1/management/bench` | 启动一次模型测速任务，Body `{"upstream": "...", "model": "...", "rounds"?: 4, "max_tokens"?: 500, "think"?: "auto"}`，立即返回 `{"job_id": "...", "status": "pending"}`；任务在后台跑 |
 | `GET` | `/v1/management/bench/history` | 该 `upstream` + `model` 最近的 **3** 份测速记录（`?upstream=&model=`），按时间倒序，每行含 `decode_tok_s` / `decode_sd` / `prefill_tok_s` / `ttft_ms` / `timing_source` 与完整 `payload`。**注册顺序在 `/bench/{job_id}` 之前**，否则 "history" 会被当成 job_id |
@@ -1039,7 +1039,7 @@ curl -H "X-API-Key: $GATEWAY_API_KEY" http://localhost:8888/v1/management/overvi
              { "key": "lmstudio", "count": 380 },
              { "key": "-", "count": 12 } ] }
 
-// group_by=status 只有两个键：ok（status < 400）与 error（status >= 400）
+// group_by=status 只有两个键：ok（status < 500，含 4xx）与 error（status >= 500）
 
 // GET /v1/management/tools/websearch
 { "enabled": true, "endpoint": "/v1/tools/web-search", "upstream": "opencode",
@@ -1158,8 +1158,10 @@ Key 不再是密钥文件里的一行文本，而是 `llmhub.db` 中 `api_keys` 
   （`api_models.embed` / `rerank` / `systemone` 与 `rerank.models`，比较时忽略 `:latest`）。
   `api_models.websearch` 不算认领——搜索端点本质是聊天透传，托管 provider 的路由模型
   （如 `opencode/auto`）必须继续可选；`systemone.model` 这类兜底同样不算。
-  `free_model`（`systemone` 的 laya-server 枚举、`websearch` 的 opencode-port 模型 id）的下拉
-  末尾多一项「自定义模型…」，选中后换成可手输的输入框，因为这两个端点本就不经网关解析模型；
+  **非空的 `api_models` 列表是封闭集合**：原样返回、不做 provider 收窄、忽略 `- ''` 之类的空白占位符，
+  且 `free_model` 置为 `false`——页里的「可用模型」表、请求/响应示例与测试窗口都读同一份结果。
+  只有**留空推导**的 `systemone` / `websearch` 家族才保留 `free_model: true`（laya-server 的路由枚举、
+  opencode-port 的模型 id），下拉末尾多一项「自定义模型…」，选中后换成可手输的输入框；
   再选回列表里的名字即可收起。测试窗口一打开就带着各参数的初始值，
   「恢复默认值」重新填入，「清空」则把每一项置空。**模型同样可以清除**：字段旁的 ×（或下拉的
   空白项）清空后请求体不带 `model`——需要模型的家族由窗口先拦下提示「请先选择模型」，

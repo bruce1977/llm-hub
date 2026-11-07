@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (every tester picker now honours `api_models`)
+
+- **A non-empty `api_models.<family>` list is now a closed set.** `websearch` used to be replaced
+  by the search provider's declared models even when the config spelled out the choices, blank
+  entries (`- ''`) could become empty `<option>`s, and `systemone` / `websearch` always offered
+  「Custom model…」. The provider filter, the free-text entry and any extra narrowing now apply
+  only to **derived** families (an empty list), so the config's names are exactly what every
+  picker offers. Blank placeholders are dropped; a list of only placeholders still derives.
+- **No hardcoded model names left on the console.** `Models · SystemOne`'s "Available models"
+  table (`tev1:0.8b` / `tev1:latest` / `nimble:latest`), the `qwen3:8b` in the three
+  `Models · LLM` request/response samples and `opencode/big-pickle` in the Web Search response
+  sample now read the same `/api-test/models` payload as their testers. The SystemOne table
+  gained a source tag, an empty state and an upstream tooltip.
+- Docs: USAGE / USAGE_CN, API / API_CN, TESTCASES, AGENTS and the web-management design doc
+  describe the closed-set rule; `test_management.py` grows to 407 checks.
+
+### Fixed (one error definition, a config-driven Embedding model list, and VRAM units)
+
+- **`stats/distribution?group_by=status` now counts only HTTP >= 500 as `error`.** It used to split
+  at 400, so the status pie disagreed with the KPI error rate, the timeseries error bars and
+  `/stats/failures` on the same window (3 vs 0 on the real database). `request_log._DISTRIBUTION_KEYS`
+  now shares the `status >= 500` threshold; 4xx replies such as a blocked `/api/pull` stay in
+  `ok`. The pie's two counters are the only changed values, and API/API_CN, AGENTS, TESTCASES,
+  the web-management design doc and the management test suite were updated to match.
+- **Models · Embedding no longer hardcodes `bge-m3:latest`.** The available-model table, its tab
+  count, the config-source tag and all four request/response examples now come from
+  `/v1/management/api-test/models` (`kinds.embed_ollama` + `kinds.embed_openai`), i.e. from
+  `api_models.embed` with the declared `upstreams[].models` pool as fallback — exactly the pool
+  the page's own two testers use. A model served by both families shows both endpoints; an empty
+  pool shows a configuration hint; with nothing configured the examples use a `<model>` placeholder.
+  New `modelsEmbed.available.empty` / `sourceNote` keys in all three languages.
+- **Console VRAM values always carry their unit.** The Dashboard KPI and its upstream table showed
+  a bare number whenever `vram_total_gib` was not configured. `format.ts` gained
+  `vramText(used, total)`, shared by DashboardView and UpstreamsView; `DeviceKind` gained the
+  `cloud` value hosted-provider rows already returned.
+
 ### Added (caller API keys stored as hashes in SQLite, with a console page to mint and revoke)
 
 - **API keys moved out of the file and into the database.** `app/key_store.py` keeps one row per key in

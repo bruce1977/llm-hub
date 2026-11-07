@@ -1,24 +1,54 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import ApiDoc from '@/components/ApiDoc.vue'
 import ConfigCard from '@/components/ConfigCard.vue'
 import TopBar from '@/components/TopBar.vue'
+import { useApiTestContext } from '@/composables/apiTestContext'
 import type { ApiParam, ApiRequestSpec, ApiResponseSpec, ConfigRow, TestField } from '@/types/ui'
 
 type Tab = 'models' | 'api'
 
 const { t } = useI18n()
-
 const tab = ref<Tab>('models')
+const { loading: contextLoading, error: contextError, load: loadContext, kindContext } = useApiTestContext()
+onMounted(() => void loadContext())
 
-// Embedding has no config block of its own: both endpoints are catch-all pass-through, so
-// this list documents the models the gateway routes to them. They must also appear in
-// upstreams[].models (or be covered by a prefix wildcard) to be routable.
-const availableModels = [
-  { name: 'bge-m3:latest', kind: 'embedding', endpoint: '/api/embed · /v1/embeddings' },
-]
+// The available-model card is a projection of config.yaml, not a hardcoded name. Both
+// embedders and the two testers on this page read the same /api-test/models payload, whose
+// embed family is narrowed by api_models.embed and otherwise falls back to the declared
+// upstream models - so the table can never advertise a name the tester would refuse.
+interface EmbedModelRow {
+  name: string
+  upstream: string | null
+  endpoint: string
+}
+
+const availableModels = computed<EmbedModelRow[]>(() => {
+  const sources = [
+    { kind: 'embed_ollama' as const, endpoint: '/api/embed' },
+    { kind: 'embed_openai' as const, endpoint: '/v1/embeddings' },
+  ]
+  const rows = new Map<string, EmbedModelRow>()
+  for (const { kind, endpoint } of sources) {
+    for (const model of kindContext(kind)?.models ?? []) {
+      const hit = rows.get(model.model)
+      if (hit) {
+        if (!hit.endpoint.includes(endpoint)) hit.endpoint = `${hit.endpoint} · ${endpoint}`
+      } else {
+        rows.set(model.model, { name: model.model, upstream: model.upstream, endpoint })
+      }
+    }
+  }
+  return [...rows.values()].sort((a, b) => a.name.localeCompare(b.name))
+})
+const embedSource = computed(() => kindContext('embed_ollama')?.source ?? 'config.yaml')
+// A placeholder, not a model name: when the config declares nothing it must not suggest
+// bge-m3 is installed. The same value keeps the four request/response examples honest.
+const exampleModel = computed(
+  () => kindContext('embed_ollama')?.default_model ?? kindContext('embed_openai')?.default_model ?? '<model>',
+)
 
 // Embedding has no config block: both endpoints are catch-all pass-through, so the page
 // documents the transport instead of projecting a configuration.
@@ -58,7 +88,7 @@ const ollamaRequest = computed<ApiRequestSpec>(() => ({
   path: '/api/embed',
   headers: authHeaders,
   body: {
-    model: 'bge-m3:latest',
+    model: exampleModel.value,
     input: ['你好世界', '机器学习入门'],
     keep_alive: '5m',
   },
@@ -69,7 +99,7 @@ const ollamaResponse = computed<ApiResponseSpec>(() => ({
   contentType: 'application/json',
   note: t('modelsEmbed.responses.embeddingsNote'),
   body: {
-    model: 'bge-m3:latest',
+    model: exampleModel.value,
     embeddings: [
       [0.123, 0.456, 0.789],
       [0.987, 0.654, 0.321],
@@ -92,7 +122,7 @@ const openaiRequest = computed<ApiRequestSpec>(() => ({
   path: '/v1/embeddings',
   headers: authHeaders,
   body: {
-    model: 'bge-m3:latest',
+    model: exampleModel.value,
     input: ['你好世界', '机器学习入门'],
   },
 }))
@@ -107,7 +137,7 @@ const openaiResponse = computed<ApiResponseSpec>(() => ({
       { object: 'embedding', index: 0, embedding: [0.123, 0.456, 0.789] },
       { object: 'embedding', index: 1, embedding: [0.987, 0.654, 0.321] },
     ],
-    model: 'bge-m3:latest',
+    model: exampleModel.value,
     usage: { prompt_tokens: 12, total_tokens: 12 },
   },
 }))
@@ -154,6 +184,8 @@ const openaiFields = computed<TestField[]>(() => [
 <template>
   <TopBar :title="t('nav.modelsEmbed')" :sub="t('modelsEmbed.sub')" />
 
+  <div v-if="contextError" class="warn-strip">⚠ {{ contextError }}</div>
+
   <div class="tabs" role="tablist">
     <button
       class="tab"
@@ -192,7 +224,7 @@ const openaiFields = computed<TestField[]>(() => [
     <ConfigCard :title="t('modelsEmbed.config.title')" tag="passthrough" :rows="rows" />
 
     <div class="card">
-      <div class="card-h">{{ t('modelsEmbed.available.title') }} <span class="tag">models</span></div>
+      <div class="card-h">{{ t('modelsEmbed.available.title') }} <span class="tag">{{ embedSource }}</span></div>
       <table>
         <thead>
           <tr>
@@ -203,9 +235,14 @@ const openaiFields = computed<TestField[]>(() => [
         </thead>
         <tbody>
           <tr v-for="m in availableModels" :key="m.name">
-            <td class="mono">{{ m.name }}</td>
-            <td><span class="chip">{{ m.kind }}</span></td>
+            <td class="mono" :title="m.upstream || undefined">{{ m.name }}</td>
+            <td><span class="chip">embedding</span></td>
             <td class="mono">{{ m.endpoint }}</td>
+          </tr>
+          <tr v-if="!availableModels.length">
+            <td colspan="3" class="empty">
+              {{ contextLoading ? t('common.loading') : t('modelsEmbed.available.empty') }}
+            </td>
           </tr>
         </tbody>
       </table>
@@ -217,6 +254,7 @@ const openaiFields = computed<TestField[]>(() => [
           <template #code><b>404</b></template>
         </i18n-t>
       </div>
+      <div class="api-note">{{ t('modelsEmbed.available.sourceNote', { source: embedSource }) }}</div>
     </div>
 
     <div class="card">

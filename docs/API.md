@@ -1054,9 +1054,9 @@ management endpoints fall back to cookie-only — they never become anonymously 
 | `GET` | `/v1/management/requests` | Request details: `start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`, returning `stats` + `rows` + `pagination` + `request_log` (switch state). **API calls only**: the query always carries `request_log.API_PATH_SCOPE` (`path LIKE '/v1/%' OR path LIKE '/api/%'`), so rows such as `/health`, `/metrics`, `/openapi.json` and `/admin/*` are still stored but never appear in lists, charts, KPIs or failure stats |
 | `GET` | `/v1/management/requests/{id}` | A single detail row (request/response bodies truncated to 8 KB, sensitive fields redacted) |
 | `GET` | `/v1/management/stats/timeseries` | Time-series aggregation: `bucket=hour\|day`, each bucket with `count` / `errors` / `p95`. `tz_offset` (minutes to add to UTC to reach the caller, UTC+8 = `480`, range -840..840) shifts **day** buckets so each bar is one local calendar day instead of one UTC day; hour buckets stay UTC because the console renders them as instants |
-| `GET` | `/v1/management/stats/distribution` | Grouped counts: `group_by=upstream\|model\|status`, returning `{group_by, start, end, items:[{key, count}]}`; `status` only splits into `ok` (<400) / `error` (≥400), and rows with no matched upstream are counted under `-` |
+| `GET` | `/v1/management/stats/distribution` | Grouped counts: `group_by=upstream\|model\|status`, returning `{group_by, start, end, items:[{key, count}]}`; `status` splits into `ok` (<500, 4xx included) / `error` (≥500) — the same threshold as the KPI error rate, the timeseries error bars and `/stats/failures` — and rows with no matched upstream are counted under `-` |
 | `GET` | `/v1/management/stats/failures` | Failure stats: `by_code` / `by_upstream` / `samples` |
-| `GET` | `/v1/management/api-test/models` | Available models, defaults and masked keys per API family: `kinds` is keyed by `generate` / `chat` / `messages` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch`, each with `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source` (which config field the options came from) / `models[]` (`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key` (masked) / `unknown`) / `default_model` / `api_key` (masked) / `api_key_env`; the top level also carries `max_response_bytes`. With `api_models` empty the lists are derived from the config; the native `/api/...` endpoints (`generate`, `embed_ollama`) list only models of `type: "ollama"` upstreams, while the `/v1/...` endpoints (`chat`, `messages`, `embed_openai`) also list `lmstudio` / `opencode` models; an explicit `api_models` list is returned as written. All upstreams are probed in one pass, so the whole console shares a single cache, refreshed on first open and on "probe again" |
+| `GET` | `/v1/management/api-test/models` | Available models, defaults and masked keys per API family: `kinds` is keyed by `generate` / `chat` / `messages` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch`, each with `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source` (which config field the options came from) / `models[]` (`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key` (masked) / `unknown`) / `default_model` / `api_key` (masked) / `api_key_env`; the top level also carries `max_response_bytes`. With `api_models` empty the lists are derived from the config; the native `/api/...` endpoints (`generate`, `embed_ollama`) list only models of `type: "ollama"` upstreams, while the `/v1/...` endpoints (`chat`, `messages`, `embed_openai`) also list `lmstudio` / `opencode` models; an explicit `api_models` list is returned as written (a closed set: blank placeholder entries ignored, `free_model=false`). All upstreams are probed in one pass, so the whole console shares a single cache, refreshed on first open and on "probe again" |
 | `POST` | `/v1/management/api-test` | Body `{"kind": "generate", "body": {...}}`; the server issues the request through the gateway's own service and returns an envelope with `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`. A `kind` outside the allowlist, or a model-requiring family without `model` → `400` |
 | `POST` | `/v1/management/bench` | Starts a speed-test job, body `{"upstream": "...", "model": "...", "rounds"?: 4, "max_tokens"?: 500, "think"?: "auto"}`, returning `{"job_id": "...", "status": "pending"}` immediately; the job runs in the background |
 | `GET` | `/v1/management/bench/history` | The most recent **3** speed tests for that `upstream` + `model` (`?upstream=&model=`), newest first, each row with `decode_tok_s` / `decode_sd` / `prefill_tok_s` / `ttft_ms` / `timing_source` and the full `payload`. **Registered before `/bench/{job_id}`**, otherwise "history" would be read as a job id |
@@ -1084,7 +1084,7 @@ management endpoints fall back to cookie-only — they never become anonymously 
              { "key": "lmstudio", "count": 380 },
              { "key": "-", "count": 12 } ] }
 
-// group_by=status has only two keys: ok (status < 400) and error (status >= 400)
+// group_by=status has only two keys: ok (status < 500, 4xx included) and error (status >= 500)
 
 // GET /v1/management/tools/websearch
 { "enabled": true, "endpoint": "/v1/tools/web-search", "upstream": "opencode",
@@ -1231,10 +1231,12 @@ capture all behave exactly as they do for an external caller, so the page shows 
   claimed by another family no longer appear under generate/chat (`api_models.embed` / `rerank` / `systemone`
   plus `rerank.models`, comparing with `:latest` ignored). `api_models.websearch` does not count as a claim —
   the search endpoint is chat passthrough at heart, so a managed provider's routing model (such as
-  `opencode/auto`) must stay selectable; fallbacks like `systemone.model` do not count either. For
-  `free_model` values (`systemone`'s laya-server enum, `websearch`'s opencode-port model ids) the dropdown ends
-  with a "custom model…" item that swaps into a free-text input, because those two endpoints never resolve the
-  model through the gateway; picking a listed name again collapses it. The tester opens pre-filled with each
+  `opencode/auto`) must stay selectable; fallbacks like `systemone.model` do not count either. **A non-empty
+  `api_models` list is a closed set**: returned as written, with no provider-side narrowing, blank placeholder
+  entries ignored, and `free_model` set to `false`. The "Available models" tables and every request/response
+  example read that same payload. Only **derived** `systemone` / `websearch` families keep `free_model: true`
+  (a laya-server routing enum, an opencode-port model id), where the dropdown ends with a "custom model…"
+  item that swaps into a free-text input; picking a listed name again collapses it. The tester opens pre-filled with each
   parameter's initial value, "restore defaults" refills them and "clear" empties every field. **The model can be
   cleared too**: after the × next to the field (or the blank item in the dropdown), the body carries no
   `model` — families that need one are stopped by the tester with "pick a model first", while

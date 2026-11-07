@@ -8,6 +8,7 @@ import ApiDoc from '@/components/ApiDoc.vue'
 import ConfigCard from '@/components/ConfigCard.vue'
 import JsonPane from '@/components/JsonPane.vue'
 import TopBar from '@/components/TopBar.vue'
+import { useApiTestContext } from '@/composables/apiTestContext'
 import type { ModelsSystemOne } from '@/types/api'
 import type { ApiParam, ConfigRow, TestField } from '@/types/ui'
 import { fmtClock } from '@/utils/format'
@@ -22,13 +23,24 @@ const lastUpdated = ref('')
 const loadError = ref('')
 const refreshing = ref(false)
 
-// System One has a single configured model, but the backend (Ollama 0.40+ / laya-server)
-// accepts several decision models selected by the request body's `model` field.
-const availableModels = [
-  { name: 'tev1:0.8b', kind: 'systemone', endpoint: '/v1/systemone' },
-  { name: 'tev1:latest', kind: 'systemone', endpoint: '/v1/systemone' },
-  { name: 'nimble:latest', kind: 'systemone', endpoint: '/v1/systemone' },
-]
+// The decision models are a projection of api_models.systemone, read from the very same
+// /api-test/models payload the tester below uses. When that list is empty the backend derives
+// it (systemone.model, then the declared pool), so the table follows that derivation too.
+const {
+  loading: contextLoading,
+  error: contextError,
+  load: loadContext,
+  kindContext,
+} = useApiTestContext()
+const availableModels = computed(() =>
+  (kindContext('systemone')?.models ?? []).map((m) => ({
+    name: m.model,
+    kind: 'systemone',
+    endpoint: '/v1/systemone',
+    upstream: m.upstream,
+  })),
+)
+const soSource = computed(() => kindContext('systemone')?.source ?? 'config.yaml')
 
 // 后端透传，管理接口不回传响应体，因此响应示例取自 docs/API.md 的实测结构
 const responseExample = {
@@ -130,7 +142,10 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  void load()
+  void loadContext()
+})
 </script>
 
 <template>
@@ -144,6 +159,7 @@ onMounted(load)
   />
 
   <div v-if="loadError" class="warn-strip">⚠ {{ loadError }}</div>
+  <div v-if="contextError" class="warn-strip">⚠ {{ contextError }}</div>
 
   <div class="tabs" role="tablist">
     <button
@@ -185,7 +201,7 @@ onMounted(load)
       <ConfigCard :title="t('modelsSystemOne.config.title')" tag="systemone" :rows="rows" />
 
       <div class="card">
-        <div class="card-h">{{ t('modelsSystemOne.available.title') }} <span class="tag">models</span></div>
+        <div class="card-h">{{ t('modelsSystemOne.available.title') }} <span class="tag">{{ soSource }}</span></div>
         <table>
           <thead>
             <tr>
@@ -196,9 +212,14 @@ onMounted(load)
           </thead>
           <tbody>
             <tr v-for="m in availableModels" :key="m.name">
-              <td class="mono">{{ m.name }}</td>
+              <td class="mono" :title="m.upstream || undefined">{{ m.name }}</td>
               <td><span class="chip">{{ m.kind }}</span></td>
               <td class="mono">{{ m.endpoint }}</td>
+            </tr>
+            <tr v-if="!availableModels.length">
+              <td colspan="3" class="empty">
+                {{ contextLoading ? t('common.loading') : t('modelsSystemOne.available.empty') }}
+              </td>
             </tr>
           </tbody>
         </table>
@@ -209,6 +230,7 @@ onMounted(load)
             <template #local><code>local</code></template>
           </i18n-t>
         </div>
+        <div class="api-note">{{ t('modelsSystemOne.available.sourceNote', { source: soSource }) }}</div>
       </div>
     </template>
 

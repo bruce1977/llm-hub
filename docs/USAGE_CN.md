@@ -350,19 +350,24 @@ num_ctx_overrides:
 
 `upstreams[].models` 说的是某个实例**声明**了什么，不是它**承担什么职责**：配置里没有任何地方
 告诉管理台 `bge-m3` 是回答 `/api/embed` 的、`qwen3:8b` 是回答 `/api/generate` 的。这个节点就是
-那句缺失的说明——每类 API 一个可选列表，`API 用法` 标签页里那些模型选择框读的就是它：
+那句缺失的说明——每类 API 一个可选列表。**所有** `API 用法` 测试窗口的模型下拉，以及各页面
+「可用模型」表、请求/响应示例里的 `model`，都读它（或按下面的规则推导），共用同一份
+`/v1/management/api-test/models` 数据：
 
 ```yaml
 api_models:
-  generate: []                       # POST /api/generate + POST /v1/chat/completions
-  embed: [bge-m3:latest]             # POST /api/embed + POST /v1/embeddings
-  rerank: []                         # POST /v1/rerank
-  systemone: []                      # POST /v1/systemone
-  websearch: []                      # POST /v1/tools/web-search
+  generate: []                       # /api/generate · /v1/chat/completions · /v1/messages
+  embed: [bge-m3:latest]             # /api/embed · /v1/embeddings
+  rerank: []                         # /v1/rerank
+  systemone: []                      # /v1/systemone
+  websearch: []                      # /v1/tools/web-search
 ```
 
 - 列表里可以写真实模型 id、`upstreams[].model_aliases` 短名，或根 `aliases:` 的派生模型名。
   发出去的就是别名本身，所以网关照样会注入它携带的固化参数。
+- **写了就是封闭集合**：非空的列表原样成为该家族的全部选项，`source` 回报 `api_models.<family>`。
+  这时不再做 provider 收窄，也不再显示「自定义模型…」——增删模型请改配置。
+  `- ''` 或纯空白行会被忽略（它们是占位符，不是模型）；全是占位符等同于留空。
 - **空列表的含义是「自己推」，不是「没有」**——这个节点之前的配置文件一个字都不用改。
   `rerank` 回落到 `rerank.models`，`systemone` 回落到 `systemone.model`，其余就是全部声明名
   （含别名与通配展开）。每个选择框下方都会写明它读的是哪一处
@@ -379,10 +384,13 @@ api_models:
   （如 `opencode/auto`）因此仍会出现在**聊天**选择框里。比较时忽略 `:latest`——Ollama 把
   `tev1` 与 `tev1:latest` 当成同一个模型。`systemone.model` 这类**兜底**同样不算认领：同一台机器
   完全可以拿聊天模型回答决策请求，它必须继续可选。
-- `websearch` 列的是搜索 provider 自己的模型；测试窗口的下拉末尾有「自定义模型…」，可以手输任意
-  名字，因为 opencode-port 会自己解析 `model`（不传就用 provider 的默认值）。`systemone` 同样有
-  这一项——laya-server 后端要的是路由枚举（`auto` / `english` / `multilingual` /
-  `typed-decisions`），不是模型 id。
+- `websearch` 列的是搜索 provider 自己的模型。**留空**（或只写占位符）时，后端会按
+  `websearch.upstream` 把候选收窄到该 provider 声明的模型，`source` 标为
+  `upstreams[].models (search provider)`；显式写出列表后严格按列表，不再做这层收窄。
+- 「自定义模型…」只出现在**推导**（留空）的家族里：`websearch` 的 opencode-port 自己解析 `model`
+  （不传就用 provider 的默认值），`systemone` 的 laya-server 要的是路由枚举（`auto` / `english` /
+  `multilingual` / `typed-decisions`）而不是模型 id。配置明确列出可选名字时这一项会消失——
+  选项就该从配置里选。
 - 没有任何上游服务的名字依然**会显示出来**并标注 `未被声明`：配错了应当给你看见，而不是藏起来。
 - 这些列表**只收窄管理台提供的选项**，路由逻辑完全不变——网关照旧接受它原本就接受的模型名，
   所以这个节点不可能把调用方锁在某个已声明的模型之外。
@@ -559,14 +567,16 @@ Models · LLM 分两个 Tab：**模型清单**（上述表格，另有**别名�
 `POST /api/generate`（Ollama 原生）、`POST /v1/chat/completions`（OpenAI 兼容）与 `POST /v1/messages`（Anthropic 兼容）的参数表与请求 / 响应示例，
 并标注 `POST /api/generate` 与 `POST /v1/chat/completions` 都**缺省即流式**（不写 `stream` 时分别走 NDJSON 与 SSE），而 `POST /v1/messages` 缺省返回单个 JSON 信封。
 Models · Embed（位于 Rerank 上方）说明两个嵌入端点 `POST /api/embed`（Ollama 原生）与
-`POST /v1/embeddings`（OpenAI 兼容）的字段与示例；两端都是原样透传，页面不读取任何配置。
+`POST /v1/embeddings`（OpenAI 兼容）的字段与示例；两端都是原样透传，但页面的「可用模型」表与
+示例里的 `model` 同样读 `api_models.embed`，不写死具体模型。
 每一份 API 文档的「请求参数」标题右侧都有一个**测试**按钮，点开后是浮层里的**接口测试窗口**
 （关掉再开，填过的内容和上一次的答复都还在）：模型选择框按 `api_models` 收窄；`lmstudio` /
 `opencode` 上游的模型只出现在 `/v1` 的测试窗口里，因为 `/api/generate` 与 `/api/embed` 是 Ollama
 自己的接口。每个选项**只显示名字或别名**（有别名用别名，否则用配置里的声明名），上游与运行状态放在悬停提示里，没人服务的名字
 仍列出来并标注「未被声明」；文档里写到的参数基本都能填，**打开时已按初始值填好**，
 「恢复默认值」重新填入、「清空」把表单与模型选择清空，「查看请求体」给出将要发送的 JSON；
-**模型是真正的下拉框**：打开时选中默认模型，列表就是全部候选；`systemone` / `websearch`
+**模型是真正的下拉框**：打开时选中默认模型，列表就是该家族的全部候选（写进 `api_models`
+的就是封闭集合，页面各处的示例也用同一批名字）；只有**留空推导**的 `systemone` / `websearch`
 在列表末尾多一项「自定义模型…」，选中后换成可手输的输入框（带候选提示），再选回列表里的
 名字即可收起。**模型可以清除**：字段旁的 ×（或下拉里的空白项）把它清空后，请求体里就不带
 `model`——需要模型的家族会先被本地拦下并提示「请先选择模型」，`systemone` / `websearch`

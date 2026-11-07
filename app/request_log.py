@@ -55,12 +55,13 @@ API_PATH_SCOPE = "(path LIKE '/v1/%' OR path LIKE '/api/%')"
 
 # Grouping expressions for /v1/management/stats/distribution. Rows that never reached an
 # upstream (blocked, oversized, unrouted) bucket as "-", the same convention as `failures`.
-# `status` counts every 4xx as an error, unlike the 5xx-only `failures` view and `error_rate`:
-# the pie answers "did the caller get what it asked for", not "did the gateway break".
+# `status` shares the >= 500 threshold with `error_rate`, the timeseries error bars and
+# `failures`: a 4xx is a caller-side/upstream rejection, not a gateway failure. Keeping one
+# definition means the three "error" numbers on the Dashboard always agree.
 _DISTRIBUTION_KEYS = {
     "upstream": "COALESCE(upstream, '-')",
     "model": "COALESCE(model, '-')",
-    "status": "CASE WHEN status >= 400 THEN 'error' ELSE 'ok' END",
+    "status": "CASE WHEN status >= 500 THEN 'error' ELSE 'ok' END",
 }
 
 _SENSITIVE_KEYS = {

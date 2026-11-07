@@ -116,7 +116,7 @@
 | 功能点 | 说明 | 数据来源 |
 |---|---|---|
 | Tab · 模型清单 · 端点信息卡 | 原生端点 `/api/embed`（Ollama）、OpenAI 兼容端点 `/v1/embeddings`、认证方式、模型解析（别名 → 路由，与 LLM 共用 `upstreams[].models` / `aliases`）、响应「原样透传」 | 静态契约 |
-| Tab · 模型清单 · 可用模型 | 独立卡片，参照 Rerank 的「可用模型」段：三列「模型 / 类型 / 调用端点」，列出网关约定的 `bge-m3:latest`（`embedding`）。清单为静态说明，实际可调用还需该模型已在 `upstreams[].models` 声明（或被前缀通配覆盖）且上游已拉取 | 静态清单 |
+| Tab · 模型清单 · 可用模型 | 独立卡片，参照 Rerank 的「可用模型」段：三列「模型 / 类型 / 调用端点」，**动态**列出 `api_models.embed` 声明的嵌入模型（留空则回落 `upstreams[].models` 可调用池）。同时出现在 `embed_ollama` / `embed_openai` 两个家族的模型显示两个端点，卡片 tag 标出配置来源，空清单给出配置提示而非硬编码模型名。清单与页面下方两个测试窗口共用同一份 `/api-test/models` 缓存，四个请求/响应示例的 `model` 也取自同一默认模型（无配置时用 `<model>` 占位），不再写死 `bge-m3:latest` | `GET /v1/management/api-test/models` |
 | Tab · 模型清单 · 功能介绍 | 模型清单 Tab 的**第一张卡片**，约 200 字说明（样式类 `feature-intro`）：嵌入的用途（语义检索 / 聚类 / 去重 / RAG）、两个入口的分工、别名解析与模型声明要求 | 静态文案 |
 | Tab · 模型清单 · 端点对照 | `/api/embed`：`model` / `input` / `truncate` / `options` / `keep_alive` → `embeddings[][]`；`/v1/embeddings`：`model` / `input` / `encoding_format` / `dimensions` / `user` → `data[].embedding` | 静态契约 |
 | Tab · API 用法 | 顶部说明块 + 两个 `ApiDoc`：请求参数表 + 请求 / 响应示例；注明模型必须已在 `config.yaml` 声明（或被前缀通配覆盖），否则 **404** 路由失败 | 静态文档（与 `docs/API.md` 对齐） |
@@ -142,10 +142,10 @@
 | 功能点 | 说明 | 数据来源 |
 |---|---|---|
 | Tab · 模型清单 · 配置信息 | Endpoint（`/v1/systemone`）、Enabled、Backend（后端 base URL，如 laya-server 或 Ollama 0.40+）、默认 `model`（`local` = 不注入）、`api_key_env`、Timeout | `/v1/management/models/systemone` |
-| Tab · 模型清单 · 可用模型 | 独立卡片，参照 Rerank：三列「模型 / 类型 / 调用端点」，列出决策后端可接受的 `tev1:0.8b`、`tev1:latest`、`nimble:latest`。清单为静态说明（后端只配置单个默认 `model`），由请求体 `model` 指定，缺省时网关按配置注入；实际能否调用取决于后端是否已部署 | 静态清单 |
+| Tab · 模型清单 · 可用模型 | 独立卡片，参照 Rerank：三列「模型 / 类型 / 调用端点」，列出 `api_models.systemone` 声明的决策模型（留空时按 `systemone.model` → 可调用池推导）。卡片标题的 tag 显示 `source`，空清单有配置提示，模型名悬停显示上游；与下方测试窗口共用同一份 `/api-test/models` 数据，不再写死 `tev1:*` / `nimble:*`。由请求体 `model` 指定，缺省时网关按配置注入 | `GET /api-test/models` |
 | Tab · 模型清单 · 功能介绍 | 模型清单 Tab 的**第一张卡片**，约 200 字说明（样式类 `feature-intro`）：快速决策的适用场景（意图识别 / 分流 / 风控 / 校验）、两种后端（laya-server 与 Ollama 0.40+）、`model` 注入与 SSE 流式 | 静态文案 |
 | Tab · API 用法 | 展示 `POST /v1/systemone` 的参数表（`state` / `questions[].type`·`instructions`·`criteria` / `model`）与请求、响应示例（`answers` / `usage` / `routing`，后端透传），另附 SSE 流式响应示例 | 静态文档 + 配置 |
-| Tab · API 用法 · 测试窗口 | `ApiTester`（`kind = systemone`）：`state` 与 `questions` 用 JSON 输入框（带文档里的示例作默认值，非法 JSON 当场标红），`stream` 是开关；模型框 `free_model: true`——laya-server 只收 `auto`/`english`/`multilingual`/`typed-decisions` 这几个枚举，Ollama 0.40+ 只收已安装模型名，所以下拉给 `api_models.systemone`（未配置时取 `systemone.model`），末尾另有「自定义模型…」选中后换成手输输入框，字段旁的 × 可清除，空着则由网关按配置注入。若 `SYSTEMONE_SERVER_API_KEY` 已设置，卡片以只读掩码 `••••••` 显示并标注变量名 | `GET /api-test/models` + `POST /api-test` |
+| Tab · API 用法 · 测试窗口 | `ApiTester`（`kind = systemone`）：`state` 与 `questions` 用 JSON 输入框（带文档里的示例作默认值，非法 JSON 当场标红），`stream` 是开关；模型下拉给 `api_models.systemone`（未配置时取 `systemone.model` → 可调用池）。`free_model` 只在**留空推导**时为 `true`——laya-server 只收 `auto`/`english`/`multilingual`/`typed-decisions` 这几个枚举，Ollama 0.40+ 只收已安装模型名；显式列出模型后该项消失，下拉只给配置里的名字。字段旁的 × 可清除，空着则由网关按配置注入。若 `SYSTEMONE_SERVER_API_KEY` 已设置，卡片以只读掩码 `••••••` 显示并标注变量名 | `GET /api-test/models` + `POST /api-test` |
 | 只读 | 本期不开放编辑，仅展示 | — |
 
 > 截图：`images/models-systemone.png`
@@ -198,7 +198,7 @@
 - **可用模型**：数据来自 `/v1/management/models/llm` 中属于 `websearch.upstream` 的行（声明名、通配已展开、`model_aliases` 短名作为显示名、根 `aliases:` 的派生模型独立成行并带 `derived` 角标），列 模型 / 上游 / 类型 / 设备 / 状态；托管 provider 探测有效时行显示 `● Cloud` 与 `● 在线`。卡片顶部说明检索能力来自后台配置的 [opencode-port](https://github.com/bruce1977/opencode-port)：需在 `config.yaml` 中把一个 `type: "opencode"` 的 upstream 指向它（默认 `127.0.0.1:10000`）并让 `websearch.upstream` 指向该 upstream；声明 `opencode/*` 时会展开成它当前支持的模型（内置 `opencode/*-free`、`auto`、`ollama-local/*`）。请求的 `model` 不是 llm-hub 配置的模型，而是 opencode-port 支持的模型名，也可以不填——省略时由 opencode-port 使用它自己的默认模型。
 - **功能介绍**：模型清单 Tab 的第一张卡片，约 200 字说明（样式类 `feature-intro`）：检索接入的用途、`query` 必填与几个关键可选字段、`synthesize` 的额外综合，以及返回 `text` 可直接拼进 prompt。
 - **API 用法**：上方「请求参数」表（参数 / 类型 / 必填 / 说明），下方左右分栏——左「请求示例」（POST + headers + JSON body），右「响应示例」（200 application/json + 透传契约）。JSON 带键名/字符串/数字/布尔着色，便于开发者对照。
-- **API 用法 · 测试窗口**：`ApiTester`（`kind = websearch`）。`query` 必填并预置一条示例查询，`top_k` / `max_chars_per_page` / `locale` / `recency`（下拉：day/week/month/year）/ `synthesize` 是复选框（默认不勾选，显式发送 `false`），`include_sources` 是三态下拉，留空即不发送。模型下拉 `free_model: true` 且**默认留空**（末尾「自定义模型…」可输入任意 opencode-port 模型名）——`model` 在这里是 opencode-port 支持的模型名（不是 llm-hub 配置的别名），省略时由 provider 用它自己的默认；`OPENCODE_API_KEY` 已设置时卡片显示只读掩码 `••••••` 与变量名。响应原样透传，测试窗口把 `text` / `results[]` 的 JSON 直接渲染出来。
+- **API 用法 · 测试窗口**：`ApiTester`（`kind = websearch`）。`query` 必填并预置一条示例查询，`top_k` / `max_chars_per_page` / `locale` / `recency`（下拉：day/week/month/year）/ `synthesize` 是复选框（默认不勾选，显式发送 `false`），`include_sources` 是三态下拉，留空即不发送。模型下拉**默认留空**（省略 `model` 时由 provider 用它自己的默认）；选项来自 `api_models.websearch`，留空时按 `websearch.upstream` 收窄到该 provider 声明的模型，`free_model: true`（末尾「自定义模型…」可输入任意 opencode-port 模型名）——显式写出列表后 `free_model=false`，列表成为封闭集合、不再做 provider 过滤。`model` 在这里是 opencode-port 支持的模型名（不是 llm-hub 配置的别名）；`OPENCODE_API_KEY` 已设置时卡片显示只读掩码 `••••••` 与变量名。响应原样透传，测试窗口把 `text` / `results[]` 的 JSON 直接渲染出来，响应示例里的 `model` 也取自同一份清单。
 - **请求参数**（以 `app/main.py` 的 `openapi_extra` 为准）：`query`(string, 必填)；`model`(string，opencode-port 支持的模型名，可省略 = 使用 opencode-port 默认模型)；`top_k`(integer, 1–50)；`max_chars_per_page`(integer)；`locale`(string)；`recency`(string: day|week|month|year)；`synthesize`(boolean)；`include_sources`(boolean)。`additionalProperties: true`，未知字段保留。
 - **响应结构**（Provider 透传）：`query` / `model` / `engine` / `answer`(可为 null) / `truncated` / `results[]`（每项 `title`/`url`/`snippet`/`paragraphs[]`）/ `text`（拼接后的段落文本）/ `sources[]`。
 - **边界**：`websearch.enabled=false` → `404`；已启用但找不到 provider upstream → `503`；请求体与上游响应**原样转发**，llm-hub 不改写。
@@ -419,7 +419,7 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
              { "key": "Ollama-iGPU", "count": 380 },
              { "key": "LM-Studio-local", "count": 262 } ] }
 // group_by=model   -> items: qwen3.6:35b-pruned / qwen3.5:9b / qwen3-reranker:4b-rk / bge-m3
-// group_by=status  -> items: ok(2xx)=1247 / error(4xx/5xx)=37
+// group_by=status  -> items: ok(<500, incl. 4xx)=1247 / error(5xx)=37
 ```
 > 三张分布图（各 Upstream / 各 Model / 成功失败）均由该接口按不同 `group_by` 取数；前端用 **ECharts** 渲染**实心饼图**（不是圆环）：饼上不画任何标签（长模型 id 曾与图形叠在一起），名称与计数收在**图形下方一行一条**的可滚动图例里（9.5px 字号 / 10.5px 行高、名称超 16 字截断并附计数），圆盘半径按容器短边计算并上移，图例永不压到扇区；颜色随主题切换明暗。趋势图（柱+折线）由 `stats/timeseries` 驱动，同样为 ECharts。
 
@@ -429,7 +429,7 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/management/api-test/models` | 每个 API 家族测试窗口需要的全部前置信息：`kinds` 以 `generate` / `chat` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch` 为键，每键给 `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source`（选项来自哪个配置项）/ `models[]`（`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key`（掩码）/ `unknown`）/ `default_model` / `api_key`（该家族自己签名的密钥，掩码）/ `api_key_env`（只给变量名）；顶层另有 `max_response_bytes`。`api_models` 为空时按配置推导，其中 `/api/...` 原生家族（`generate` / `embed_ollama`）只保留 `type: "ollama"` 上游的行，`/v1` 家族也列 `lmstudio` / `opencode` 的模型，显式列表原样返回。一次探测所有上游，前端整站共用一份缓存 |
+| GET | `/v1/management/api-test/models` | 每个 API 家族测试窗口需要的全部前置信息：`kinds` 以 `generate` / `chat` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch` 为键，每键给 `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source`（选项来自哪个配置项）/ `models[]`（`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key`（掩码）/ `unknown`）/ `default_model` / `api_key`（该家族自己签名的密钥，掩码）/ `api_key_env`（只给变量名）；顶层另有 `max_response_bytes`。`api_models` 为空时按配置推导，其中 `/api/...` 原生家族（`generate` / `embed_ollama`）只保留 `type: "ollama"` 上游的行，`/v1` 家族也列 `lmstudio` / `opencode` 的模型，显式列表原样返回（封闭集合：忽略空白占位符、`free_model=false`、不做 provider 过滤）。一次探测所有上游，前端整站共用一份缓存 |
 | POST | `/v1/management/api-test` | Body `{"kind": "...", "body": {...}}`；**服务端**用网关自己的服务发出这一笔，返回信封 `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`。`kind` 不在白名单，或需要模型的家族没给 `model` → `400` |
 
 **`POST /v1/management/api-test` 响应示例**
@@ -458,8 +458,9 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 > 首次打开才挂载、之后只切换显示，所以关闭再开不会丢掉填过的内容与上一次答复。模型是真正
 > 的下拉框，**只显示名字或别名**（上游与运行状态在悬停提示）；候选同样按方言分流——`/api/generate`、
 > `/api/embed` 是 Ollama 原生接口，只列 `type: "ollama"` 上游的模型，`lmstudio` / `opencode` 的模型
-> 只出现在 `/v1/chat/completions`、`/v1/embeddings` 窗口。`free_model` 家族在末尾多一项
+> 只出现在 `/v1/chat/completions`、`/v1/embeddings` 窗口。**留空推导**的 `free_model` 家族在末尾多一项
 > 「自定义模型…」，选中后换成手输输入框（自动聚焦，带 datalist 候选），选回列表里的名字即收起；
+> `api_models` 明确列出该家族名字时 `free_model=false`，这一项不会出现；
 > 表单**打开时已填好初始值**，「恢复默认值」重填、「清空」清空。**模型可以清除**：字段旁的 ×
 > （或 select 的空白项）清空后请求体不带 `model`，`model_required` 的家族由窗口先拦下，
 > `free_model` 的家族交给端点决定；「恢复默认值」会重新选中 `default_model`。**有文档默认值的

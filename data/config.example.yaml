@@ -84,6 +84,10 @@ num_ctx_overrides:
 # pass-through). The two Ollama-native testers (/api/generate, /api/embed) also drop models
 # served by an lmstudio / opencode upstream, which only implements the /v1 side; the OpenAI
 # compatible testers keep them. These lists only ever narrow what the selector shows.
+# A NON-EMPTY list is a closed set: used exactly as written (blank `- ''` placeholders are
+# ignored), with no provider-side narrowing and no 「Custom model…」 free-text entry. Only a
+# family left empty gets those fallbacks. The same list feeds the page's "Available models"
+# table and the model in its request/response examples.
 api_models:
   generate: []
   embed: []

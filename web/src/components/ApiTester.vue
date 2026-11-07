@@ -61,8 +61,9 @@ watch(
 
 const pickedModel = ref('')
 const manualModel = ref('')
-/** `systemone` / `websearch` accept names the list does not carry, so their select offers a
- *  「自定义模型…」 entry that swaps in the free-text box instead of typing into the dropdown. */
+/** Only a family whose names were derived (an empty `api_models` list) accepts names the
+ *  selector does not carry. Its select then offers a 「自定义模型…」 entry that swaps in the
+ *  free-text box; an explicitly configured list is closed and `free_model` comes back false. */
 const customMode = ref(false)
 const running = ref(false)
 const result = ref<ApiTestResult | null>(null)
@@ -109,6 +110,12 @@ const modelChoice = computed({
     pickedModel.value = value
     customMode.value = false
   },
+})
+
+/** A re-probe can turn a derived family into an explicitly configured (closed) list. Drop
+ *  the custom box in that case, or the request would carry a model the select no longer shows. */
+watch(allowsFreeModel, (allowed) => {
+  if (!allowed && customMode.value) customMode.value = false
 })
 
 /** The free-text box mounts only in custom mode, so it takes the caret explicitly. */

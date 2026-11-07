@@ -453,6 +453,8 @@ const zhTW: MessageSchema = {
       model: '模型',
       type: '類型',
       endpoint: '呼叫端點',
+      empty: '找不到可用的嵌入模型。請在 config.yaml 的 api_models.embed 或 upstreams[].models 中宣告。',
+      sourceNote: '清單即時取自 {source}，與頁面下方兩個測試視窗共用同一份 /api-test/models 資料；修改設定後重新整理頁面或點擊「重新探測」即可更新。',
     },
     availableNote:
       '嵌入模型與 LLM 共用 {models} / {aliases}。呼叫時透過 {model} 指定上表模型；未宣告（且未被前綴萬用字元涵蓋）時會 {code} 路由失敗，上游未抓取該模型時由 Ollama 報錯。',
@@ -565,9 +567,11 @@ const zhTW: MessageSchema = {
       model: '模型',
       type: '類型',
       endpoint: '呼叫端點',
+      empty: '找不到可用的決策模型。請在 config.yaml 的 api_models.systemone 中宣告，或留空讓閘道從 systemone.model / upstreams[].models 推導。',
+      sourceNote: '清單即時取自 {source}，與下方測試視窗共用同一份 /api-test/models 資料；修改設定後重新整理頁面或點擊「重新探測」即可更新。',
     },
     availableNote:
-      '清單為決策後端可接受的模型名，由請求本體 {model} 指定；預設時閘道依設定注入 {injected}（{local} 表示不注入）。實際能否呼叫取決於後端（laya-server 或 Ollama 0.40+）是否已部署該模型。',
+      '清單來自 api_models.systemone（留空時由閘道推導），由請求本體 {model} 指定；預設時閘道依設定注入 {injected}（{local} 表示不注入）。實際能否呼叫取決於後端（laya-server 或 Ollama 0.40+）是否已部署該模型。',
     params: {
       state: '自由結構，承載待判定的上下文（如 message），原樣透傳給後端',
       questions: '問題 id → 問題定義，至少 1 項；type 決定判定形態',
