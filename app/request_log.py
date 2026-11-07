@@ -492,14 +492,26 @@ class RequestLog:
             row = conn.execute("SELECT * FROM requests WHERE id = ?", (record_id,)).fetchone()
         return dict(row) if row else None
 
-    async def timeseries(self, *, start: str, end: str, bucket: str = "hour") -> dict[str, Any]:
-        return await asyncio.to_thread(self._timeseries_sync, start, end, bucket)
+    async def timeseries(
+        self, *, start: str, end: str, bucket: str = "hour", tz_offset_minutes: int = 0
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._timeseries_sync, start, end, bucket, tz_offset_minutes)
 
-    def _timeseries_sync(self, start: str, end: str, bucket: str) -> dict[str, Any]:
+    def _timeseries_sync(
+        self, start: str, end: str, bucket: str, tz_offset_minutes: int = 0
+    ) -> dict[str, Any]:
         fmt = "%Y-%m-%dT%H:00" if bucket == "hour" else "%Y-%m-%d"
+        # `ts` is naive UTC, so a bare strftime groups by UTC calendar days: at UTC+8 the bar
+        # for "today" would start at 08:00 local and 00:00-07:59 would land on yesterday.
+        # Day buckets therefore shift by the caller's offset first. Hour buckets keep UTC —
+        # the console renders them as instants (local time), so shifting here would convert
+        # them twice.
+        shift = bucket == "day" and bool(tz_offset_minutes)
+        bucket_expr = f"strftime('{fmt}', ts, ?)" if shift else f"strftime('{fmt}', ts)"
+        args: list[Any] = ([f"{tz_offset_minutes:+d} minutes"] if shift else []) + [start, end]
         sql = f"""
             WITH base AS (
-                SELECT strftime('{fmt}', ts) AS bucket, duration_ms,
+                SELECT {bucket_expr} AS bucket, duration_ms,
                        CASE WHEN status >= 500 THEN 1 ELSE 0 END AS is_err
                 FROM requests WHERE ts >= ? AND ts <= ? AND {API_PATH_SCOPE}
             ), ranked AS (
@@ -514,7 +526,7 @@ class RequestLog:
             FROM ranked GROUP BY bucket ORDER BY bucket
         """
         with self._db() as conn:
-            rows = conn.execute(sql, (start, end)).fetchall()
+            rows = conn.execute(sql, args).fetchall()
         return {
             "bucket": bucket,
             "start": start,
@@ -583,14 +595,17 @@ class RequestLog:
             "samples": [dict(row) for row in samples],
         }
 
-    async def today_summary(self) -> dict[str, Any]:
-        start = (
-            datetime.now(UTC)
-            .replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
-            .isoformat(timespec="seconds")
-        )
-        end = now_ts()
-        return await asyncio.to_thread(self._today_summary_sync, start, end)
+    async def today_summary(self, start: str | None = None, end: str | None = None) -> dict[str, Any]:
+        """KPI window behind the dashboard's "today" tile.
+
+        The caller owns where the day starts: the console sends the browser's local midnight
+        already converted to UTC, because a UTC day is not the user's day - at UTC+8 it would
+        silently drop everything between 00:00 and 08:00 local. Callers that send nothing (API
+        clients, tests) keep the server-side UTC-day fallback.
+        """
+        finish = end or now_ts()
+        begin = start or f"{finish[:10]}T00:00:00"
+        return await asyncio.to_thread(self._today_summary_sync, begin, finish)
 
     def _today_summary_sync(self, start: str, end: str) -> dict[str, Any]:
         where, params = self._where(start, end, None, None, None, None)

@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -890,6 +891,79 @@ def run() -> int:
             "overview sums today's tokens",
             r.json()["kpi"]["tokens_today"] >= 24,
             str(r.json()["kpi"]),
+        )
+
+        # ------------------------------------- today window & day buckets ---
+        # The console defines "today" as the browser's local day and sends its midnight as UTC;
+        # the server-side fallback is a UTC day, which at UTC+8 hides 00:00-08:00 local.
+        print("[6a] today window and day buckets follow the caller's clock")
+
+        def kpi(**params) -> int:
+            return client.get("/v1/management/overview", params=params).json()["kpi"]["requests_today"]
+
+        whole_day = kpi()
+        check("KPI counts the UTC day when no window is sent", whole_day >= 4, str(whole_day))
+        check(
+            "an explicit window replaces the default one",
+            kpi(today_start="2020-01-01T00:00:00", today_end="2020-01-02T00:00:00") == 0,
+            str(kpi(today_start="2020-01-01T00:00:00", today_end="2020-01-02T00:00:00")),
+        )
+        check(
+            "today_start/today_end accept Z-suffixed input",
+            kpi(today_start="2020-01-01T00:00:00Z", today_end="2020-01-02T00:00:00Z") == 0,
+        )
+        check(
+            "invalid today_start -> 400",
+            client.get("/v1/management/overview", params={"today_start": "yesterday"}).status_code == 400,
+        )
+        check(
+            "today_start after today_end -> 400",
+            client.get(
+                "/v1/management/overview",
+                params={"today_start": "2026-01-02T00:00:00", "today_end": "2026-01-01T00:00:00"},
+            ).status_code == 400,
+        )
+
+        # A row at 16:30 UTC is 00:30 the next day at UTC+8, so UTC grouping files it under the
+        # anchor's date and local grouping under the following one. The anchor is the latest
+        # 16:30 UTC at least an hour old, which also keeps it inside the default 24h window so
+        # the other stats in this suite stay consistent.
+        now_utc = datetime.now(UTC).replace(tzinfo=None)
+        anchor = now_utc.replace(hour=16, minute=30, second=0, microsecond=0)
+        if anchor > now_utc - timedelta(hours=1):
+            anchor -= timedelta(days=1)
+        anchor_date = anchor.date().isoformat()
+        local_date = (anchor + timedelta(hours=8)).date().isoformat()
+        with sqlite3.connect(os.environ["REQUEST_LOG_DB"]) as conn:
+            conn.execute(
+                "INSERT INTO requests (ts, method, path, model, upstream, status, duration_ms)"
+                " VALUES (?, 'POST', '/v1/chat/completions', 'm', 'u', 200, 10)",
+                (anchor.isoformat(timespec="seconds"),),
+            )
+        day_range = {
+            "start": f"{anchor_date}T00:00:00",
+            "end": f"{anchor_date}T23:59:59",
+            "bucket": "day",
+        }
+
+        def day_buckets(**extra) -> list[str]:
+            r = client.get("/v1/management/stats/timeseries", params={**day_range, **extra})
+            return [p["ts"] for p in r.json()["points"]]
+
+        check("day buckets default to UTC", day_buckets() == [anchor_date], str(day_buckets()))
+        check(
+            "tz_offset shifts day buckets to the local calendar",
+            day_buckets(tz_offset=480) == [local_date],
+            f"{day_buckets(tz_offset=480)} != [{local_date}]",
+        )
+        check(
+            "tz_offset=-480 stays in UTC",
+            day_buckets(tz_offset=-480) == [anchor_date],
+            str(day_buckets(tz_offset=-480)),
+        )
+        check(
+            "absurd tz_offset -> 400",
+            client.get("/v1/management/stats/timeseries", params={**day_range, "tz_offset": 5000}).status_code == 400,
         )
 
         # ------------------------------------------------- stats path scope ---

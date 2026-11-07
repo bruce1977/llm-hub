@@ -42,7 +42,10 @@ export const api = {
   logout: (): Promise<AxiosResponse<AuthResult>> => http.post<AuthResult>('/auth/logout'),
   ping: (): Promise<AxiosResponse<AuthPing>> => http.get<AuthPing>('/auth/ping'),
 
-  overview: () => http.get<Overview>('/overview'),
+  // `today_start` / `today_end` are the browser's local day edges converted to UTC: the KPI
+  // tile means "today where the user is", which a server-side UTC day does not answer.
+  overview: (params?: { today_start?: string; today_end?: string }) =>
+    http.get<Overview>('/overview', { params }),
   upstreams: () => http.get<UpstreamsResponse>('/upstreams'),
   upstream: (name: string) => http.get<UpstreamDetail>(`/upstreams/${encodeURIComponent(name)}`),
 
@@ -54,7 +57,9 @@ export const api = {
   requests: (params: RequestsQuery) => http.get<RequestsResponse>('/requests', { params }),
   requestDetail: (id: number) => http.get<RequestDetail>(`/requests/${id}`),
 
-  timeseries: (params: RangeQuery & { bucket?: Bucket }) =>
+  // `tz_offset` is minutes to add to UTC to reach this browser (UTC+8 -> 480) and only
+  // affects `bucket: 'day'`, so each bar is one local calendar day.
+  timeseries: (params: RangeQuery & { bucket?: Bucket; tz_offset?: number }) =>
     http.get<Timeseries>('/stats/timeseries', { params }),
   distribution: (params: RangeQuery & { group_by: DistributionKey }) =>
     http.get<Distribution>('/stats/distribution', { params }),

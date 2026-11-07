@@ -469,11 +469,29 @@ def _hosted_models(
 
 
 @router.get("/overview", summary="Dashboard KPIs, upstream summary and running models", tags=["management"])
-async def overview(request: Request, _=Depends(require_admin)):
+async def overview(
+    request: Request,
+    today_start: str | None = None,
+    today_end: str | None = None,
+    _=Depends(require_admin),
+):
     cfg = request.app.state.manager.config
     client = request.app.state.client
     infos = await _probe_all(cfg, client)
-    today = await _log(request).today_summary()
+    # The browser owns the definition of "today": it sends its local midnight converted to UTC.
+    # Without it the KPI falls back to a UTC day, which is only correct for callers east of
+    # nothing - at UTC+8 it would hide every request made between 00:00 and 08:00 local.
+    try:
+        today_begin = normalize_ts(today_start)
+        today_finish = normalize_ts(today_end)
+    except ValueError as exc:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if today_begin and today_finish and today_begin > today_finish:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="today_start must not be later than today_end.",
+        )
+    today = await _log(request).today_summary(today_begin, today_finish)
 
     available = [model for info in infos for model in info["running_models"]]
     aliases = _alias_by_target(cfg)
@@ -814,16 +832,25 @@ async def stats_timeseries(
     start: str | None = None,
     end: str | None = None,
     bucket: str = "hour",
+    tz_offset: int = 0,
     _=Depends(require_admin),
 ):
     if bucket not in {"hour", "day"}:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST, detail="bucket must be 'hour' or 'day'."
         )
+    # Minutes to add to UTC to reach the caller's local clock (UTC+8 -> 480). Only day buckets
+    # use it, so a bar is one local calendar day instead of one UTC day.
+    if not -840 <= tz_offset <= 840:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST, detail="tz_offset must be within -840..840."
+        )
     begin, finish = _resolve_range(start, end)
     log = _log(request)
     await log.flush()
-    return JSONResponse(await log.timeseries(start=begin, end=finish, bucket=bucket))
+    return JSONResponse(
+        await log.timeseries(start=begin, end=finish, bucket=bucket, tz_offset_minutes=tz_offset)
+    )
 
 
 @router.get("/stats/distribution", summary="Grouped request counts for the distribution pies", tags=["management"])

@@ -31,9 +31,15 @@ export function fmtDateTime(value: string | null | undefined): string {
 }
 
 export function fmtBucket(value: string | null | undefined, bucket: string | null | undefined): string {
+  // Day buckets arrive as local calendar dates (the API already shifted them by the caller's
+  // offset), so they are reformatted as text: parsing them as instants would convert a second
+  // time and land on the previous day anywhere west of UTC.
+  if (bucket === 'day') {
+    const parts = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value ?? ''))
+    return parts ? `${parts[2]}/${parts[3]}` : value || '—'
+  }
   const date = parseUtc(value)
   if (!date) return value || '—'
-  if (bucket === 'day') return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
   return date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' })
 }
 

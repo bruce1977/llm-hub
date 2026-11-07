@@ -7,7 +7,7 @@ import { api } from '@/api/management'
 import { gateway } from '@/stores/gateway'
 import TopBar from '@/components/TopBar.vue'
 import type { Overview } from '@/types/api'
-import { fmtClock, fmtInt, fmtKiloTokens } from '@/utils/format'
+import { daysAgoStartInput, fmtClock, fmtInt, fmtKiloTokens, fromInputValue } from '@/utils/format'
 
 const { t } = useI18n()
 
@@ -76,7 +76,10 @@ async function load() {
   if (refreshing.value) return
   refreshing.value = true
   try {
-    const { data } = await api.overview()
+    // Same local-day window as the dashboard tile, so the two screens never disagree.
+    const { data } = await api.overview({
+      today_start: fromInputValue(daysAgoStartInput(1)) ?? undefined,
+    })
     ovw.value = data
     gateway.version = data.gateway_version
     lastUpdated.value = fmtClock(new Date().toISOString())

@@ -78,7 +78,12 @@ const vramPct = computed(() => {
 })
 
 async function loadOverview() {
-  const { data } = await api.overview()
+  // "Today" means today where the user is. The server stores UTC and would otherwise cut the
+  // day at UTC midnight, hiding everything between 00:00 and 08:00 in UTC+8; so send the local
+  // day start, already converted to the UTC form the API expects.
+  const { data } = await api.overview({
+    today_start: fromInputValue(daysAgoStartInput(1)) ?? undefined,
+  })
   overview.value = data
   gateway.version = data.gateway_version ?? gateway.version
   lastUpdated.value = fmtClock(data.generated_at)
@@ -90,8 +95,10 @@ async function loadStats() {
   const spanHours = start && end ? (new Date(end).getTime() - new Date(start).getTime()) / 3600000 : 24
   bucket.value = spanHours > 48 ? 'day' : 'hour'
   const params: RangeQuery = start && end ? { start, end } : {}
+  // Day bars are local calendar days; `getTimezoneOffset()` is UTC minus local, so negate it.
+  const tz = -new Date().getTimezoneOffset()
   const [ts, up, mo, st] = await Promise.all([
-    api.timeseries({ ...params, bucket: bucket.value }),
+    api.timeseries({ ...params, bucket: bucket.value, tz_offset: tz }),
     api.distribution({ ...params, group_by: 'upstream' }),
     api.distribution({ ...params, group_by: 'model' }),
     api.distribution({ ...params, group_by: 'status' }),

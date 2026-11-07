@@ -105,6 +105,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A browser `zh-TW` / `zh-HK` / `zh-MO` / `zh-Hant` tag now opens the console in Traditional Chinese
   (`localeFromTag()`); a bare `zh` keeps Simplified, as before
 
+### Fixed (dashboard: "today" is the user's day, not the server's UTC day)
+
+- The *today* KPI tile counted a UTC calendar day while every other screen spoke in local time. At
+  UTC+8 that window starts at 08:00 local, so a request made between 00:00 and 08:00 was silently
+  dropped from the count, the token total, the P95 and the error rate — measured on a fixture of three
+  rows, the tile showed 1 where the local day holds 2. `GET /v1/management/overview` now takes
+  `today_start` / `today_end`, and the console fills them with the browser's local midnight converted
+  to UTC; a caller that sends nothing keeps the previous UTC-midnight fallback, so scripts and tests
+  are unaffected. The About page sends the same window, so both screens agree
+- Day bars on the request chart were UTC days too, for the same reason: the 00:00-08:00 slice of local
+  time landed on the previous bar. `GET /v1/management/stats/timeseries` takes `tz_offset` (minutes to
+  add to UTC, clamped to ±840) and shifts only the `day` grouping; hour buckets stay UTC because the
+  console renders them as instants. The bar label is now a plain local date and is no longer parsed
+  back as one, which also fixes the previous-day label in timezones west of UTC
+
 ### Fixed (console: checkbox accent colour and one control height)
 
 - Native checkboxes inherited the browser's own accent — a purple that belongs to nothing else in this
