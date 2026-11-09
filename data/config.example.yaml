@@ -10,7 +10,14 @@ server:
 auth:
   enabled: true
   allow_anonymous_health: true
+  # Regexes (fullmatch against the TCP peer): matching addresses may open /docs
+  # and call the API without a key. Empty = nobody is exempt.
   allow_access_ip_whitelist: []
+  # CIDR blocks of the trusted internal network. Declaring at least one makes
+  # `enabled: false` mean "anonymous only inside these networks" - every other
+  # client still needs a valid key. Leave empty for a fully public gateway with
+  # auth enabled, or a fully private one with auth disabled (startup warns).
+  trusted_networks: []
 routing:
   strict: false
 upstreams:

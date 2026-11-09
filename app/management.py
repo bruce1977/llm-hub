@@ -27,12 +27,12 @@ from typing import Any
 
 from admin_auth import (
     ADMIN_COOKIE_NAME,
-    ADMIN_SESSION_TTL,
     ADMIN_USERNAME,
     create_admin_token,
     get_admin_password,
     require_admin,
     require_admin_session,
+    set_admin_cookie,
 )
 from api_test import MAX_RESPONSE_BYTES, KINDS, execute, get_kind
 from auth import client_ip
@@ -90,14 +90,7 @@ async def login(request: Request, body: AdminLogin) -> Response:
         await asyncio.sleep(0.1)
         raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password.")
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        ADMIN_COOKIE_NAME,
-        create_admin_token(key),
-        httponly=True,
-        samesite="lax",
-        max_age=ADMIN_SESSION_TTL,
-        secure=request.url.scheme == "https",
-    )
+    set_admin_cookie(resp, request, create_admin_token(key))
     return resp
 
 

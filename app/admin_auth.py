@@ -27,22 +27,47 @@ Design notes:
     over plain HTTP during local development but is locked down in production.
   * The API-key path is skipped when gateway auth is disabled or no key is configured,
     so ``auth.enabled: false`` cannot silently open the management API.
+  * Session lifetime is ``ADMIN_SESSION_TTL`` seconds (default 12h, clamped to
+    5 min .. 7 days). A successful request past half the TTL re-issues the cookie
+    (sliding renewal), so an active session does not hard-expire. Logout only clears
+    the browser cookie - there is no server-side session table, so a copied token
+    stays valid until its expiry or an ADMIN_PASSWORD change.
+  * A valid console session cookie is also accepted on business API routes
+    (see ``auth.has_admin_session``), so the web UI can call the gateway directly.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import time
 
 from auth import extract_api_key
-from fastapi import Cookie, HTTPException, Request, status
+from fastapi import Cookie, HTTPException, Request, Response, status
 from key_store import get_store
+
+logger = logging.getLogger("llm_hub")
 
 ADMIN_COOKIE_NAME = "llmhub_admin"
 ADMIN_USERNAME = "admin"
-ADMIN_SESSION_TTL = 12 * 3600  # seconds (12h)
+#: Default session lifetime (12h). Override with ADMIN_SESSION_TTL (seconds).
+ADMIN_SESSION_TTL = 12 * 3600
+_MIN_SESSION_TTL = 300
+_MAX_SESSION_TTL = 7 * 24 * 3600
+
+
+def session_ttl() -> int:
+    """Session lifetime in seconds; ADMIN_SESSION_TTL is clamped to 5 min .. 7 days."""
+    raw = (os.getenv("ADMIN_SESSION_TTL") or "").strip()
+    if not raw:
+        return ADMIN_SESSION_TTL
+    try:
+        return max(_MIN_SESSION_TTL, min(_MAX_SESSION_TTL, int(raw)))
+    except ValueError:
+        logger.warning("Ignoring invalid ADMIN_SESSION_TTL=%r; using %ds", raw, ADMIN_SESSION_TTL)
+        return ADMIN_SESSION_TTL
 
 
 def get_admin_password() -> str | None:
@@ -56,21 +81,45 @@ def _sign(msg: str, key: str) -> str:
 
 
 def create_admin_token(key: str) -> str:
-    expiry = str(int(time.time()) + ADMIN_SESSION_TTL)
+    expiry = str(int(time.time()) + session_ttl())
     return f"{expiry}.{_sign(expiry, key)}"
 
 
-def verify_admin_token(token: str | None, key: str) -> bool:
+def session_remaining(token: str | None, key: str) -> int | None:
+    """Seconds left on a valid token, or None when forged / malformed / expired."""
     if not token or "." not in token:
-        return False
+        return None
     expiry_str, sig = token.rsplit(".", 1)
     try:
         expiry = int(expiry_str)
     except ValueError:
-        return False
+        return None
     if not hmac.compare_digest(_sign(expiry_str, key), sig):
-        return False
-    return expiry > int(time.time())
+        return None
+    remaining = expiry - int(time.time())
+    return remaining if remaining > 0 else None
+
+
+def verify_admin_token(token: str | None, key: str) -> bool:
+    return session_remaining(token, key) is not None
+
+
+def refresh_due(token: str | None, key: str) -> bool:
+    """Sliding renewal: extend a valid session once it is past half its lifetime."""
+    remaining = session_remaining(token, key)
+    return remaining is not None and remaining < session_ttl() // 2
+
+
+def set_admin_cookie(response: Response, request: Request, token: str) -> None:
+    """Single place for the cookie flags, shared by login and sliding renewal."""
+    response.set_cookie(
+        ADMIN_COOKIE_NAME,
+        token,
+        httponly=True,
+        samesite="lax",
+        max_age=session_ttl(),
+        secure=request.url.scheme == "https",
+    )
 
 
 def _gateway_key_authorized(request: Request) -> bool:

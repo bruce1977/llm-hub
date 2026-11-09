@@ -191,6 +191,7 @@ gateway is unaffected.
 | `SYSTEMONE_SERVER_API_KEY` | ❌ | System One backend key, needed only when `systemone.api_key_env` points at it; required by laya-server, ignored by Ollama 0.40+ backends |
 | `OPENCODE_GATEWAY_API_KEY` | ❌ | Web search upstream key, needed only when `websearch.api_key_env` points at it (empty by default = no signature) |
 | `ADMIN_PASSWORD` | ❌ | Console login password (the user name is always `admin`). It is a separate credential from caller API keys: it only buys a 12-hour session cookie via `POST /v1/management/auth/login`, and presenting it as `Bearer` / `X-API-Key` is still a 401. Besides that cookie, `/v1/management/*` also accepts a gateway key from the `api_keys` table (so scripts can reuse one), except the three `/api-keys` endpoints — those accept only the session cookie, since otherwise any client could mint itself another key. Unset, `/admin` says the console is not enabled and every `/v1/management/*` call returns 503 |
+| `ADMIN_SESSION_TTL` | ❌ | Console session lifetime in seconds, default `43200` (12h), clamped to `300` .. `604800` (5 min .. 7 days). Successful requests past half the TTL renew the session; logout only clears the browser cookie, there is no server-side session table |
 | `REQUEST_LOG_DB` | ❌ | SQLite path for request details, defaults to `llmhub.db` next to `CONFIG_PATH` (`/data/llmhub.db` in the container). One file holds three tables: `requests` (details), `bench_results` (speed-test history) and `api_keys` (caller key hashes and masks) |
 | `LLMHUB_DB` | ❌ | Database path for the `bench_results` and `api_keys` tables, also `llmhub.db` next to `CONFIG_PATH` by default. Only set it to split those two away from the request log; all three tables share one file by default, so the container needs a single writable `/data` |
 | `REQUEST_LOG_RETENTION_DAYS` | ❌ | Retention for request details in days, default `30`; `0` keeps them forever |
@@ -201,6 +202,50 @@ gateway is unaffected.
 > `config.yaml` (default `true`): the switch is read per request, so flipping it to `false` and saving needs
 > no container restart, and since the config mtime is compared at most once per second, writes stop within
 > about a second.
+
+---
+
+## Internal vs public authentication
+
+"No key inside the LAN, a valid key from the outside" is a single `auth.trusted_networks` setting in
+`config.yaml` - no need to run two separate gateways:
+
+```yaml
+auth:
+  enabled: false                  # true works too: trusted networks stay key-free
+  allow_anonymous_health: true     # / and /health stay anonymous for container probes
+  allow_access_ip_whitelist: []
+  trusted_networks:
+    - 127.0.0.1/32                # in-container HEALTHCHECK
+    - 192.168.10.0/24             # LAN range
+```
+
+- Inside the trusted networks: every path is key-free (even with an invalid key), `/docs` is visible.
+- Outside: every business API needs a valid key (`401` without, `403` with an invalid one), `/docs` 404.
+- For a public-only instance use `auth.trusted_networks: []` + `auth.enabled: true` and keep at least
+  one key in `api_keys`; otherwise startup warns and all external requests answer 401.
+- Never expose the backend Ollama port (11434 etc.) to the internet: that bypasses the gateway and
+  the entire auth chain.
+- A console session cookie also authenticates business APIs; its lifetime is `ADMIN_SESSION_TTL`.
+
+Behind a reverse proxy uvicorn rewrites the client address from forwarding headers, so the proxy
+must **overwrite** rather than append:
+
+```nginx
+proxy_set_header X-Forwarded-For $remote_addr;   # not $proxy_add_x_forwarded_for
+proxy_set_header X-Forwarded-Proto $scheme;      # lets the session cookie carry Secure
+```
+
+Verify:
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' http://<lan-ip>:8834/v1/models                                   # 200
+curl -o /dev/null -w '%{http_code}\n' http://<public-host>:8834/v1/models                           # 401
+curl -H 'X-Forwarded-For: 192.168.10.5' -o /dev/null -w '%{http_code}\n' http://<public-host>:8834/v1/models  # 401
+curl -m 3 -o /dev/null -w '%{http_code}\n' http://<public-host>:11434/api/tags                      # unreachable
+```
+
+If the third command answers 200, the proxy is trusting a forged `X-Forwarded-For`.
 
 ---
 

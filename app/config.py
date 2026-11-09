@@ -10,6 +10,7 @@ a `.json` file parses exactly the same way.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 logger = logging.getLogger("llm_hub")
 
@@ -144,6 +145,24 @@ class AuthConfig(BaseModel):
     # Matched against the TCP peer, deliberately not X-Forwarded-For: any client can put an
     # arbitrary address in that header, and honouring it here would be a key bypass.
     allow_access_ip_whitelist: list[str] = Field(default_factory=list)
+    # CIDR blocks (or single IPs) that count as the trusted internal network.
+    # Declaring at least one turns `enabled: false` into an internal/outside split:
+    # only these networks stay anonymous, every other client still needs a valid
+    # key. Empty keeps the legacy behaviour (fully anonymous while auth is off);
+    # the startup self-check warns loudly in that case.
+    trusted_networks: list[str] = Field(default_factory=list)
+
+    @field_validator("trusted_networks")
+    @classmethod
+    def _validate_networks(cls, networks: list[str]) -> list[str]:
+        for cidr in networks:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    f"auth.trusted_networks entry {cidr!r} is not a valid IPv4/IPv6 CIDR: {exc}"
+                ) from exc
+        return networks
 
     @model_validator(mode="before")
     @classmethod
@@ -725,6 +744,8 @@ def build_default_config() -> dict[str, Any]:
             "allow_anonymous_health": True,
             # Regexes for addresses that may open /docs and skip the API-key check.
             "allow_access_ip_whitelist": [],
+            # CIDR blocks of the trusted internal network (empty = legacy behaviour).
+            "trusted_networks": [],
         },
         "routing": {"strict": False},
         "upstreams": [

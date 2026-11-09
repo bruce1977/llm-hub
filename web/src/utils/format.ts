@@ -30,6 +30,32 @@ export function fmtDateTime(value: string | null | undefined): string {
   return `${date.toLocaleDateString('zh-CN')} ${date.toLocaleTimeString('zh-CN', { hour12: false })}`
 }
 
+export interface DateTimeParts {
+  /** `yy-MM-dd`, e.g. `26-11-09` (local calendar day). */
+  date: string
+  /** `HH:mm:ss`, in the viewer's local timezone. */
+  time: string
+  /** `yyyy-MM-dd HH:mm:ss`, used as the hover title so the century is never lost. */
+  full: string
+}
+
+/** Two-line stamp for the Requests table: date above the clock. All three parts come from
+ *  the same parsed instant, so the lines can never disagree near a day boundary. */
+export function fmtDateTimeParts(value: string | null | undefined): DateTimeParts {
+  const date = parseUtc(value)
+  if (!date) return { date: '—', time: '', full: '' }
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  const year = date.getFullYear()
+  const month = pad(date.getMonth() + 1)
+  const day = pad(date.getDate())
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  return {
+    date: `${String(year).slice(-2)}-${month}-${day}`,
+    time,
+    full: `${year}-${month}-${day} ${time}`,
+  }
+}
+
 export function fmtBucket(value: string | null | undefined, bucket: string | null | undefined): string {
   // Day buckets arrive as local calendar dates (the API already shifted them by the caller's
   // offset), so they are reformatted as text: parsing them as instants would convert a second

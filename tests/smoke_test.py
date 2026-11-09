@@ -1063,6 +1063,92 @@ def main() -> int:
         finally:
             auth_cfg.allow_access_ip_whitelist = []
 
+        # --------- auth.trusted_networks: internal/outside split + console session ---
+        print("[16c] auth.trusted_networks / console session cookie")
+        from admin_auth import (
+            ADMIN_COOKIE_NAME,
+            _sign,
+            create_admin_token,
+            refresh_due,
+            session_remaining,
+            session_ttl,
+            verify_admin_token,
+        )
+        from config import AuthConfig
+        from fastapi.testclient import TestClient as _TestClient
+
+        saved_auth = (
+            auth_cfg.enabled,
+            list(auth_cfg.allow_access_ip_whitelist),
+            list(auth_cfg.trusted_networks),
+            os.environ.get("ADMIN_PASSWORD"),
+        )
+        try:
+            try:
+                AuthConfig(trusted_networks=["not-a-network"])
+                check("invalid trusted_networks is rejected", False, "expected ValidationError")
+            except Exception:
+                check("invalid trusted_networks is rejected", True)
+
+            internal = _TestClient(client.app, client=("192.168.10.5", 41000))
+            external = _TestClient(client.app, client=("167.104.161.192", 41001))
+            no_key_bad = {"Authorization": "Bearer definitely-wrong"}
+            auth_cfg.allow_access_ip_whitelist = []
+            auth_cfg.trusted_networks = ["192.168.10.0/24"]
+            auth_cfg.enabled = False
+
+            check("internal /v1/models needs no key", internal.get("/v1/models").status_code == 200)
+            check("internal /v1/models ignores an invalid key",
+                  internal.get("/v1/models", headers=no_key_bad).status_code == 200)
+            check("internal /docs is visible", internal.get("/docs").status_code == 200)
+            check("external /v1/models needs a key", external.get("/v1/models").status_code == 401)
+            check("external /v1/models rejects an invalid key",
+                  external.get("/v1/models", headers=no_key_bad).status_code == 403)
+            check("external /docs stays hidden", external.get("/docs").status_code == 404)
+            check("a forged internal X-Forwarded-For does not unlock the API",
+                  external.get("/v1/models", headers={"X-Forwarded-For": "192.168.10.5"}).status_code == 401)
+            check("external /health stays anonymous", external.get("/health").status_code == 200)
+
+            auth_cfg.enabled = True
+            check("enabled=true: internal is still anonymous", internal.get("/v1/models").status_code == 200)
+            check("enabled=true: external still needs a key", external.get("/v1/models").status_code == 401)
+
+            # A console sign-in is a credential in its own right, from outside too.
+            os.environ["ADMIN_PASSWORD"] = "test-admin-password-123456"
+            pw = os.environ["ADMIN_PASSWORD"]
+            token = create_admin_token(pw)
+            check("a valid console session unlocks the API from outside",
+                  external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: token}).status_code == 200)
+            check("a forged console session does not",
+                  external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: "1.deadbeef"}).status_code == 401)
+            past = int(__import__("time").time()) - 10
+            expired = f"{past}.{_sign(str(past), pw)}"
+            check("an expired console session does not",
+                  external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: expired}).status_code == 401)
+            check("session_remaining reports a live session",
+                  (session_remaining(token, pw) or 0) > session_ttl() // 2)
+            check("a fresh session is not due for renewal", refresh_due(token, pw) is False)
+            check("verify_admin_token rejects a tampered token",
+                  verify_admin_token("1.deadbeef", pw) is False)
+
+            # Sliding renewal: a session past half its TTL gets a fresh cookie.
+            due_expiry = int(__import__("time").time()) + session_ttl() // 4
+            due = f"{due_expiry}.{_sign(str(due_expiry), pw)}"
+            check("a session past half its TTL is due for renewal", refresh_due(due, pw) is True)
+            renewed = external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: due})
+            check("middleware re-issues the session cookie",
+                  renewed.cookies.get(ADMIN_COOKIE_NAME) not in (None, due),
+                  str(renewed.cookies.get(ADMIN_COOKIE_NAME)))
+        finally:
+            auth_cfg.enabled = saved_auth[0]
+            auth_cfg.allow_access_ip_whitelist = saved_auth[1]
+            auth_cfg.trusted_networks = saved_auth[2]
+            if saved_auth[3] is None:
+                os.environ.pop("ADMIN_PASSWORD", None)
+            else:
+                os.environ["ADMIN_PASSWORD"] = saved_auth[3]
+            os.environ.pop("ADMIN_SESSION_TTL", None)
+
         # ------------------------- OpenCode gateway upstream type + web search config ---
         print("[17] OpenCode upstream type and web search config")
         oc_cfg = GatewayConfig(

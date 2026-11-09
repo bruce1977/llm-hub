@@ -52,7 +52,7 @@ English: [API.md](API.md)。
 -H "X-API-Key: sk-gateway-example-key"
 ```
 
-**例外：** `/`、`/health` 端点默认无需认证（由 `auth.allow_anonymous_health` 控制）。
+**例外：** 仅 `/`、`/health` 两个运维探针默认无需认证（由 `auth.allow_anonymous_health` 控制；设为 `false` 则也要 Key）。其它业务 API——包括 `/v1/models`——对不可信来源一律要求有效 Key。
 
 **Key 从哪里来：** 调用方的 Key 是 `llmhub.db` 里 `api_keys` 表的一行，表里只有 `sha256(明文)` 与掩码；
 在管理台 `/admin`（账户菜单 → ⚿ API Key 管理）签发与吊销。`GATEWAY_API_KEYS` /
@@ -60,12 +60,22 @@ English: [API.md](API.md)。
 新生成的 Key 形如 `sk-hub-` + 40 位 base62，共 47 字符。详见「管理 API」一节的
 **调用方 API Key**。
 
-**客户端 IP 白名单：** `auth.allow_access_ip_whitelist`（正则字符串数组，`re.fullmatch` 逐条匹配）
-命中的来源可以访问 `/docs` 与 `/openapi.json`，并且调用任何业务 API 时免查 API Key；未命中时
-`/docs`、`/openapi.json` 一律 **404**（不是 401/403，对外看起来就像没有这两个路径）。匹配对象是
-ASGI 的客户端地址（`request.client.host`），网关代码从不读取 `X-Forwarded-For`；但 uvicorn 的
-`ProxyHeadersMiddleware` 在 TCP 对端属于可信代理时（`--forwarded-allow-ips`，默认 `127.0.0.1`）
-会用转发头改写 `request.client`，所以前置代理必须自行清理 `X-Forwarded-For`。
+**可信来源（内网免 Key）：** `auth.allow_access_ip_whitelist`（正则字符串数组，`re.fullmatch` 逐条匹配）
+与 `auth.trusted_networks`（CIDR 数组）共同定义可信网络，由同一个 `trusted_peer()` 判定，
+`/docs` 可见性与免 Key 检查读的都是它。可信来源可以打开 `/docs`、`/openapi.json`、
+`/static/swagger/*`，并且调用**任何路径**时免查 API Key——即使带了无效 Key 也放行；
+未命中时文档路径一律 **404**（不是 401/403，对外看起来就像不存在），业务 API 无 Key `401`、
+无效 Key `403`。声明 `auth.trusted_networks` 后，`auth.enabled: false` 也只对这些网段免 Key，
+外网仍要 Key；未声明则保持旧的「全部匿名」行为，但启动日志会明确告警。
+匹配对象是 ASGI 的客户端地址（`request.client.host`），网关代码从不读取 `X-Forwarded-For`；
+但 uvicorn 的 `ProxyHeadersMiddleware` 在 TCP 对端属于可信代理时
+（`--forwarded-allow-ips`，默认 `127.0.0.1`）会用转发头改写 `request.client`，
+所以前置代理必须用 `proxy_set_header X-Forwarded-For $remote_addr;` 覆盖客户端自带的头。
+
+**管理台会话 Cookie：** 登录 `/v1/management/auth/login` 后签发的签名 Cookie 也是业务 API 的凭据，
+浏览器无需持有调用方 Key。有效期 `ADMIN_SESSION_TTL` 秒（默认 `43200`，钳制 5 分钟 ~ 7 天），
+使用过半后成功请求会自动续期；退出登录只清除浏览器 Cookie，服务端没有会话表，
+被复制的 Cookie 在到期或 `ADMIN_PASSWORD` 变更之前仍然有效。
 
 **Swagger UI：** 打开 `/docs`（需先满足上面的 IP 白名单），**每个端点的 Parameters 区都有一个
 `X-API-Key` 输入框**——点 **Try it out** 后填入 Key，点 **Execute** 时随本次请求发送（只影响该端点的

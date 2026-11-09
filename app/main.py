@@ -25,7 +25,14 @@ from typing import Any
 
 import httpx
 import uvicorn
-from admin_auth import require_admin
+from admin_auth import (
+    ADMIN_COOKIE_NAME,
+    create_admin_token,
+    get_admin_password,
+    refresh_due,
+    require_admin,
+    set_admin_cookie,
+)
 from auth import (
     DOCS_PATHS,
     client_ip,
@@ -33,6 +40,7 @@ from auth import (
     extract_api_key,
     find_weak_keys,
     ip_allowed,
+    is_weak_key,
     require_api_key,
 )
 from config import CONFIG_PATH, ConfigManager
@@ -150,6 +158,43 @@ async def lifespan(app: FastAPI):
                 "Seed the empty table with the GATEWAY_API_KEYS environment variable (comma "
                 "separated) or GATEWAY_API_KEYS_FILE (a secret file such as data/.keys) and "
                 "restart, then manage keys at /admin; or turn auth off with auth.enabled=false."
+            )
+
+    # Startup self-check for the unauthenticated mode. Previously `enabled: false`
+    # silently skipped every check above: a gateway bound to 0.0.0.0 could serve
+    # all APIs anonymously while /docs stayed hidden, which reads as "protected"
+    # but is not. trusted_networks turns that into an explicit internal/outside split.
+    if not cfg.auth.enabled:
+        if cfg.auth.trusted_networks:
+            logger.warning(
+                "auth.enabled=false with auth.trusted_networks=%s: only those networks are "
+                "anonymous; every other client must present a valid API key (%d key(s) in store)",
+                cfg.auth.trusted_networks,
+                app.state.api_keys.count(),
+            )
+            if app.state.api_keys.count() == 0:
+                logger.warning(
+                    "The api_keys table is empty: all requests from outside "
+                    "auth.trusted_networks will be rejected with 401. Mint a key at "
+                    "/admin -> API keys."
+                )
+        else:
+            logger.warning(
+                "auth.enabled=false and no auth.trusted_networks declared: EVERY API endpoint is "
+                "anonymous on %s:%d, while /docs stays hidden by the IP whitelist - that is not "
+                "a security boundary. Declare auth.trusted_networks (CIDR) or set auth.enabled=true.",
+                cfg.server.host,
+                cfg.server.port,
+            )
+
+    # ADMIN_PASSWORD doubles as the HMAC key that signs console session cookies:
+    # guessing it lets an attacker mint a token with any expiry. Warn (without
+    # ever logging the value) instead of refusing, so a local console still works.
+    if admin_password := get_admin_password():
+        if weak_reason := is_weak_key(admin_password):
+            logger.warning(
+                "Weak ADMIN_PASSWORD (%s): it signs console session cookies, use >=16 random chars",
+                weak_reason,
             )
 
     # Security self-check: refuse to start with weak/placeholder keys on a public gateway.
@@ -395,6 +440,21 @@ def _rate_limited(rl, request: Request, sec) -> bool:
     return False
 
 
+def _renew_admin_session(request: Request, response: Response) -> None:
+    """Sliding renewal: an actively used console session never hard-expires.
+
+    Once a valid session is past half its TTL, re-issue the cookie with a fresh
+    expiry. Runs on successful responses only, so a rejected request cannot
+    keep a stolen session alive.
+    """
+    password = get_admin_password()
+    if not password:
+        return
+    token = request.cookies.get(ADMIN_COOKIE_NAME)
+    if refresh_due(token, password):
+        set_admin_cookie(response, request, create_admin_token(password))
+
+
 @app.middleware("http")
 async def gateway_security_middleware(request: Request, call_next):
     """Per-request hardening of the public surface, evaluated in this order:
@@ -439,8 +499,12 @@ async def gateway_security_middleware(request: Request, call_next):
             logger.warning("Path not in allowlist: %s %s", method, path)
             return _deny(status.HTTP_403_FORBIDDEN, "Path not allowed.")
 
-        # 3. API docs go to whitelisted addresses only -------------------------
-        if path.rstrip("/") in DOCS_PATHS and not docs_allowed(request, cfg):
+        # 3. API docs and their vendored Swagger assets go to trusted addresses
+        #    only. The docs gate and the anonymous-key bypass share trusted_peer(),
+        #    so a hidden /docs can never coexist with a key-free API.
+        if (
+            path.rstrip("/") in DOCS_PATHS or path.startswith("/static/swagger/")
+        ) and not docs_allowed(request, cfg):
             return _deny(status.HTTP_404_NOT_FOUND, "Not found.")
 
         # /redoc was intentionally removed (superseded by /docs); return a clean
@@ -476,9 +540,11 @@ async def gateway_security_middleware(request: Request, call_next):
             if allowed:
                 resp = await call_next(request)
                 resp.headers["Access-Control-Allow-Origin"] = origin
+                _renew_admin_session(request, resp)
                 return _harden_response(resp, path)
 
     resp = await call_next(request)
+    _renew_admin_session(request, resp)
     return _harden_response(resp, path)
 
 

@@ -221,6 +221,7 @@ auth:
   enabled: true
   allow_anonymous_health: true
   allow_access_ip_whitelist: []
+  trusted_networks: []            # CIDR，如 192.168.10.0/24、127.0.0.1/32
 ```
 
 - **密钥不再写在 `config.yaml`**：`api_keys` 字段已移除，配置里放不下任何凭据（真源是下面说的
@@ -246,6 +247,26 @@ auth:
   记录警告并跳过。注意 uvicorn 的 `ProxyHeadersMiddleware` 在**受信代理**（`--forwarded-allow-ips`，
   默认仅 `127.0.0.1`）转发时会用转发头改写客户端地址——经本机反代部署时，命中判定看到的是真实来源，
   因此必须确保反代正确设置并清理 `X-Forwarded-For`
+- **`trusted_networks`：内网免 Key / 外网必须 Key 的显式开关**（CIDR 数组，如 `192.168.10.0/24`、
+  `10.0.0.0/8`、`127.0.0.1/32`，也接受单个 IP）。填写后：
+  - 可信网段内访问**任何路径**都免 Key，即使带了无效 Key 也放行；`/docs`、`/openapi.json`
+    与 `/static/swagger/*` 同样只对可信来源可见——文档可见性与免 Key 共用 `trusted_peer()`
+    一个判定，不会再出现「文档被挡、API 却全裸」的假象
+  - 网段外访问**所有业务 API**（含 `/v1/models`、`/api/tags`、`/v1/chat/completions`）都必须带
+    有效 Key：无 Key `401`、无效 Key `403`。仅 `/` 与 `/health` 仍按 `allow_anonymous_health`
+    保持匿名（容器健康检查 / 负载均衡探针），设为 `false` 可一并关闭
+  - `enabled: false` **不再是全局匿名**：只有可信网段内免 Key，外网依然要 Key。若 `api_keys`
+    表为空，外网请求会全部 `401`，启动日志会提示去 `/admin` 签发 Key
+  - 留空 `[]` 保持旧行为（`enabled: false` = 全部匿名），但启动日志会明确告警「所有 API 匿名，
+    隐藏 `/docs` 不是安全边界」
+  - 判定同样只看 TCP 对端（`request.client.host`），**不读 `X-Forwarded-For`**。经本机反代时
+    uvicorn 会用转发头改写它，所以反代必须用 `proxy_set_header X-Forwarded-For $remote_addr;`
+    **覆盖**（不要用 `$proxy_add_x_forwarded_for` 追加），否则外部可伪造内网 IP 绕过鉴权
+- **管理台登录后的会话 Cookie 也是业务 API 的凭据**：登录拿到的签名 Cookie 可直接调用 `/v1/models`
+  等业务端点，浏览器无需持有调用方 Key。有效期由 `ADMIN_SESSION_TTL` 控制（秒，默认 `43200`
+  = 12 小时，钳制在 5 分钟 ~ 7 天），用过半后每次成功请求自动续期，活跃会话不会硬掉线。
+  退出登录只清除浏览器 Cookie——服务端没有会话表，被复制出去的 Cookie 在到期或
+  `ADMIN_PASSWORD` 变更之前仍然有效
 - ⚠️ 启用鉴权（`enabled: true`）而 `api_keys` 表在导入后仍然一行都没有时，网关**拒绝启动**并给出
   补救办法：先用 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` 把空表喂上再重启，或改
   `auth.enabled: false`——避免误暴露无鉴权服务

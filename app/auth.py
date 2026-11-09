@@ -10,8 +10,12 @@ Multiple keys are supported. They live in the ``api_keys`` table of ``llmhub.db`
 hashes (see ``key_store.py``) and are verified through that store's in-memory set, so no client
 request touches sqlite; the environment only seeds an empty table on first start.
 
-`auth.allow_access_ip_whitelist` holds regexes for client addresses that are exempt from the
-key check and may open /docs. It is matched against the TCP peer, never X-Forwarded-For.
+`auth.allow_access_ip_whitelist` (regexes) and `auth.trusted_networks` (CIDR blocks) define
+the trusted network. Callers on it are exempt from the key check - even with an invalid key -
+and may open /docs; `trusted_peer()` is the single judgement used by both. It is matched
+against the TCP peer, never X-Forwarded-For. Declaring `trusted_networks` also turns
+`auth.enabled: false` into an internal/outside split: external callers still need a key.
+A valid console session cookie is a credential in its own right.
 """
 
 from __future__ import annotations
@@ -26,7 +30,10 @@ from key_store import get_store
 
 logger = logging.getLogger("llm_hub")
 
-# Routes always anonymous when auth.allow_anonymous_health is true.
+# Liveness / system-info probes, anonymous by default for container health checks
+# and load balancers. These are the ONLY paths an untrusted caller may reach
+# without a key; every business API (including /v1/models) needs one. Set
+# auth.allow_anonymous_health=false to require a key here too.
 PUBLIC_PATHS = {"/", "/health"}
 # OpenAPI docs routes: served only to auth.allow_access_ip_whitelist addresses.
 # Served locally (vendored assets) so they work without any public CDN.
@@ -154,9 +161,26 @@ def ip_pattern_allowed(ip: str | None, patterns: Iterable[str]) -> bool:
     return False
 
 
+def trusted_peer(request: Request, cfg) -> bool:
+    """Single source of truth for "this caller is on the trusted network".
+
+    The `/docs` gate and the anonymous API-key bypass both use this, so they can
+    never disagree. `allow_access_ip_whitelist` keeps its regex semantics;
+    `auth.trusted_networks` adds CIDR blocks for the internal/outside split.
+    Only the ASGI client address is consulted - `X-Forwarded-For` is forgeable.
+    """
+    if cfg is None:
+        return False
+    peer = peer_ip(request)
+    if ip_pattern_allowed(peer, cfg.auth.allow_access_ip_whitelist):
+        return True
+    networks = cfg.auth.trusted_networks
+    return bool(networks) and ip_allowed(peer, networks)
+
+
 def docs_allowed(request: Request, cfg) -> bool:
-    """`/docs` and `/openapi.json` are served only to whitelisted addresses."""
-    return cfg is not None and ip_pattern_allowed(peer_ip(request), cfg.auth.allow_access_ip_whitelist)
+    """`/docs`, `/openapi.json` and the Swagger assets: trusted network only."""
+    return trusted_peer(request, cfg)
 
 
 async def _authorize(request: Request, cfg) -> str | None:
@@ -174,12 +198,17 @@ async def _authorize(request: Request, cfg) -> str | None:
             detail="Client address is not permitted to access this gateway.",
         )
 
-    if cfg.auth.allow_anonymous_health and path in PUBLIC_PATHS:
+    # A trusted-network address is exempt from the key check on EVERY path, even
+    # when the caller sends an invalid key. The /docs gate reads the same
+    # judgement, so a hidden /docs can never coexist with a key-free API.
+    # Empty whitelist + empty trusted_networks means nobody is exempt.
+    if trusted_peer(request, cfg):
         return None
 
-    # A whitelisted address is trusted to be on the network already, so it is exempt from
-    # the key check (and gets /docs). An empty whitelist means nobody is exempt.
-    if ip_pattern_allowed(peer_ip(request), cfg.auth.allow_access_ip_whitelist):
+    # The only anonymous paths for untrusted callers are the liveness / info
+    # probes used by the container HEALTHCHECK and load balancers. Every
+    # business API needs a key; auth.allow_anonymous_health=false closes these too.
+    if cfg.auth.allow_anonymous_health and path in PUBLIC_PATHS:
         return None
 
     key = extract_api_key(request, allow_query=cfg.security.allow_query_api_key)
@@ -202,12 +231,38 @@ async def _authorize(request: Request, cfg) -> str | None:
     return key
 
 
+def has_admin_session(request: Request) -> bool:
+    """A valid, unexpired console session cookie is a credential for API calls.
+
+    Local import: admin_auth imports extract_api_key from this module, so a
+    module-level import here would be circular.
+    """
+    from admin_auth import ADMIN_COOKIE_NAME, get_admin_password, verify_admin_token
+
+    password = get_admin_password()
+    if not password:
+        return False
+    return verify_admin_token(request.cookies.get(ADMIN_COOKIE_NAME), password)
+
+
 async def require_api_key(request: Request) -> str | None:
-    """FastAPI dependency used by the catch-all gateway route."""
+    """FastAPI dependency used by every business endpoint.
+
+    Credential priority: a signed console session, then the trusted-network
+    bypass, then a valid caller API key. An untrusted caller with neither gets
+    401 (no key) or 403 (invalid key), including on `/`.
+    """
     manager = getattr(request.app.state, "manager", None)
     if manager is None:
         return "anonymous"
+    if has_admin_session(request):
+        return "admin-session"
     cfg = manager.config
     if not cfg.auth.enabled:
+        # trusted_networks turns "auth off" into an explicit internal/outside
+        # split: only those networks stay anonymous. Without it keep the legacy
+        # behaviour (all anonymous) - the startup self-check warns loudly.
+        if cfg.auth.trusted_networks and not trusted_peer(request, cfg):
+            return await _authorize(request, cfg)
         return "anonymous"
     return await _authorize(request, cfg)

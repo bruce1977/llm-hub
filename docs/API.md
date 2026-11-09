@@ -52,8 +52,9 @@ Most endpoints require an API key, supplied in one of two ways:
 -H "X-API-Key: sk-gateway-example-key"
 ```
 
-**Exceptions:** `/` and `/health` need no authentication by default (controlled by
-`auth.allow_anonymous_health`).
+**Exceptions:** only the `/` and `/health` probes are anonymous by default (controlled by
+`auth.allow_anonymous_health`; set it to `false` to require a key there too). Every business API,
+including `/v1/models`, needs a valid key from an untrusted caller.
 
 **Where keys come from:** a caller key is a row in the `api_keys` table inside `llmhub.db`, where only
 `sha256(plaintext)` and a mask are stored. Keys are minted and revoked in the console at `/admin`
@@ -62,13 +63,25 @@ Most endpoints require an API key, supplied in one of two ways:
 key looks like `sk-hub-` plus 40 base62 characters, 47 in total. See **Caller API keys** in the
 [Management API](#management-api-web-console) section.
 
-**Client IP allowlist:** sources matching `auth.allow_access_ip_whitelist` (an array of regex strings,
-each matched with `re.fullmatch`) may open `/docs` and `/openapi.json`, and may call any business API without
-an API key. For everything else `/docs` and `/openapi.json` return **404** (not 401/403, so from the outside
-the paths simply do not exist). Matching runs against the ASGI client address (`request.client.host`); the
-gateway never reads `X-Forwarded-For` itself, but uvicorn's `ProxyHeadersMiddleware` rewrites
-`request.client` from forwarding headers when the TCP peer is a trusted proxy (`--forwarded-allow-ips`,
-`127.0.0.1` by default), so a front proxy must sanitise `X-Forwarded-For` on its own.
+**Trusted networks (key-free inside):** `auth.allow_access_ip_whitelist` (regex strings, `re.fullmatch`)
+and `auth.trusted_networks` (CIDR blocks) define the trusted network through one shared judgement,
+`trusted_peer()` - the docs gate and the key bypass both read it. Trusted peers may open `/docs`,
+`/openapi.json` and `/static/swagger/*`, and reach **every path** without a key, even if they send an
+invalid one. Everyone else gets **404** on the docs paths (not 401/403, so from outside they simply do not
+exist), `401` without a key and `403` with an invalid key on business APIs. Once `trusted_networks` is
+declared, `auth.enabled: false` exempts only those networks; external callers still need a key. Without
+the declaration the legacy all-anonymous behaviour stays, but startup warns loudly.
+Matching runs against the ASGI client address (`request.client.host`); the gateway never reads
+`X-Forwarded-For` itself, but uvicorn's `ProxyHeadersMiddleware` rewrites `request.client` from
+forwarding headers when the TCP peer is a trusted proxy (`--forwarded-allow-ips`, `127.0.0.1` by
+default), so a front proxy must **overwrite** with `proxy_set_header X-Forwarded-For $remote_addr;`
+rather than appending, or an outsider can forge an internal address.
+
+**Console session cookie:** the signed cookie minted by `/v1/management/auth/login` is also a credential
+on business API routes, so the browser need not hold a caller key. Its lifetime is `ADMIN_SESSION_TTL`
+seconds (default `43200`, clamped 5 min .. 7d) and successful requests past half the TTL renew it.
+Logout only clears the browser cookie - there is no server-side session table, so a copied cookie stays
+valid until it expires or `ADMIN_PASSWORD` changes.
 
 **Swagger UI:** open `/docs` (after satisfying the allowlist above). **Every endpoint's Parameters section
 carries an `X-API-Key` input** — click **Try it out**, fill the key in, and **Execute** sends it with that one

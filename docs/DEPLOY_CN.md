@@ -178,6 +178,7 @@ scripts\docker-build.bat
 | `SYSTEMONE_SERVER_API_KEY` | ❌ | System One 后端密钥，仅当 `systemone.api_key_env` 指向它时才需要；laya-server 必需，Ollama 0.40+ 后端会忽略该头 |
 | `OPENCODE_GATEWAY_API_KEY` | ❌ | 联网检索上游密钥，仅当 `websearch.api_key_env` 指向它时才需要（默认留空 = 不签名） |
 | `ADMIN_PASSWORD` | ❌ | Web 管理台登录密码（用户名固定 `admin`），与调用方 API Key 是两套凭据：它只用于 `POST /v1/management/auth/login` 换取 12 小时会话 Cookie，本身当作 `Bearer` / `X-API-Key` 提交仍是 401。`/v1/management/*` 除该 Cookie 外也接受 `api_keys` 表里的网关 Key（供脚本复用），但 `/api-keys` 三个接口例外——只认会话 Cookie，否则任何客户端都能用它自己的 Key 再造一把。未设置时 `/admin` 显示「管理台未启用」，`/v1/management/*` 全部返回 503 |
+| `ADMIN_SESSION_TTL` | ❌ | 管理台会话有效期（秒），默认 `43200`（12 小时），钳制在 `300` ~ `604800`（5 分钟 ~ 7 天）。会话使用过半后成功请求会自动续期；退出登录只清除浏览器 Cookie，服务端没有会话表 |
 | `REQUEST_LOG_DB` | ❌ | 请求明细 SQLite 路径，默认 `CONFIG_PATH` 同目录的 `llmhub.db`（容器内为 `/data/llmhub.db`）。同一个库文件里共有三张表：`requests`（明细）、`bench_results`（测速历史）与 `api_keys`（调用方 Key 的 hash 与掩码） |
 | `LLMHUB_DB` | ❌ | `bench_results` 与 `api_keys` 两张表的库路径，默认同样是 `CONFIG_PATH` 同目录的 `llmhub.db`。只在需要把它们与明细库分开时才设置；三张表默认落在同一个文件，容器只需一个可写 `/data` |
 | `REQUEST_LOG_RETENTION_DAYS` | ❌ | 请求明细保留天数，默认 `30`；`0` 表示永久保留 |
@@ -186,6 +187,48 @@ scripts\docker-build.bat
 > 请把 `REQUEST_LOG_DB` 指到可写路径，或设为空目录下的默认位置。
 > 是否入库由 `config.yaml` 的 `request_log.enabled` 控制（默认 `true`）：该开关逐请求读取，
 > 改成 `false` 保存后无需重启容器；配置的 mtime 每秒最多比对一次，因此约 1 秒内停止写入。
+
+---
+
+## 内外网鉴权分工
+
+「内网调用不需要 API Key、外网调用必须带 Key」由 `config.yaml` 的 `auth.trusted_networks` 实现，
+不必拆成两套服务：
+
+```yaml
+auth:
+  enabled: false                  # 填 true 也可以：可信网段同样免 Key
+  allow_anonymous_health: true     # / 与 /health 保持匿名，供容器健康检查
+  allow_access_ip_whitelist: []
+  trusted_networks:
+    - 127.0.0.1/32                # 容器内 HEALTHCHECK
+    - 192.168.10.0/24             # 内网网段
+```
+
+- 可信网段内：任何路径免 Key（带无效 Key 也放行），`/docs` 可见。
+- 网段外：所有业务 API 都要有效 Key（无 Key `401`、无效 Key `403`），`/docs` 返回 404。
+- 公网实例不与内网共用时，改为 `auth.trusted_networks: []` + `auth.enabled: true`，并确保
+  `api_keys` 表里至少有一把 Key；否则启动日志会告警且外网请求全部 401。
+- 后端 Ollama 端口（11434 等）**不要**映射到公网，否则请求绕过网关，整套鉴权失效。
+- 管理台登录后的会话 Cookie 同样可以调用业务 API，有效期由 `ADMIN_SESSION_TTL` 控制。
+
+经反向代理时，uvicorn 会用转发头改写客户端地址，因此代理必须**覆盖**而非追加：
+
+```nginx
+proxy_set_header X-Forwarded-For $remote_addr;   # 不要用 $proxy_add_x_forwarded_for
+proxy_set_header X-Forwarded-Proto $scheme;      # 让会话 Cookie 正确带 Secure
+```
+
+验收：
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' http://<内网IP>:8834/v1/models                                          # 200
+curl -o /dev/null -w '%{http_code}\n' http://<公网域名>:8834/v1/models                                      # 401
+curl -H 'X-Forwarded-For: 192.168.10.5' -o /dev/null -w '%{http_code}\n' http://<公网域名>:8834/v1/models  # 401
+curl -m 3 -o /dev/null -w '%{http_code}\n' http://<公网域名>:11434/api/tags                               # 连不通
+```
+
+第三条若返回 200，说明反代把伪造的 `X-Forwarded-For` 当成了来源 IP。
 
 ---
 

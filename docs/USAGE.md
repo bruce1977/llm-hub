@@ -233,6 +233,7 @@ auth:
   enabled: true
   allow_anonymous_health: true
   allow_access_ip_whitelist: []
+  trusted_networks: []            # CIDR, e.g. 192.168.10.0/24, 127.0.0.1/32
 ```
 
 - **Keys are no longer configurable in `config.yaml`**: the `api_keys` field is gone, so the file
@@ -263,6 +264,31 @@ auth:
   address from forwarded headers when the peer is a **trusted proxy** (`--forwarded-allow-ips`,
   default `127.0.0.1`), so behind a local reverse proxy the real source is what matches — make sure
   that proxy sets and sanitises `X-Forwarded-For`
+- **`trusted_networks`: the explicit internal/outside switch** (a list of CIDR blocks such as
+  `192.168.10.0/24`, `10.0.0.0/8`, `127.0.0.1/32`; a bare IP is accepted too). Once declared:
+  - Trusted peers reach **every path** without a key, even if they send an invalid one;
+    `/docs`, `/openapi.json` and `/static/swagger/*` are visible to the same peers. The docs gate
+    and the key bypass share `trusted_peer()`, so a hidden `/docs` can no longer coexist with a
+    key-free API
+  - Every other caller needs a valid key on **all business APIs** (`/v1/models`, `/api/tags`,
+    `/v1/chat/completions`, ...): `401` without one, `403` with an invalid one. Only `/` and
+    `/health` stay anonymous under `allow_anonymous_health` (container / load-balancer probes);
+    set it to `false` to close those too
+  - `enabled: false` is **no longer globally anonymous**: only the trusted networks are exempt,
+    external callers still need a key. With an empty `api_keys` table those external requests all
+    answer `401`, and startup tells you to mint a key at `/admin`
+  - Leaving it `[]` keeps the legacy behaviour (`enabled: false` = everyone anonymous), but
+    startup now warns loudly that a hidden `/docs` is **not** a security boundary
+  - Matching again uses only the TCP peer (`request.client.host`), never `X-Forwarded-For`.
+    Uvicorn rewrites it from forwarding headers behind a trusted proxy, so the proxy must
+    **overwrite** with `proxy_set_header X-Forwarded-For $remote_addr;` (not append with
+    `$proxy_add_x_forwarded_for`), or an outsider can forge an internal IP
+- **A console session cookie is also a credential on business API routes**: after sign-in the
+  signed cookie can call `/v1/models` and friends directly, so the browser need not hold a caller
+  key. Its lifetime is `ADMIN_SESSION_TTL` seconds (default `43200` = 12h, clamped 5 min .. 7d)
+  and successful requests past half the TTL renew it, so an active session never hard-expires.
+  Logout only clears the browser cookie - there is no server-side session table, so a copied
+  cookie stays valid until it expires or `ADMIN_PASSWORD` changes
 - ⚠️ With auth enabled (`enabled: true`) and **no row in `api_keys`** (after seeding), the gateway
   **refuses to start** and names the fix: seed the empty table with `GATEWAY_API_KEYS` /
   `GATEWAY_API_KEYS_FILE` and restart, or set `auth.enabled: false`. This avoids an accidentally

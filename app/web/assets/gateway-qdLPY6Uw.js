@@ -1,1 +1,0 @@
-import{W as e}from"./index-DG6-GuT5.js";var t=e({version:null});export{t};

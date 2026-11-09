@@ -14,7 +14,7 @@ import type {
   RequestsResponse,
   RequestStats,
 } from '@/types/api'
-import { daysAgoStartInput, fmtClock, fmtInt, fmtMs, fmtPct, fromInputValue, statusBadge, todayEndInput } from '@/utils/format'
+import { daysAgoStartInput, fmtClock, fmtDateTimeParts, fmtInt, fmtMs, fmtPct, fromInputValue, statusBadge, todayEndInput } from '@/utils/format'
 
 const PAGE_SIZE = 15
 const STATUS_OPTIONS = ['2xx', '3xx', '4xx', '5xx']
@@ -307,7 +307,10 @@ onMounted(() => {
         </thead>
         <tbody>
           <tr v-for="row in rows" :key="row.id">
-            <td class="mono">{{ fmtClock(row.ts) }}</td>
+            <td class="mono time-cell" :title="fmtDateTimeParts(row.ts).full">
+              <div class="date-line">{{ fmtDateTimeParts(row.ts).date }}</div>
+              <div>{{ fmtDateTimeParts(row.ts).time }}</div>
+            </td>
             <td>{{ row.method }}</td>
             <td class="path-cell">
               {{ row.path }}
@@ -360,6 +363,18 @@ onMounted(() => {
 .sub-line {
   color: var(--text-dim);
   font-size: 11.5px;
+}
+
+/* Date above the clock in the 时间 column: both lines stay on one row each and the
+   date is dimmed like the other table sub-lines. */
+.time-cell {
+  white-space: nowrap;
+  line-height: 1.45;
+}
+
+.time-cell .date-line {
+  color: var(--text-dim);
+  font-size: 11px;
 }
 
 .warn-strip code {

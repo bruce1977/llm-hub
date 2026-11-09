@@ -49,7 +49,7 @@ llm-hub/
 │   ├── tsconfig.json         # strict, moduleResolution "bundler", @/* -> src/*
 │   └── vite.config.ts        # build.outDir = ../app/web (the bundle is committed, node_modules are not)
 ├── tests/
-│   ├── smoke_test.py        # Comprehensive mock tests (135)
+│   ├── smoke_test.py        # Comprehensive mock tests (154)
 │   ├── test_gateway_new.py  # Aggregation / systemone / web search / /docs schema tests (63)
 │   ├── test_management.py   # Management API + request log + API keys + console serving tests (407)
 │   ├── verify_security.py   # Security control tests (15)
@@ -142,7 +142,7 @@ python tests/demo.py
 **Important:** E2E tests always use `data/config.yaml` from the project root (set via `CONFIG_PATH=./data/config.yaml`). This config points to the local Ollama instance at `127.0.0.1:11434`. Never hardcode paths in test commands.
 
 ### Test Structure
-- `smoke_test.py` — 135 mock tests (auth, routing, aliases, streaming, `/api/generate` forwarding, rerank, security, `/` system info, upstream types), no external deps
+- `smoke_test.py` — 154 mock tests (auth, routing, aliases, streaming, `/api/generate` forwarding, rerank, security, `/` system info, upstream types, the `auth.trusted_networks` internal/outside split, console-session cookies on API routes, session expiry and sliding renewal), no external deps
 - `test_gateway_new.py` — 63 tests for aggregation, systemone + web search forwarding and the `/docs` schema (auth schemes + inline `X-API-Key` input + the documented `/api/generate` request/response schema)
 - `test_management.py` — 407 tests for admin auth (session cookie **or** gateway API key → 200; the admin password as `Bearer` / `X-API-Key` and a key in the query string → 401; wrong username → 401; `ADMIN_PASSWORD` unset → 503), the `/admin` static console (`/admin` → `/admin/` redirect, SPA fallback, immutable caching for `assets/`, `../` cannot escape the build, the tab icon served as `image/svg+xml` rather than falling back to the shell, 503 with a build hint when `app/web` is missing), upstream probes + device classification, the `upstreams/{name}` detail (declared `models` with renames applied plus the derived alias names, `/api/ps` `running_models`), the config-driven `/models/llm` (only declared names, `display` / `alias` / `derived` per row, a `model_aliases` rename replacing `display` without touching the target, a root `aliases:` entry becoming its own row right after its target — device inherited, memory `null`, `aliases[].kind` separating `rename` from `derived`, a `qwen3:*` or `opencode/*` prefix expanded through discovery and flagged `wildcard`, an unresolvable pattern kept as its own row with `running: false`, runtime device/memory, dead upstream contributes only its declared names), hosted `opencode` rows (probe online ⇒ every declared model `running` with `device: "cloud"` and memory `null`, rows added to `/overview` `running_models` and the KPI, nothing added when offline), `/overview` appending only **running** derived rows to `running_models` while `kpi.running_models` counts just the physical + hosted rows, masked config projections (LLM / rerank / systemone / tools-websearch), the `api_models` derivation and narrowing (names explicitly claimed by embed/rerank/systemone removed from generate/chat while a `websearch` claim does not hide a chat model or its alias, a tagless `tev1` claim matching a declared `tev1:latest`, alias and derived names accepted, `free_model` on derived websearch/systemone families, an unserved name kept visible, the per-kind default and mask, a non-Ollama (`lmstudio`) model absent from the native `generate` / `embed_ollama` kinds while `chat` / `embed_openai` keep it, an explicit list served as written as a closed set that beats the web-search provider filter and turns `free_model` off, and blank placeholder entries ignored rather than becoming empty options), the `/api-test` envelope (closed `kind` allowlist → 400, a missing `model` where the family needs one → 400, alias + `think` injection, `num_ctx` clamping, the envelope's requested/resolved model + upstream + injected params (flat keys, not nested), NDJSON and SSE assembly with `stream`/`content_type`/`ttft_ms`, an unreachable backend's **502** and a disabled capability's **404** arriving as data rather than as an error, the 128 KB `truncated` cap and the request-log row a tester call leaves), request-log capture (stream / non-stream / 502, timestamps, requested vs resolved model, query string, an allowed `HEAD` forwarded but never written to the log, the `tokens_in` / `tokens_out` split from both usage formats and the `NULL` when a response reports no usage), the `kpi.tokens_today` total, filters, pagination, timeseries, distribution pies and the `group_by` guard, the `request_log.enabled` switch and the legacy-database `ALTER TABLE` upgrade (including the declared type of the added columns), the `/v1` + `/api` **stats scope** (a non-API path is still written to the raw table yet counted by neither the list, the timeseries, the pies, the KPI or `failures`, and `?path=` cannot bring it back, while its `/requests/{id}` deep link still opens) and the **caller API key routes** (session cookie only — a gateway key alone is **401** on all three; the seeded `source: "file"` row is masked with no plaintext anywhere in the payload; **201** create returns a `sk-hub-` key of exactly 47 base62 characters whose mask equals `mask_key(secret)`, and that plaintext never reappears in a later listing; blank label **400** / over-long **422**; the fresh key authenticates `/api/tags` and `/v1/management/auth/ping` at once, a tampered last character does not; revoke answers **200** then **404**, the row disappears and the key stops authenticating — checked after `logout`, because a live session cookie would otherwise satisfy `require_admin` on its own), plus a direct `ApiKeyStore` unit section (50 generated keys are unique, prefixed and fixed-length; `hash_key` is the lowercase sha256 hex; the three `mask_key` shapes; `create` row fields and label truncation; `list_keys` ordering and its exact column set; `import_plaintext` de-duplicates and marks `source: "file"`; `unserved_env_keys` reports only masks; a deleted key fails `verify()`), and the **local-day dashboard window** (`today_start` / `today_end` replacing the UTC fallback, malformed or reversed windows → 400) with `tz_offset` day bucketing (UTC by default, shifted to the caller's calendar, ±840 clamp)
 - `verify_security.py` — 15 security tests (method allowlist, path allowlist, rate limit, headers)
@@ -345,11 +345,20 @@ Docs live in `docs/`. Only the two landing pages, `CHANGELOG.md` and this file s
   restarting. The misspellings `allow_access_ip_whilelist`
   / `allow_ip_whitelist` are normalised to the real field with a warning (pydantic would otherwise
   drop them silently and leave the whitelist empty)
-- `/docs` and `/openapi.json` are served only to sources matching `auth.allow_access_ip_whitelist`
-  (`re.fullmatch` against the ASGI client address; the gateway never reads `X-Forwarded-For` itself
-  because a caller can forge it), and those sources also bypass API-key checks. Everyone else gets
-  **404**. The old `security.allow_docs` field is gone. Uvicorn's `ProxyHeadersMiddleware` may have
-  already rewritten `request.client` from forwarded headers when the peer is a trusted proxy
+- `auth.trusted_networks` (CIDR blocks) declares the internal network. With it set,
+  `auth.enabled: false` becomes an internal/outside split: trusted peers are anonymous on every
+  path (even with an invalid key), everyone else still needs a valid caller key. Without it the
+  legacy all-anonymous behaviour stays, but startup logs a loud warning. `trusted_peer()` is the
+  single judgement shared by the docs gate and the key bypass
+- A valid console session cookie also authenticates business API routes, not just
+  `/v1/management/*`. Its lifetime is `ADMIN_SESSION_TTL` seconds (default 12h, clamped
+  5 min..7d) and is renewed past half the TTL; logout only clears the browser cookie
+- `/docs`, `/openapi.json` and `/static/swagger/*` are served only to trusted peers
+  (`allow_access_ip_whitelist` regexes / `trusted_networks` CIDR, matched against the ASGI client
+  address; the gateway never reads `X-Forwarded-For` itself because a caller can forge it).
+  Everyone else gets **404**. The old `security.allow_docs` field is gone. Uvicorn's
+  `ProxyHeadersMiddleware` may have already rewritten `request.client` from forwarded headers
+  when the peer is a trusted proxy
   (`--forwarded-allow-ips`, default `127.0.0.1`), so behind a local reverse proxy the real client
   address is what matches — the proxy must sanitise `X-Forwarded-For`
 - Endpoints listed in `main.POST_ONLY_PATHS` answer **405** with `Allow: POST` on other methods
@@ -694,6 +703,11 @@ Docs live in `docs/`. Only the two landing pages, `CHANGELOG.md` and this file s
 - The Requests 模型 dropdown follows the chosen 上游: `/models/llm` rows carry their upstream, and an
   alias is offered under every upstream that serves its target (`ModelChoice.upstreams: string[]`).
   A derived alias is now *also* its own row, so the choices are deduped by name
+- The Requests 时间 column stacks `yy-MM-dd` above `HH:mm:ss` (both local time, like `fmtClock`),
+  with the full `yyyy-MM-dd HH:mm:ss` on the cell's `title`. `fmtDateTimeParts()` in
+  `utils/format.ts` parses the naive UTC ISO timestamp once and returns all three parts, so a
+  two-line stamp cannot split across a day boundary; the dimmed `.date-line` matches the table's
+  other sub-lines and `white-space: nowrap` keeps the column narrow
 - Models · LLM is two tabs (`tab = 'models' | 'api'`, no router change, no extra fetch): 模型清单 holds the
   three config tables, API 用法 renders two `ApiDoc` blocks - `POST /api/generate` and
   `POST /v1/chat/completions` - whose parameter tables mirror `app/main.py`'s `openapi_extra` schema and

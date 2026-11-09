@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (Requests table timestamps show the calendar date)
+
+- **The 时间 column is now two lines**: `yy-MM-dd` above `HH:mm:ss`, so a 7-day window can be read
+  without cross-checking the filters. Hovering a cell shows the full local `yyyy-MM-dd HH:mm:ss`.
+  `fmtDateTimeParts()` in `web/src/utils/format.ts` derives all three values from one parsed
+  instant (the backend sends naive UTC ISO strings, displayed in the viewer's local timezone),
+  so the date and the clock can never disagree across a day boundary. The bundle in `app/web`
+  was rebuilt.
+
+### Added (trusted-network split, console sessions as API credentials, sliding expiry)
+
+- **`auth.trusted_networks` (CIDR list) declares the internal network.** Declaring it turns
+  `auth.enabled: false` into an explicit internal/outside split: trusted peers call every path
+  without a key — even with an invalid key — while any other caller still needs a valid key.
+  It works with `auth.enabled: true` as well. Without the declaration the legacy all-anonymous
+  behaviour is kept, but the startup self-check now warns loudly that a hidden `/docs` is **not**
+  a security boundary.
+- **The `/docs` gate and the anonymous-key bypass now share `trusted_peer()`**, so they cannot
+  disagree. `/static/swagger/*` is gated together with `/docs` and `/openapi.json`.
+- **A valid console session cookie is now a credential on business API routes**, not only on
+  `/v1/management/*`. The only anonymous paths left for an untrusted caller are `/` and `/health`
+  (`auth.allow_anonymous_health` still controls them).
+- **Session lifetime is configurable and sliding**: `ADMIN_SESSION_TTL` (seconds, default 43200,
+  clamped to 5 min .. 7 days); a successful request past half the TTL re-issues the cookie, so an
+  active console session no longer hard-expires at 12h. A weak `ADMIN_PASSWORD` is warned about at
+  startup because it doubles as the cookie's HMAC signing key.
+- **Startup self-check** reports the effective auth mode; with `trusted_networks` set and an empty
+  `api_keys` table it also warns that external callers will get 401 until a key is minted.
+
 ### Fixed (every tester picker now honours `api_models`)
 
 - **A non-empty `api_models.<family>` list is now a closed set.** `websearch` used to be replaced
