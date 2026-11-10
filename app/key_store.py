@@ -12,11 +12,10 @@ passphrase left to brute-force, and the gateway verifies a key on **every** clie
 KDF would tax every call by tens of milliseconds and turn the endpoint into a DoS amplifier while
 buying nothing against a secret nobody can guess.
 
-Keys used to come only from ``GATEWAY_API_KEYS`` / ``GATEWAY_API_KEYS_FILE`` (``data/.keys``).
-They are still honoured: the first start against an empty table imports them as
-``source="file"``, and from then on the table is the only source of truth -- the file is never
-re-read, so a key revoked in the console stays revoked, and editing the file changes nothing
-(startup says so out loud).
+Keys are created **only** in the console: there is no environment variable, key file or
+config node that seeds them. A deployment starts with an empty table, the operator signs in
+at ``/admin`` with ``ADMIN_PASSWORD`` and mints the first key there. Nothing outside the
+database can revive a revoked key, and rotating a key never needs a restart.
 """
 
 from __future__ import annotations
@@ -45,7 +44,6 @@ KEY_LENGTH = len(KEY_PREFIX) + SECRET_BODY  # 47, always
 _ALPHABET = string.ascii_letters + string.digits
 
 SOURCE_CONSOLE = "console"
-SOURCE_FILE = "file"
 
 LABEL_MAX_CHARS = 100
 
@@ -74,9 +72,9 @@ def generate_key() -> str:
 def mask_key(secret: str) -> str:
     """A display form that identifies a key without disclosing it.
 
-    Generated keys keep their prefix and 4+4 characters of the body. Imported keys have any
-    shape (an old ``sk-...`` from a file), so they fall back to head-and-tail of the whole
-    string, and a short one is covered completely.
+    Generated keys keep their prefix and 4+4 characters of the body. A row written by an
+    older release may hold a key of any shape (an ``sk-...`` migrated from a file), so those
+    fall back to head-and-tail of the whole string, and a short one is covered completely.
     """
     if secret.startswith(KEY_PREFIX) and len(secret) > len(KEY_PREFIX) + 8:
         body = secret[len(KEY_PREFIX) :]
@@ -102,6 +100,9 @@ class ApiKeyStore:
         self.db_path = Path(db_path or os.getenv("LLMHUB_DB") or Path(CONFIG_PATH).parent / "llmhub.db")
         self._hashes: frozenset[str] = frozenset()
         self._started = False
+        # Serialise "write row + reload in-memory hashes". Interleaved create/revoke
+        # calls could otherwise leave a revoked hash in the cache until the *next* write.
+        self._write_lock = asyncio.Lock()
 
     # ------------------------------------------------------------- lifecycle ---
     async def start(self) -> None:
@@ -130,28 +131,31 @@ class ApiKeyStore:
         """Add a key and return ``(row, plaintext)`` -- the plaintext is never stored."""
         label = _clean_label(label)
         secret = generate_key()
-        row = await asyncio.to_thread(self._insert_sync, secret, label, SOURCE_CONSOLE)
-        await asyncio.to_thread(self._load_cache)
+        async with self._write_lock:
+            row = await asyncio.to_thread(self._insert_sync, secret, label, SOURCE_CONSOLE)
+            await asyncio.to_thread(self._load_cache)
         return row, secret
 
     async def delete(self, key_id: int) -> bool:
-        removed = await asyncio.to_thread(self._delete_sync, key_id)
-        await asyncio.to_thread(self._load_cache)
+        async with self._write_lock:
+            removed = await asyncio.to_thread(self._delete_sync, key_id)
+            await asyncio.to_thread(self._load_cache)
         return removed
 
-    async def import_plaintext(self, keys: list[str], *, source: str = SOURCE_FILE) -> int:
-        """Seed the table from environment / ``.keys`` values, skipping what is already there."""
-        inserted = await asyncio.to_thread(self._import_sync, keys, source)
-        await asyncio.to_thread(self._load_cache)
-        return inserted
+    async def add_plaintext(
+        self, secrets: list[str], *, label: str = "", source: str = SOURCE_CONSOLE
+    ) -> int:
+        """Insert operator-supplied plaintext keys, skipping duplicates, and return the count.
 
-    def unserved_env_keys(self, keys: list[str]) -> list[str]:
-        """Environment keys the table does not contain, as masks.
-
-        After the first import the file stops being the source of truth, so these are dead
-        credentials the operator probably believes still work -- startup warns about them.
+        This is the migration/test entry point, not a startup seed: the gateway never reads
+        keys from the environment, so the only caller in production code is someone moving
+        rows between two databases. The console uses :meth:`create`, which generates the
+        secret itself and shows it exactly once.
         """
-        return [mask_key(k) for k in keys if k and hash_key(k) not in self._hashes]
+        async with self._write_lock:
+            inserted = await asyncio.to_thread(self._insert_many_sync, secrets, label, source)
+            await asyncio.to_thread(self._load_cache)
+        return inserted
 
     # ----------------------------------------------------------------- sqlite ---
     def _connect(self) -> sqlite3.Connection:
@@ -203,19 +207,17 @@ class ApiKeyStore:
         with self._db() as conn:
             return conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,)).rowcount > 0
 
-    def _import_sync(self, keys: list[str], source: str) -> int:
+    def _insert_many_sync(self, secrets: list[str], label: str, source: str) -> int:
         inserted = 0
         with self._db() as conn:
-            for secret in keys:
+            for secret in secrets:
                 if not secret or conn.execute(
                     "SELECT 1 FROM api_keys WHERE hash = ?", (hash_key(secret),)
                 ).fetchone():
                     continue
                 conn.execute(
                     "INSERT INTO api_keys (hash, masked, label, source, created_at) VALUES (?, ?, ?, ?, ?)",
-                    # An imported key has no description to carry over, and the console is what
-                    # renders one, so the label stays empty and `source="file"` does the telling.
-                    (hash_key(secret), mask_key(secret), "", source, now_ts()),
+                    (hash_key(secret), mask_key(secret), label, source, now_ts()),
                 )
                 inserted += 1
         return inserted

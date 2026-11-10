@@ -7,6 +7,420 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (2026-11-10: every log line now carries a timestamp)
+
+uvicorn installs its own logging configuration when it starts, which replaces `logging.basicConfig()`
+and ships formatters with **no** time field. A burst of probe traffic therefore looked like this —
+impossible to line up against a restart, a config change or a scan window:
+
+```
+INFO:     167.104.161.192:33932 - "GET /v1/models HTTP/1.1" 404 Not Found
+```
+
+- **`app/logging.json` is the single source of truth for the format**, applied to both `uvicorn.error`
+  and `uvicorn.access`. Every line is now
+  `2026-11-10 20:31:18.718 | INFO    | uvicorn.access | 127.0.0.1:61641 - "GET /v1/models HTTP/1.1" 404 Not Found`
+  (millisecond precision, logger name, and uvicorn's status phrase restored via `%(status_code)s`).
+  Handlers keep uvicorn's routing: server/app lines on stderr, access lines on stdout.
+- **All three entrypoints agree.** `serve.py` passes the loaded dict to `uvicorn.Config(log_config=...)`;
+  `scripts/start-local.ps1` passes `--log-config logging.json` on the auto-reload path (uvicorn accepts
+  a file there, not a dict); `main.setup_logging()` re-formats handlers uvicorn had *already* installed,
+  which covers a hand-run `uvicorn main:app` where no log config was supplied. Only the two lines uvicorn
+  prints *before* the app's lifespan (`Started server process`, `Waiting for application startup`) keep
+  the stock shape on that last path — a `--log-config` start formats those too. The `serve.py` startup
+  banner is timestamped as well.
+- **`server.log_level` is one knob again.** uvicorn only applied it to `uvicorn.error` /
+  `uvicorn.access`; `logging_config.uvicorn_log_config()` pins every logger plus root, and
+  `setup_logging()` sets the root level explicitly because `basicConfig` is a no-op once a handler exists.
+- **`Dockerfile` copies `app/logging.json`** (it ships `app/*.py` plus `app/static` / `app/web`, so a bare
+  JSON file would have been left behind and the container would have fallen back to uvicorn's stock
+  format). `--log-config` remains the only way to format the reload parent process.
+- **Tests**: `verify_security.py` adds `test_log_timestamps()` — 7 checks on the formatter spec plus a
+  real "re-format an installed access handler" round trip (suite **149 → 156**). The other three suites
+  are unchanged at 229 / 95 / 414.
+
+### Fixed (2026-11-10: `security.public.admin_endpoints: allow` looked like a no-op)
+
+Three unrelated faults produced the same symptom, and only the third was a setting people could see:
+
+- **`data/config.yaml` renamed its upstreams but not `default_upstream`.** It shipped
+  `default_upstream: ollama` while the entries are `ollama-gpu` / `ollama-igpu` / `opencode`, so
+  `Config.default_upstream_obj()` returned `None`. Every call that carries **no `model`** — `api/pull`
+  (`name`), `api/push`, `api/create`, `api/delete`, `api/copy`, `api/tags`, `api/ps` — therefore died in
+  `proxy.forward()` with `404 No upstream configured for model ''`, *after* the admin filter had already
+  let it through. `admin_endpoints: allow` was working; nothing downstream could route the call. The value
+  is now `ollama-gpu`, and config load logs an **error** naming the dangling value and the upstreams that
+  do exist, so the next rename cannot break model-less calls silently.
+- **That 404 no longer blames a missing `model`.** For a body without one it now says the call is routed
+  by `default_upstream`, quotes the configured value, and lists the available upstream names.
+- **`admin_endpoints` is only half a switch**, and the log now says so. `path_allowlist` decides whether
+  the path exists on the public socket at all, so `allow` with no matching `POST` rule still answers 404
+  (the mode only lifts the block, it never opens a path). Startup now prints the endpoints that survive
+  **both** — or, when the mode is `readonly` while nothing is listed, an explicit warning that the
+  setting has no effect plus the rule to add. New
+  `PublicSecurityConfig.reachable_admin_paths()` computes that intersection (unit-tested for all three
+  modes in `verify_security.py`).
+- **Tests**: `verify_security.py` gains 5 checks on `reachable_admin_paths()` (suite **132**); the rest of
+  the suite counts are unchanged because the other three faults are configuration and log output.
+  Verified against the shipped config: internal `POST /api/pull` now reaches the upstream (`502` from a
+  deliberately dead base URL) instead of `404`, and `/api/tags` answers again.
+
+### Removed (2026-11-10: caller API keys are no longer an environment concern)
+
+`GATEWAY_API_KEYS` is gone, together with every code path that read it. Keys were already stored as
+hashes in `llmhub.db` and managed in the console; the environment seed was the last way to bring one
+into existence outside `/admin`, and it is exactly the kind of secret that leaks through a compose file,
+a `docker inspect` or a screenshot.
+
+- **`app/config.py`**: `ENV_API_KEYS`, `collect_env_api_keys()`, `set_api_keys()`, `get_api_keys()` and
+  the `Config.api_keys` property are deleted. A key is now only ever a row of the `api_keys` table.
+- **`app/main.py`**: the first-start import and the "ignoring N environment keys" warning are gone, and
+  so is the weak-key startup check (`security.fail_on_weak_keys` had nothing left to screen: the console
+  generates 238-bit keys). The remaining guard is narrow and logical: startup refuses only when **no
+  credential could ever exist** — an empty table, no `ADMIN_PASSWORD` (so the console cannot mint one)
+  and no anonymous internal zone. An empty table on its own is a normal first run; every keyed request
+  answers 401 until the first key is minted.
+- **`app/key_store.py`**: `import_plaintext()` and `unserved_env_keys()` are replaced by
+  `add_plaintext(secrets, label=…, source=…)`, an operator/test migration helper; `SOURCE_FILE` is
+  removed (existing rows keep their historical `source: "file"` label).
+- **`scripts/start-local.ps1`** now *strips* a stale `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` from
+  the environment with a warning instead of exporting it, and its preflight counts rows in
+  `api_keys` rather than merging in environment keys.
+- **Tests** seed their own keys: each suite writes the hash rows into `llmhub.db` before the lifespan
+  starts (a shared-per-suite database, so a stale table can never mask a missing fixture).
+  `smoke_test.py` **229**, `verify_security.py` **149**, `test_gateway_new.py` **95**,
+  `test_management.py` **414**, all green.
+- **Docs**: `.env.example`, `docs/DEPLOY(.md/_CN.md)`, `docs/USAGE(.md/_CN.md)`, `docs/CONFIG(.md/_CN.md)`,
+  `docs/API(.md/_CN.md)`, `docs/TESTCASES.md`, `README(.md/_CN.md)`, `AGENTS.md`,
+  `docs/web-management/web-management-implementation.md` and the marketing post now describe the console
+  as the only key source. Migration for an existing deployment: nothing to do — the rows are already in
+  `llmhub.db`; just delete the variable from `.env` / compose.
+
+### Changed (2026-11-10: `admin_endpoints: allow` also opens the management plane)
+
+The mode used to be a filter in front of Ollama's model API and nothing else, so an operator who wanted
+the console reachable from the internet had no switch at all — `/admin` and `/v1/management/*` were a
+hard-coded **404** on the public listener. `allow` now means what it says.
+
+- **`app/bridge.py`** decides the management prefixes *before* it consults `path_allowlist`
+  (`admin_plane_open()` / `is_anonymous_admin_path()`), so `allow` routes `/admin*` and
+  `/v1/management/*` to their real handlers as a unit. A prefix rule, not an allowlist entry: no regex
+  can describe `/admin/assets/*` reliably. `deny` (default) and `readonly` keep the hard **404**, and
+  listing the prefixes in `path_allowlist` changes nothing under those modes.
+- **The plane is still never anonymous.** Only the static console shell and
+  `POST /v1/management/auth/login` skip the credential check — they are respectively a page holding no
+  data and the handshake that *creates* a session. Every other management route keeps requiring the
+  signed session cookie, and a gateway API key is still not an admin credential.
+- **Ollama's endpoints are unchanged**: `allow` only lifts the admin filter, so `api/pull` and friends
+  still need their own `path_allowlist` entry. Startup now prints two different lines: the
+  reachable-endpoint intersection for `readonly`, and an explicit warning for `allow` that the
+  management plane is open on that port.
+- **Tests**: `verify_security.py::test_admin_endpoints_allow_opens_the_management_plane` covers all three
+  modes on the public socket (404 vs. routed shell + login, management API still 401 without a cookie, a
+  gateway key still not an admin credential, business paths untouched).
+- **Docs**: `docs/CONFIG(.md/_CN.md)`, `docs/USAGE(.md/_CN.md)`, `docs/API(.md/_CN.md)`,
+  `docs/TESTCASES.md`, `AGENTS.md`, `README(.md/_CN.md)` and the marketing post describe the two halves
+  of the mode.
+
+### Changed (2026-11-10: three environment variables, everything else optional)
+
+`.env.example` had grown into a second configuration manual - listener layouts, database paths, provider
+keys, 90 lines of prose for a file whose job is to hold a couple of secrets.
+
+- **It now declares `CONFIG_PATH`, `ADMIN_PASSWORD` and `SYSTEMONE_SERVER_API_KEY`** — the file
+  location (commented, with its default), the console password a deployment must supply, and the
+  optional outbound backend key. Ports, zones, the allowlist, upstreams and timeouts all live in
+  `config.yaml`.
+- **`docs/DEPLOY.md` / `DEPLOY_CN.md`** state that the template names those three and that every other
+  row in the table is optional; `docs/USAGE.md` / `USAGE_CN.md` describe the copy step the same way.
+- **System One's outbound key is now visible at startup**: `main.py` logs the resolved backend URL, the
+  injected model, the variable name from `systemone.api_key_env` (default `SYSTEMONE_SERVER_API_KEY`,
+  renamed from `LAYA_SERVER_API_KEY`) and whether it is set. `docs/CONFIG.md` / `CONFIG_CN.md` spell out
+  that this is the outbound key, distinct from the inbound gateway key a caller presents.
+
+### Fixed (2026-11-10: upgrading an old config silently re-locked the LAN listener)
+
+The stated requirement has always been "the LAN listener is key-free, the internet listener is not".
+The code honoured it, but the *upgrade path* did not: the legacy mapping turned `auth.enabled: true`
+into `security.internal.allow_anonymous: false` unconditionally, so any pre-refactor config arrived at
+the new model with the LAN socket keyed - the opposite of the design - and the first symptom was a
+bare `401` on `GET /v1/models` from `127.0.0.1`.
+
+- **`_migrate_auth_node` now reads the zone layout before deciding.** With
+  `security.public.port` configured (including a port migrated from `LLMHUB_PUBLIC_PORTS`), the old
+  `auth.enabled: true` intent - *keep the internet out* - is already enforced by the public listener,
+  which requires a key on every request and cannot be switched off; the LAN socket therefore goes back
+  to `allow_anonymous: true`. Only when **no** public listener exists does the single socket stay
+  keyed, because that one socket may still be the internet-facing one. An explicit
+  `security.internal.allow_anonymous` always wins over the migration.
+- **Both outcomes log a warning that names the field**, so an operator who upgrades sees which zone
+  they ended up with and how to change it, instead of discovering it through a 401.
+- **`data/config.yaml`** (the gitignored runtime file) had `allow_anonymous: false`; it is now `true`
+  with a comment explaining that the internet side is guarded by `security.public`. The template
+  (`data/config.example.yaml`) was already correct.
+- **Tests**: `smoke_test.py` `[16b]` and `verify_security.py::test_legacy_config_migration` now assert
+  both branches (with and without a public port; suites **227** and **127**). Verified live:
+  internal `GET /v1/models` → 200 without a key, `GET /health` → 200, the same two requests on the
+  public socket → 401 / 404, `GET /admin` → 404.
+
+### Fixed (2026-11-10: the CORS pre-flight killed the connection it was answering)
+
+Found by the live two-socket run of the split above: a browser reaching the gateway cross-origin got
+no answer at all.
+
+- **The pre-flight `204` is now bodyless.** It was built as `JSONResponse({}, status_code=204)`, and
+  Starlette deliberately omits `content-length` for 204/304 while `Response.__call__` still sends the
+  body — so two bytes (`{}`) reached uvicorn after a header block that promised none, and
+  `httptools_impl` raised `RuntimeError: Response content longer than Content-Length`, dropping the
+  connection. The client had already read the `204` line, so the failure surfaced one request later:
+  the *next* call on that pooled connection died with "server disconnected without sending a
+  response", which in a browser means a failed pre-flight and a request that never leaves the page.
+  `app/main.py` now returns `Response(status_code=204, headers=…)`.
+- **`OPTIONS` on the public socket has to be listed.** The pre-flight is answered before
+  `public_auth_denial` — correctly, since a pre-flight carries no credentials — but it is still a
+  method+path for `bridge_denial`, so an unlisted `OPTIONS` was a **404** and no cross-origin browser
+  client could use the public listener at all. This is config-driven on purpose (the allowlist stays
+  the complete public surface): a web page needs an `OPTIONS:` entry mirroring the paths it calls.
+- **Tests**: `verify_security.py::test_cors_preflight_is_bodyless_and_precedes_the_key_check` (9
+  checks; the suite is now **126**) asserts `r.content == b""` on the 204, that an unlisted origin gets
+  no CORS header, that a listed public `OPTIONS` is 204 without any key while an unlisted one is 404
+  with a valid key, and that the public **401 keeps `Access-Control-Allow-Origin`** so the browser can
+  read the refusal instead of seeing an opaque CORS error. Live: internal 8125 anonymous 200, public
+  8126 401 / 403 / 200, unlisted 404, pre-flight 204, and the call after the pre-flight on the same
+  connection succeeds.
+- **Docs**: `AGENTS.md` (CORS bullet, test counts), `docs/CONFIG.md` + `docs/CONFIG_CN.md`
+  (`security.cors_origins` row + a pre-flight paragraph), `docs/USAGE.md` + `docs/USAGE_CN.md`,
+  `docs/API.md` + `docs/API_CN.md`, `docs/TESTCASES.md` 测试 24B, and the `cors_origins` /
+  `path_allowlist` comments in `data/config.example.yaml`.
+
+### Changed (2026-11-10: the public zone decides paths and credentials in two separate steps)
+
+`app/bridge.py` used to answer one question — *does this method+path exist on the internet-facing
+socket* — while the credential rule lived only in every business route's `Depends(require_api_key)`.
+That split was invisible and unauditable: an allowlist entry looked like the whole public policy, and
+a route that ever forgot the dependency would have been anonymously reachable from the internet.
+
+- **`bridge.public_auth_denial(request, cfg)` is now the second half of the envelope**, evaluated by
+  the same middleware right after the path check: no key and no console session → **401** with
+  `WWW-Authenticate: Bearer`, an invalid key → **403**. It delegates to `auth.authorize()` (renamed
+  from `_authorize`, still the single source of the rules) and accepts a signed console session exactly
+  as the dependency does, so every observable status and detail string is unchanged.
+- **The credential is a property of the zone, not of the route.** Listing a path in
+  `security.public.path_allowlist` can never make it anonymous, and a handler without the dependency
+  is still authenticated — `verify_security.py::test_public_credential_is_a_zone_rule_not_a_route_rule`
+  proves it by registering a deliberately dependency-less route (5 new checks; see the pre-flight fix
+  above for the current suite total).
+- **Order preserved on purpose:** the check runs *after* the rate limiter (a throttled caller still
+  sees **429**) and *after* the CORS pre-flight answer (a pre-flight carries no credentials), and the
+  401/403 keeps the `Access-Control-Allow-Origin` header it would have had as a route-level error.
+  The internal listener is not credential-checked in the middleware — `/admin` static, `/`, `/health`
+  and the `security.internal.allow_anonymous` case must stay reachable.
+- **Docs**: the two steps are now named where the public surface is described — `app/bridge.py`
+  module docstring, the middleware's numbered order, `AGENTS.md`, `docs/CONFIG.md` +
+  `docs/CONFIG_CN.md`, `docs/USAGE.md` + `docs/USAGE_CN.md` (the ZH pair also gained the missing
+  「网关转发哪些路径」 section and its three FAQ entries, so its dangling anchor resolves),
+  `docs/TESTCASES.md` 测试 24B and the `data/config.example.yaml` comment.
+
+### Changed (2026-11-10: the catch-all forwards only declared API paths)
+
+The catch-all used to forward *anything* it could not match locally, so the trusted internal
+listener was an open proxy for the whole upstream API. It is now a closed set, and the two
+settings that looked broken (`admin_endpoints: allow`, `routing.strict: true` on admin calls)
+actually reach the upstream.
+
+- **Closed forwardable set** (`proxy.FORWARDABLE_PATHS` + the `api/blobs/` prefix). A path outside
+  it answers **404** — `Endpoint '/<path>' is not part of this gateway's API…` — in **both** zones:
+  `api/generate`, `api/chat`, `api/embed`, `api/embeddings`, `api/show`, `api/version`,
+  `v1/chat/completions`, `v1/completions`, `v1/embeddings`, `api/pull`, `api/push`, `api/create`,
+  `api/delete`, `api/copy`, `api/blobs/*`. The model-management entries stay in the set on purpose,
+  so a **403** from `admin_endpoints` remains a clearer answer than a 404. Paths the gateway answers
+  itself (aggregated `/v1/models`, `/api/tags`, `/api/ps`, rerank, Messages, System One, web search,
+  the management API, the console, `/docs`) are never forwarded. `security.blocked_paths` therefore
+  only produces 403 for a path that really is a gateway API.
+- **`admin_endpoints: allow` forwards `api/blobs/*` too.** The blob prefix test used to sit outside
+  the mode list, so blob uploads stayed blocked even under `allow`. `deny` and `readonly` still
+  block them.
+- **`admin_endpoints` never opens a path** (documented, not a code change): `bridge_denial()` 404s
+  anything missing from `security.public.path_allowlist` *before* the admin filter runs, so exposing
+  `pull` on the public socket needs both the mode (`readonly` / `allow`) **and** an allowlist entry
+  such as `POST: [^/api/pull$]`. On the internal listener the mode is a no-op by design.
+- **`routing.strict` no longer vetoes a model-less call.** `Config.resolve("")` always falls back to
+  `default_upstream`; strict refuses unknown *named* models only. Ollama's admin bodies carry
+  `name`, not `model`, so `POST /api/pull` used to dead-end in
+  `404 No upstream configured for model ''` under `strict: true` — the other reason `allow` looked
+  broken. `default_upstream` must still name an existing `upstreams[].name`.
+- **Five more endpoints in `/docs`.** `POST /api/chat`, `/v1/chat/completions`, `/v1/completions`,
+  `/api/embed` and `/v1/embeddings` are documented routes now (joining `/api/generate`), each with a
+  request schema, examples, the right response media types (NDJSON+JSON, JSON+SSE, JSON) and
+  404/405 entries. They still forward through `ProxyService.forward`, so routing, alias injection,
+  `num_ctx` clamping, streaming and request-log capture are unchanged.
+- **405 on every documented POST-only route.** `POST_ONLY_PATHS` now covers all six forwards plus
+  rerank, System One, web search and Messages; any other method gets a gateway **405** with
+  `Allow: POST` instead of being proxied upstream.
+- **New `docs/CONFIG.md` / `docs/CONFIG_CN.md`**: a node-by-node `config.yaml` reference (how the
+  file is read and hot-reloaded, every key with its default and reader, the public path surface,
+  fields the console reads but routing does not, removed nodes, and how to check that a key really
+  does something). The README doc map grew a fourth row; `data/config.example.yaml` explains the
+  `admin_endpoints` + `path_allowlist` interplay and the `default_upstream` prerequisite inline.
+- Suites: smoke **226**, gateway **95**, management **417**, security **112** — all green, plus a
+  live two-socket run (internal anonymous, public key-mandatory) confirming `api/pull` and
+  `api/blobs/*` reach Ollama under `allow`.
+
+### Changed (2026-11-10: config.yaml is the single source for ports and zones)
+
+The security config had grown into overlapping `server` / `auth` / `security` nodes, with the port
+and zone layout split between environment variables and the file. It is now one tree, and the word
+"bridge" is gone from the config vocabulary (the `app/bridge.py` module keeps its filename; it is
+the public-zone path policy, not a zone).
+
+- **Ports live in `config.yaml` only.** `server.port` is the internal listener and the new
+  `security.public.port` is the public one (`null` = none, `= server.port` = public-only). There
+  are no port environment variables any more; `LLMHUB_HOST`, `LLMHUB_PORT`, `LLMHUB_LOG_LEVEL`,
+  `LLMHUB_PUBLIC_PORTS`, `LLMHUB_PUBLIC_PORT`, `LLMHUB_PUBLIC_ADMIN` and `GATEWAY_AUTH_DISABLED`
+  are read **only** as one-time migration hints (explicit config wins) and log a warning.
+  `scripts/start-local.ps1` lost `-Port`, `-Bind`, `-LogLevel`, `-PublicPorts` and `-PublicAdmin`.
+- **The top-level `auth` node is gone.** Its replacement is `security.internal`
+  (`allow_anonymous`, `expose_version`, `expose_docs`). Old `auth.enabled: true|false` migrates to
+  `allow_anonymous: false|true`; `auth.api_keys`, `allow_anonymous_health`,
+  `allow_access_ip_whitelist` and `trusted_networks` are dropped with a warning — trust is the
+  listening socket, never a client IP.
+- **`security.public.path_allowlist` is now a dict and the whole public surface.** Keys are HTTP
+  methods, values are `re.fullmatch` regex lists, e.g.
+  `GET: ["^/v1/models$"]` / `POST: ["^/v1/chat/completions$"]`. Unlisted pairs answer **404** with
+  or without a key; invalid regexes are dropped with a warning (fail-closed) and an invalid method
+  name fails config validation. The old global `security.path_allowlist` (list of strings, 403)
+  and `security.allowed_http_methods` (405) were removed along with `security.expose_version` and
+  the unused `expose_health_details`; the verb of a migrated old pattern comes from the old method
+  list (`GET`/`POST` when absent).
+- **Public zone keys are mandatory and cannot be switched off.** No `require_api_key` toggle: the
+  public listener always needs a valid key or a console session cookie. `/v1/management/*`,
+  `/admin*` and any `..` / NUL path stay hard 404 no matter what the config lists.
+- **Ollama's model-management blocklist moved to `security.public.admin_endpoints`.** It used to
+  be `security.admin_endpoints` and was enforced in `proxy.py` on *every* request, so the trusted
+  LAN listener also answered 403 for `api/pull` / `api/delete` even though the code comment said
+  "on public gateways". It is now enforced only when the request arrived on the public listener;
+  the internal listener forwards these calls untouched (`blocked_paths` still applies in both
+  zones). A stale root-level `admin_endpoints` is migrated into `security.public`.
+- **Fail-closed key guard** now reads: zero rows in `api_keys` **and** no anonymous internal zone →
+  startup error. The `auth.enabled=false with no trust anchor` check disappeared with the field.
+- `Config` exposes `public_ports()` / `listen_ports()`; `serve.py`, `main.py`, `auth.py`,
+  `bridge.py`, the launcher preflight, `data/config.yaml`, `data/config.example.yaml`,
+  `.env.example`, `Dockerfile` comments, the four regression suites (smoke 175, management 417,
+  security 105, gateway 72) and both bilingual doc sets were updated together. **Migration:** move
+  `server.port` to `server.port`, set `security.public.port` where `LLMHUB_PUBLIC_PORTS` used to
+  be, translate `auth.enabled` to `security.internal.allow_anonymous` (inverted), and write the
+  public endpoints you actually expose into `security.public.path_allowlist` — nothing is exposed
+  on the public listener by default.
+
+### Removed (2026-11-10: SQLite is the only key source)
+
+- **File-based API key seeding is gone.** `GATEWAY_API_KEYS_FILE` and the implicit `.keys` file
+  next to `CONFIG_PATH` are no longer read. `GATEWAY_API_KEYS` still seeds an empty `api_keys`
+  table once on first start; afterwards the SQLite table (`/admin` → API keys) is the single source
+  of truth. A stale `GATEWAY_API_KEYS_FILE` left in an old `.env` or container environment is
+  silently ignored (`scripts/start-local.ps1` drops it with a warning). The `source="file"` value
+  stored on already-imported rows is kept as a legacy label. Core (`config.py`, `main.py`,
+  `key_store.py`, `systemone.py`), launcher, tests, bilingual docs, the three console i18n files
+  and the config/env templates were updated together. **Migration:** if a deployment still relies
+  on a mounted key file, mint keys at `/admin` or set `GATEWAY_API_KEYS` before upgrading — the
+  file will no longer be imported. This also removes the `Failed to read GATEWAY_API_KEYS_FILE=…`
+  startup error seen on the public instance.
+
+### Security (2026-11-10: the client IP is no longer a request header)
+
+A public instance was serving `/v1/models` anonymously while `/docs` returned 404. The root cause
+was not the whitelist but the address it matched: uvicorn's `ProxyHeadersMiddleware` rewrites
+`scope["client"]` from `X-Forwarded-For` whenever the TCP peer is in `--forwarded-allow-ips`
+(`127.0.0.1` by default, i.e. a same-host nginx) and sets the client port to `0`.
+`auth.peer_ip()` read that rewritten value, so any caller could claim a LAN address. Combined
+with `auth.enabled: false`, the whole gateway was anonymous.
+
+- **Real TCP peer.** New `app/serve.py` is the container entrypoint (`Dockerfile CMD`), starting
+  uvicorn with `proxy_headers=False`. `auth.peer_ip()` rejects scopes with the port-0 rewrite
+  fingerprint, so a legacy `uvicorn main:app` start fails closed instead of trusting XFF.
+- **Application-level XFF parsing.** `client_ip()` honours forwarded headers only for TCP peers
+  in `security.trusted_proxies` and takes the **rightmost untrusted hop** instead of the leftmost
+  one. `trusted_peer()` refuses proxy-shaped requests from undeclared peers, which stops a
+  `^127\.0\.0\.1$` whitelist from unlocking every request arriving through a same-host proxy.
+- **Listener-based trust zones.** `LLMHUB_PUBLIC_PORTS` (alias `LLMHUB_PUBLIC_PORT`), plus
+  `LLMHUB_HOST` / `LLMHUB_PORT` / `LLMHUB_LOG_LEVEL`. `serve.py` binds every listener in ONE
+  process so the in-memory API-key cache stays shared. `scope["server"]` is kernel-assigned and
+  unspoofable: any request on a public listener requires a valid key or console session, ignoring
+  `auth.enabled`, IP whitelists, `trusted_networks` and XFF. `/docs` is hidden there too.
+- **Fail closed.** `auth.enabled: false` (or `GATEWAY_AUTH_DISABLED=true`) with no declared trust
+  anchor now requires a key everywhere; startup logs an ERROR instead of a warning. With an anchor,
+  only that anchor is anonymous.
+- **Compatibility.** Deployments that relied on `auth.enabled: false` being globally anonymous
+  must declare `auth.trusted_networks` / `allow_access_ip_whitelist` / `security.trusted_proxies`,
+  or set `LLMHUB_PUBLIC_PORTS`. The image must be rebuilt and restarted: a running container keeps
+  the old uvicorn behaviour. Mapping two host ports to one container port does NOT create two zones;
+  open a second container listener (see `docs/DEPLOY.md` / `DEPLOY_CN.md`).
+- **Bridge path policy.** On `LLMHUB_PUBLIC_PORTS` listeners the same in-process app hides the
+  management API, docs, model/probe introspection routes and the liveness probes (`/health`,
+  `/healthz`) with **404** (even for a caller holding a valid key), and gates `/admin` with **403** by
+  default (`LLMHUB_PUBLIC_ADMIN=true` serves the static shell only — management stays 404). There is
+  no anonymous HTTP path on a bridge listener. The internal listener keeps the original behaviour:
+  normal APIs key-free with `auth.enabled: false`, `/docs`, `/admin` and `/health` reachable,
+  management cookie-only. Point the container HEALTHCHECK at the internal port; a public-only
+  instance has no anonymous `/health` (use a TCP connect check). This is a listener policy, not a
+  second proxy process, so the key cache, rate-limit buckets and console lockout stay shared.
+- **Tests.** `verify_security.py` grows from 52 to 96 checks (IP chain, port-0 fingerprint,
+  rightmost untrusted hop, loopback whitelist, bridge zones, hidden management/docs/introspection
+  paths, bridge-hidden `/health`/`/healthz`, `/admin` 403/200 opt-in, fail-closed default);
+  `smoke_test.py` grows from 154 to 174 with the same zone rules at HTTP level.
+- **Local launcher.** `scripts/start-local.ps1` (and its `.bat` wrapper) no longer starts a bare
+  `uvicorn main:app`: the single-listener dev path always passes `--no-proxy-headers`, and declaring
+  any bridge port (`-PublicPorts`, `LLMHUB_PUBLIC_PORTS` / `LLMHUB_PUBLIC_PORT`) or `-NoReload`
+  switches it to the hardened `serve.py` entrypoint (no auto-reload, all listeners in one process).
+  New `-PublicPorts` / `-PublicAdmin` flags; preflight now checks every listener port, reports the
+  resolved zone layout and the chosen entrypoint, and warns on `auth.enabled=false` without a
+  trust anchor. Manual uvicorn examples in the README/docs gained `--no-proxy-headers`.
+
+### Security (2026-11-09 audit: a caller key is no longer an administrator)
+
+Two independent audits converged on the same critical chain: `require_admin` accepted any
+valid gateway API key, and that key is handed to every client. Combined with an unmasked
+`GET /config`, readable request bodies and a writable `PUT /config`, one leaked caller key
+meant full gateway takeover. Code-level findings are fixed here; deployment-level items are
+listed at the end of this section.
+
+- **Management API is now console-session-only.** `require_admin` and
+  `require_admin_session` apply the same cookie-only rule; every `/v1/management/*` route
+  switched to the latter. A caller key (or the admin password in a header) answers 401.
+  `GET /config` masks all `upstreams[].headers` values; `PUT /config` restores those masks
+  from disk, only overwrites segments actually present in the payload, and writes through a
+  unique temp file under an `asyncio.Lock` (no more lost keys or torn config.yaml).
+- **Config can no longer point the gateway at its own secrets.** `api_key_env` must name a
+  provider key (`*_API_KEY` / `*_API_TOKEN`), so `ADMIN_PASSWORD` and `GATEWAY_API_KEYS` can
+  never be mailed upstream as a Bearer token. `upstreams[].base_url` and `systemone.backend`
+  reject non-HTTP schemes, embedded credentials and cloud metadata endpoints; LAN/loopback
+  inference backends remain allowed because that is what this gateway routes to.
+- **High-severity boundaries.** `client_ip()` uses the TCP peer unless the peer is listed in
+  the new `security.trusted_proxies` (XFF can no longer bypass `allowed_client_ips`, pick a
+  rate-limit bucket or poison audit rows). `path_allowlist` is a full match. Forwarding drops
+  `cookie` / `referer` / `x-forwarded-*` and upstream `set-cookie`, and `messages.py` finally
+  attaches configured upstream headers. Paths are normalised with `..` / NUL rejected, and the
+  shared httpx client no longer follows redirects. `auth.read_limited_body()` enforces the
+  32 MB cap from `Content-Length` and while streaming for proxy / messages / websearch /
+  systemone, with a middleware pre-check for the remaining routes.
+- **Medium / Low.** Bodies are redacted before truncation and query-string credentials are
+  masked; example/placeholder credentials now refuse to start and weak-key warnings print
+  masks only; sign-in has a 5-failure / 15-minute lockout and 429 carries `Retry-After`;
+  `key_store` serialises write+cache-reload; `/bench` clamps rounds/tokens and concurrent
+  jobs; analytics windows cap at 90 days; `security.expose_version` hides the version from
+  `/`; `%00` in console paths and Swagger asset boundaries return clean 404s; log fields use
+  `%r` so newlines cannot forge log lines.
+- **Compatibility notes.** Scripts that called `/v1/management/*` with a gateway key must log
+  in once and keep a cookie jar. `api_key_env` values such as `WEBSEARCH_TEST_KEY` must be
+  renamed to end in `_API_KEY`. `path_allowlist` patterns must match the entire path.
+- **Not fixed here (deployment or a larger migration).** TLS termination + HSTS and the
+  `Secure` cookie flag still require a reverse proxy (the code now honours
+  `X-Forwarded-Proto: https`); the image still runs as root and dependencies are not
+  hash-pinned; sessions are still stateless HMAC tokens with no server-side revocation;
+  request bodies are still logged by default; `ADMIN_CSP` still allows `unsafe-inline` for
+  the SPA bootstrap; the console keeps its perimeter-rule exemption so `PUT /config` can
+  work. See `docs/DEPLOY.md` / `DEPLOY_CN.md` for the public deployment checklist.
+
 ### Changed (Requests table timestamps show the calendar date)
 
 - **The 时间 column is now two lines**: `yy-MM-dd` above `HH:mm:ss`, so a 7-day window can be read

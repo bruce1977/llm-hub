@@ -61,7 +61,7 @@
 于是给它定了三条原则，后面所有实现细节基本都从这三条推出来：
 
 1. **只做转发，不改协议语义。** Ollama 的 NDJSON 和 OpenAI 的 SSE 原样流过去，网关不重新组装回答内容。唯一主动改写协议的是 `/v1/messages` —— 客户端发的本来就是 Anthropic 信封，这一步躲不掉，详见第四节。
-2. **配置是唯一真源。** 一个带注释的 `config.yaml`，改完约 1 秒热重载，不用重启容器；密钥只从环境变量或挂载的 `.keys` 文件注入，配置文件里放不下任何凭据。管理台绝大多数页面只是这份配置的只读投影，唯一会写它的是 Settings 页。
+2. **配置是唯一真源。** 一个带注释的 `config.yaml`，改完约 1 秒热重载，不用重启容器；调用方密钥由管理台签发、存在本地 SQLite 里（启动后用 `ADMIN_PASSWORD` 登录 `/admin` 签第一把，没有任何环境变量能注入），配置文件里放不下任何凭据。管理台绝大多数页面只是这份配置的只读投影，唯一会写它的是 Settings 页。
 3. **调用面和管理面分开。** 调用方用 API Key（`Bearer` / `X-API-Key`），管理台用 12 小时 HttpOnly 会话 Cookie；签发、吊销 Key 的三个接口只认会话 Cookie —— 网关 Key 是每个客户端都持有的东西，不能拿它给自己再发一把。
 
 技术选型也就没什么悬念：FastAPI 处理异步与流式透传；请求明细进 SQLite（WAL，不引入额外数据库）；管理台用 Vue 3 + TypeScript 写，但**构建产物直接提交进仓库**，镜像 `COPY` 进去就能用。整个服务是单进程、单个配置文件、一个数据库文件，Docker 一条命令拉起。
@@ -116,7 +116,7 @@ num_ctx_overrides:
 调用侧从此只需要记一个地址：
 
 ```bash
-KEY=sk-hub-你的密钥
+KEY=sk-hub-你的密钥   # 在 /admin → API Key 管理签发，明文只显示一次
 
 # Ollama 原生
 curl http://localhost:8888/api/chat -H "X-API-Key: $KEY" \
@@ -138,7 +138,7 @@ curl http://localhost:8888/v1/models -H "X-API-Key: $KEY"
 
 `/v1/models` 是**聚合**出来的，不是代理到某一台 Ollama 的 `/api/tags`——别名、前缀通配展开、优先级胜出的上游，都在这份清单里。
 
-配置改完约 1 秒热重载，不用重启容器。密钥不写进 `config.yaml`，只从环境变量或挂载的 `.keys` 文件注入。
+配置改完约 1 秒热重载，不用重启容器。密钥不写进 `config.yaml`，由管理台签发并存在本地 SQLite 中。
 
 ---
 
@@ -201,20 +201,20 @@ event: message_stop
 
 ## 六、要从公网用，就别把 Ollama 直接映射出去
 
-默认按「公网不可信」设计，几个默认值我都没敢放宽：
+默认按「公网不可信」设计。端口和分区只从 `config.yaml` 读：`server.port` 是内网口（可信 LAN），业务 API 可以免 Key；`security.public.port` 是公网口，每笔请求都要 Key 或管理台会话，而且只放行配置里列明的方法+路径——连 `/health` 默认都不对外。信任来自内核分配的监听 socket（请求从哪个端口进来），不是 IP 白名单。几个默认值我都没敢放宽：
 
 | 项 | 默认 | 用意 |
 |---|---|---|
-| `admin_endpoints` | `deny` | 拦截 `pull` / `push` / `create` / `delete` / `copy` / `blobs` |
-| `allowed_http_methods` | `["GET","POST"]` | 其余动词一律 405，LLM 网关本来就不需要 PUT / DELETE |
+| `security.public.port` | `null` | `null` 是只有内网口；写成与 `server.port` 不同的值才多开一个公网口；写成相同值就是纯公网单口（只能靠 TCP 探活） |
+| `security.internal.allow_anonymous` | `true` | 只作用于内网口：业务 API 免 Key；`/` 和 `/health` 永远匿名给健康检查用 |
+| `security.public.path_allowlist` | 内置常见路径 | **只管公网口**：「HTTP 方法 → 正则」整串匹配表，没列的方法+路径一律 404（带 Key 也一样）；`/v1/management/*` 和 `/admin` 默认同样 404，只有下一行的 `admin_endpoints: allow` 能打开 |
+| `admin_endpoints`（`security.public` 下） | `deny` | 仅外网监听，管两件事：① 过滤 Ollama 的模型管理端点（`pull` / `push` / `create` / `delete` / `copy` / `blobs`），这半边仍要求 `path_allowlist` 有对应规则；② 设为 `allow` 时 `/admin*` 和 `/v1/management/*` 在公网口不再 404——前缀规则先于 allowlist 判定，不需要加条目 |
 | `max_body_bytes` | 32 MB | 超了返回 413，防大 body 打挂 |
 | `cors_origins` | `[]` | 留空就不返回任何 CORS 头，不再有 `*` |
 | `allow_query_api_key` | `false` | 密钥不进日志、不进浏览器历史 |
-| `fail_on_weak_keys` | `true` | 检测到占位密钥直接拒绝启动 |
-| `path_allowlist` | `[]` | 非空时路径必须命中正则，否则 403 |
 | `rate_limit` | 可开 | 内存令牌桶，按 IP 或按 Key 限流 |
 
-还有 `/docs` 和 `/openapi.json`：默认外部一律 404，只有 `auth.allow_access_ip_whitelist` 命中的来源能打开。这里有个容易翻车的点——**白名单匹配的是 TCP 对端地址，网关自己不读 `X-Forwarded-For`**（那玩意可伪造），所以经本机反代部署时，必须确保反代正确设置并清理转发头，否则判定看到的不是真实来源。
+还有 `/docs` 和 `/openapi.json`：它们只在**内网口**提供，由 `security.internal.expose_docs` 控制；**公网口永远 404**，带不带 Key 都一样。管理台是另一回事：默认在公网口 404，只有 `admin_endpoints: allow` 才打开，而「打开」不等于「匿名」——只有静态外壳和 `POST /v1/management/auth/login` 免凭据，其余接口仍然只认会话 Cookie，网关 Key 不是管理凭据。这里有个容易翻车的点——XFF 改不了分区：网关用 `proxy_headers=False` 启动，`security.trusted_proxies` 只决定限流桶和审计日志里记的 `client_ip`，伪造一个内网 `X-Forwarded-For` 也进不了内网口。经本机反代部署时，记得 `proxy_set_header X-Forwarded-For $remote_addr;`（覆盖，不要追加），否则限流和审计看到的不是真实来源。
 
 调用方密钥现在存在 `llmhub.db` 的 `api_keys` 表里，**只存 `sha256(明文)` 和掩码，库里没有明文**，复制走 `.db` 也没法重放。管理台签发 `sk-hub-` + 40 位 base62（共 47 字符，约 238 位随机），明文只显示一次，关掉弹窗就找不回来；吊销是两步确认。
 
@@ -233,7 +233,7 @@ event: message_stop
 5. **`think: false` 不生效。** 需要 Ollama 0.9+；老版本得在别名参数里改用 `{"stop": ["<think>"]}` 顶一阵。
 6. **改了配置没生效。** 热重载靠文件 mtime，某些编辑器或 NFS / SMB 挂载不更新 mtime，重启容器即可。
 
-这些坑现在都写进了文档和测试用例（管理 API 那套有 407 项检查），不是靠记忆。
+这些坑现在都写进了文档和测试用例（管理 API 那套有 417 项检查），不是靠记忆。
 
 ---
 
@@ -244,7 +244,7 @@ Docker（推荐）：
 ```bash
 mkdir -p llm-hub/data
 cp data/config.example.yaml llm-hub/data/config.yaml   # 填真实上游地址
-cp .env.example llm-hub/.env                           # 填 GATEWAY_API_KEYS、ADMIN_PASSWORD
+cp .env.example llm-hub/.env                           # 填 ADMIN_PASSWORD
 
 docker run -d --name llm-hub -p 8888:8000 \
   -v $(pwd)/llm-hub/data:/data --env-file llm-hub/.env \
@@ -253,9 +253,9 @@ docker run -d --name llm-hub -p 8888:8000 \
 curl http://localhost:8888/health     # {"ok":true}
 ```
 
-然后打开 `http://localhost:8888/admin/`，用 `admin` + `ADMIN_PASSWORD` 登录。不设这个密码时管理台显示「未启用」，所有管理接口返回 503——这是故意的，不留一个无密码的后台。
+然后打开 `http://localhost:8888/admin/`，用 `admin` + `ADMIN_PASSWORD` 登录。不设这个密码时管理台显示「未启用」，所有管理接口返回 503——这是故意的，不留一个无密码的后台。登录后第一件事是去「API Key 管理」签一把调用方密钥：没有环境变量或密钥文件能导入，空表就是首次启动的正常状态（需要 Key 的请求一律 401），明文只显示一次。
 
-本地调试不想开 Docker 也行：`pip install -r requirements.txt`，在 `app/` 目录下 `python -m uvicorn main:app --reload --port 8000 --env-file ../.env`。Windows 有 `scripts\start-local.bat`，首次加 `-Install`。
+本地调试不想开 Docker 也行：`pip install -r requirements.txt`，在 `app/` 目录下 `python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers`。Windows 有 `scripts\start-local.bat`，首次加 `-Install`；端口和分区只从 `data/config.yaml` 读（`server.port` / `security.public.port`），脚本没有端口或分区相关的命令行开关；把 `security.public.port` 设成与 `server.port` 不同的值，或加 `-NoReload`，就切到加固入口 `serve.py`（内外网双监听、无自动重载）。老的 `LLMHUB_*` 端口环境变量只在迁移时读一次，之后一律以配置为准。
 
 配置文件和密钥都是挂载进去的，不打进镜像；镜像自带管理台产物，构建时不需要 Node。
 

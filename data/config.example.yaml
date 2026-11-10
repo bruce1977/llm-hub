@@ -7,17 +7,15 @@ server:
   request_timeout: 600.0
   max_concurrency: 64
   upstream_keepalive_expiry: 30.0
-auth:
-  enabled: true
-  allow_anonymous_health: true
-  # Regexes (fullmatch against the TCP peer): matching addresses may open /docs
-  # and call the API without a key. Empty = nobody is exempt.
-  allow_access_ip_whitelist: []
-  # CIDR blocks of the trusted internal network. Declaring at least one makes
-  # `enabled: false` mean "anonymous only inside these networks" - every other
-  # client still needs a valid key. Leave empty for a fully public gateway with
-  # auth enabled, or a fully private one with auth disabled (startup warns).
-  trusted_networks: []
+# Caller authentication is configured under `security`, NOT under a top-level
+# `auth` node. Trust zones are decided by the listening socket:
+#   server.port              -> internal (trusted LAN)
+#   security.public.port     -> public (internet-facing), if configured
+# No IP whitelist or X-Forwarded-For header can move a request between zones.
+# strict: true refuses to guess an upstream for an unknown *named* model (404 instead
+# of forwarding it). A request whose body carries no `model` at all - a GET, or an Ollama
+# admin call such as api/pull which sends `name` - always goes to default_upstream,
+# strict or not.
 routing:
   strict: false
 upstreams:
@@ -61,7 +59,16 @@ upstreams:
   - opencode/*
   timeout: 300
   priority: 30
+  # Optional headers attached to every forwarded request. Model discovery (/v1/models,
+  # /api/tags) and the /probe health checks send them too, so an upstream with its own
+  # auth still shows up in the aggregated catalog. Never put a secret value here: name an
+  # environment variable instead (websearch.api_key_env / systemone.api_key_env).
+  # headers:
+  #   Authorization: Bearer <provider key>
   description: 'OpenCode API Gateway: free built-in models (OpenAI-compatible chat) plus the web search provider used by POST /v1/tools/web-search. Set base_url to your gateway address; remove this upstream if you do not want it.'
+# Must name an existing upstreams[].name. A dangling value silently disables the
+# fallback: unroutable models and model-less calls (api/pull, api/blobs/*) then 404
+# with "No upstream configured for model ''".
 default_upstream: ollama
 # Each entry below is a model of its own: `model` is what actually gets forwarded upstream,
 # `params` are force-injected, and the console lists the alias as a separate row (its target
@@ -108,6 +115,11 @@ rerank:
   models:
   - qwen3-reranker:4b
   instruction: Given a web search query, retrieve relevant passages that answer the query. A passage is relevant only if it directly answers the specific question asked. Passages that merely share the same broad topic, mention related keywords, or talk about the same field or entity without answering the question are NOT relevant.
+  # The prompt each document is scored with. The built-in default is the official
+  # Qwen3-Reranker chat template ({instruction} / {query} / {document}); override it only
+  # for a reranker that expects a different phrasing, and keep the yes/no answer shape -
+  # the score comes from the logprobs of the first answer token.
+  # template: '<|im_start|>system\n...<|im_start|>assistant\n'
   yes_token: 'yes'
   no_token: 'no'
   yes_aliases: []
@@ -150,19 +162,92 @@ websearch:
 request_log:
   enabled: true
 security:
-  admin_endpoints: deny
+  # ------------------------------------------------------------------ #
+  # Zone A: the trusted LAN listener on server.port (8000 by default).
+  # The kernel-assigned local socket is the trust anchor: no IP whitelist and
+  # no X-Forwarded-For setting can move a request into or out of this zone.
+  internal:
+    # true  = normal APIs are key-free on THIS port only.
+    # false = every business API needs a key (the liveness probes stay open).
+    allow_anonymous: true
+    # Whether the anonymous `/` probe reveals the exact build version.
+    expose_version: false
+    # Whether /docs, /openapi.json and the Swagger assets are served.
+    # The public zone never serves them, whatever this says.
+    expose_docs: true
+
+  # ------------------------------------------------------------------ #
+  # Zone B: the internet-facing listener.
+  #   null = no public listener (internal-only instance).
+  #   8001 = a second socket: internal 8000 + public 8001 in ONE process.
+  #   8000 = same value as server.port -> public-only single socket, with NO
+  #          anonymous HTTP path (use a TCP port check for the container probe).
+  # Map the two container ports to DIFFERENT host ports; two host ports pointing
+  # at one container socket do NOT create two zones.
+  public:
+    port: 8001
+    # The COMPLETE list of what exists on the public socket. Keys are HTTP
+    # methods; values are full-match regexes (re.fullmatch, not prefixes).
+    # Anything not listed returns 404 before routing, WITH OR WITHOUT a key.
+    # There is no code-level hidden-path list and no `require_api_key` toggle:
+    # this mapping is the only positive allowlist.
+    # The management API (/v1/management/*) and /admin are always 404 here.
+    # Listing a path does not invent one: it must also be a gateway API that
+    # app/proxy.py is willing to forward (see docs/CONFIG.md -> path surface),
+    # otherwise the proxy answers 404 "not part of this gateway's API".
+    # Listing a path never makes it anonymous either. app/bridge.py answers two
+    # separate questions in the middleware: bridge_denial() = does this
+    # method+path exist here (404 if not), public_auth_denial() = may this
+    # caller use it (401 without a key or console session, 403 for an invalid
+    # key). The second one belongs to the zone, not to the route, so it cannot
+    # be waived from config and is checked after the rate limiter.
+    # Browser (cross-origin) clients need OPTIONS mirrored here: the preflight
+    # carries no key and is answered before the credential check, but an
+    # unlisted method+path is still a 404, so add
+    #   OPTIONS:
+    #   - ^/v1/chat/completions$
+    # for every path a web page calls on this socket.
+    path_allowlist:
+      GET:
+      - ^/v1/models$
+      POST:
+      - ^/v1/chat/completions$
+      - ^/v1/messages$
+      - ^/api/generate$
+      - ^/api/chat$
+    # Ollama model management on the PUBLIC listener only:
+    #   deny     = block pull/push/create/delete/copy/blobs (default)
+    #   readonly = still allow `pull`, block the rest
+    #   allow    = forward every admin call, api/blobs/* included
+    # The internal listener never applies this - pulling a model on the trusted
+    # LAN is a normal operation, so changing this value there does nothing.
+    # This mode NEVER opens a path on its own: path_allowlist is checked first,
+    # so exposing `pull` publicly needs BOTH a mode that allows it AND an entry,
+    # e.g. admin_endpoints: readonly plus POST: [^/api/pull$] above. Without the
+    # entry the 404 comes from the allowlist and looks like "allow has no effect".
+    admin_endpoints: deny
+
+  # ------------------------------------------------------------------ #
+  # Hardening shared by BOTH zones.
   blocked_paths: []
+  # Exact origins allowed cross-site; empty sends no CORS headers at all. A
+  # preflight is answered with a bodyless 204 BEFORE the public key check (it
+  # carries no credentials), but OPTIONS is still a method+path for the
+  # allowlist: a browser calling the PUBLIC port needs an OPTIONS: entry there,
+  # or the preflight is a 404 and the real request never leaves the page.
   cors_origins: []
   max_body_bytes: 33554432
   allow_query_api_key: false
-  expose_health_details: false
-  fail_on_weak_keys: true
   allowed_client_ips: []
-  allowed_http_methods:
-  - GET
-  - POST
-  path_allowlist: []
+  # CIDR list of reverse proxies whose X-Forwarded-For may be trusted for IP
+  # fencing, rate-limit buckets and audit rows. This is NOT a zone anchor.
+  # client_ip() takes the RIGHTMOST hop that is not a trusted proxy, so a forged
+  # leftmost XFF value cannot pick an internal address. Behind nginx set:
+  #   proxy_set_header X-Forwarded-For $remote_addr;   (overwrite, don't append)
+  trusted_proxies: []
   rate_limit:
+    # Turn this on for any internet-facing instance (or rate-limit at the proxy).
+    # The console sign-in has its own lockout, but other endpoints are unthrottled.
     enabled: false
     per_minute: 60
     burst: 20

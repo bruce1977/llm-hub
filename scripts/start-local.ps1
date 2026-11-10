@@ -1,25 +1,36 @@
 <#
 .SYNOPSIS
-    Run the llm-hub gateway on this machine.
+    Run the llm-hub gateway on this machine (development hot reload or two-zone listeners).
 
 .DESCRIPTION
-    Starts the FastAPI gateway exactly the way the modules expect (they are flat inside app/,
-    so uvicorn must be pointed at app/ with --app-dir) and checks the usual reasons a local
-    start fails before launching: missing dependencies, missing or invalid config.yaml,
-    an authenticated gateway with no API key, weak/placeholder keys, a port already in use
-    and an unbuilt web console.
+    Starts the FastAPI gateway from app/ (the modules are flat, so the app directory must be
+    on sys.path) and checks the usual reasons a local start fails before launching: missing
+    dependencies, missing or invalid config.yaml, an empty key table with no way to mint
+    a key, a busy listener port, a missing console build or an unset admin password.
 
-    The working directory is app/, like the image's WORKDIR /app, so the relative paths in
-    .env (../data/config.yaml, ../data/.keys) resolve here the same way they do in the
-    container.
+    Ports and zone policy come ONLY from config.yaml:
+      server.port              internal (trusted LAN) listener
+      server.host              bind address
+      server.log_level         uvicorn log level
+      security.public.port     public (internet-facing) listener, or null for none.
+                               Equal to server.port = public-only instance.
+
+    Two launch paths, picked automatically:
+
+    * Default (no distinct public port, no -NoReload): uvicorn CLI with auto-reload. It passes
+      --no-proxy-headers, so a caller's X-Forwarded-For can no longer rewrite the TCP peer.
+      Single listener only; the same HTTP policy as the container.
+
+    * A distinct public port, or -NoReload: app/serve.py, the hardened entrypoint also used
+      by the Docker image. It binds every listener in ONE process (shared API-key cache, rate
+      buckets and login lockout) and uses the kernel-assigned local socket as the trust
+      anchor. Public traffic needs a key and only sees the paths in
+      security.public.path_allowlist. serve.py has no auto-reload; restart after app/*.py edits.
+
+    The working directory is app/, like the image's WORKDIR /app, so the relative path in
+    .env (../data/config.yaml) resolves here the same way it does in the container.
 
     Secrets are read from .env (never from config.yaml) and only their names are printed.
-
-.PARAMETER Port
-    Listen port. Default: server.port from the config file (8000 in the template).
-
-.PARAMETER Bind
-    Bind address. Default: server.host from the config file.
 
 .PARAMETER Config
     Path to config.yaml. Default: CONFIG_PATH from .env when it resolves (the value there is
@@ -27,17 +38,16 @@
     <repo>\data\config.yaml - created from data\config.example.yaml when it does not exist yet.
 
 .PARAMETER EnvFile
-    Path to the env file with GATEWAY_API_KEYS / ADMIN_PASSWORD. Default: <repo>\.env.
+    Path to the env file with CONFIG_PATH / ADMIN_PASSWORD / SYSTEMONE_SERVER_API_KEY.
+    Default: <repo>\.env.
     Values already set in the current session win, so the shell can override the file.
 
 .PARAMETER Python
     Python executable. Default: python, falling back to the py launcher.
 
-.PARAMETER LogLevel
-    uvicorn log level. Default: server.log_level from the config file.
-
 .PARAMETER NoReload
-    Serve without --reload (reload watches app/ and restarts on every saved .py file).
+    Skip auto-reload and start through app/serve.py, the hardened entrypoint the Docker
+    image uses. Useful to validate the exact production startup path locally.
 
 .PARAMETER Install
     Run `pip install -r requirements.txt` first, then continue with the checks and start.
@@ -48,22 +58,27 @@
 .EXAMPLE
     scripts\start-local.ps1
 .EXAMPLE
-    scripts\start-local.ps1 -Port 8888 -NoReload
+    scripts\start-local.ps1 -NoReload
 .EXAMPLE
     scripts\start-local.ps1 -CheckOnly
 .EXAMPLE
-    scripts\start-local.bat -Install
+    scripts\start-local.ps1 -Install
 .NOTES
-    Endpoints once running:  /health  /docs  /admin/  /v1/models  /v1/chat/completions
+    Edit data\config.yaml to open a public listener:
+      security:
+        public:
+          port: 8001
+          path_allowlist:
+            GET:  ['^/v1/models$']
+            POST: ['^/v1/chat/completions$']
+    Then map two DIFFERENT container ports to the host. Two host ports pointing at the
+    same container port do NOT create two zones.
 #>
 [CmdletBinding()]
 param(
-    [int]$Port = 0,
-    [string]$Bind = '',
     [string]$Config = '',
     [string]$EnvFile = '',
     [string]$Python = '',
-    [string]$LogLevel = '',
     [switch]$NoReload,
     [switch]$Install,
     [switch]$CheckOnly
@@ -80,10 +95,8 @@ function Fail([string]$Message) {
 }
 
 # --------------------------------------------------------------------- layout ---
-# The image runs with WORKDIR /app, so every relative path the app receives (CONFIG_PATH and
-# GATEWAY_API_KEYS_FILE from .env, e.g. ../data/config.yaml) is read from inside app/.
-# The launcher keeps that convention: app/ is the working directory for both the probe and
-# uvicorn, which is also what the README's `cd app` commands assume.
+# The image runs with WORKDIR /app, so every relative path the app receives (CONFIG_PATH from
+# .env, e.g. ../data/config.yaml) is read from inside app/. The launcher keeps that convention.
 $Root = Split-Path -Parent $PSScriptRoot
 $AppDir = Join-Path $Root 'app'
 $ReqFile = Join-Path $Root 'requirements.txt'
@@ -92,7 +105,6 @@ if (-not (Test-Path (Join-Path $AppDir 'main.py'))) {
     Fail "cannot find $AppDir\main.py - run this script from inside the repository."
 }
 
-# -Config wins over CONFIG_PATH from .env, which wins over the repository default.
 $ConfigExplicit = [bool]$Config
 if (-not $EnvFile) { $EnvFile = Join-Path $Root '.env' }
 
@@ -161,7 +173,6 @@ if (Test-Path -LiteralPath $EnvFile) {
 $DefaultConfig = Join-Path $Root 'data\config.yaml'
 $ConfigPath = $DefaultConfig
 if ($ConfigExplicit) {
-    # a path the caller typed is read from where they are standing
     $ConfigPath = Resolve-FromPath $Config (Get-Location).ProviderPath
 } elseif ($EnvValues.Contains('CONFIG_PATH')) {
     $FromEnv = [string] $EnvValues['CONFIG_PATH']
@@ -175,9 +186,6 @@ if ($ConfigExplicit) {
 
 $Template = Join-Path $Root 'data\config.example.yaml'
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
-    # Mirror the app's own rule (config.ConfigManager._active_path): a pre-YAML config.json
-    # beside the expected path is a real configuration, so use it rather than papering over
-    # it with a fresh template.
     $Legacy = Join-Path (Split-Path -Parent $ConfigPath) 'config.json'
     if (Test-Path -LiteralPath $Legacy) {
         Warn ("{0} not found - using the legacy {1}; rename it to {2}." -f $ConfigPath, $Legacy, [System.IO.Path]::GetFileName($ConfigPath))
@@ -205,21 +213,30 @@ if ($EnvNames.Count) { Note ("loaded: " + ($EnvNames -join ', ')) }
 
 $env:CONFIG_PATH = $ConfigPath
 
-# The keys file is opened by the app relative to its working directory. Say it out loud when
-# it is not there instead of letting the app log a read error on every start and reload.
-$KeysFile = [string] $env:GATEWAY_API_KEYS_FILE
-if ($KeysFile -and -not (Test-Path -LiteralPath (Resolve-FromPath $KeysFile $AppDir))) {
-    if ($env:GATEWAY_API_KEYS) {
-        Remove-Item -LiteralPath 'Env:GATEWAY_API_KEYS_FILE'
-        Warn ("GATEWAY_API_KEYS_FILE='{0}' is not readable from {1} - using the inline GATEWAY_API_KEYS instead." -f $KeysFile, $AppDir)
-    } else {
-        Warn ("GATEWAY_API_KEYS_FILE='{0}' is not readable from {1} and no inline GATEWAY_API_KEYS are set - auth will have no keys." -f $KeysFile, $AppDir)
+# Caller keys live only in the SQLite api_keys table and are minted in the console. Both
+# environment seed variables are dead: GATEWAY_API_KEYS (inline) and GATEWAY_API_KEYS_FILE
+# (file) were removed, so drop them from .env and from the environment to avoid the
+# impression that they still matter.
+foreach ($DeadKeyVar in @('GATEWAY_API_KEYS', 'GATEWAY_API_KEYS_FILE')) {
+    if (Test-Path "Env:$DeadKeyVar") {
+        Remove-Item -LiteralPath "Env:$DeadKeyVar"
+        Warn ("$DeadKeyVar is no longer supported - caller keys are minted at /admin and stored in the SQLite api_keys table; ignoring the stale variable.")
     }
+}
+
+# Ports and zone policy now live in config.yaml. The app still reads the legacy variables
+# once as a migration hint (LLMHUB_PUBLIC_PORTS -> security.public.port,
+# GATEWAY_AUTH_DISABLED -> security.internal.allow_anonymous) but explicit config wins.
+$LegacyNames = @('LLMHUB_HOST','LLMHUB_PORT','LLMHUB_PUBLIC_PORTS','LLMHUB_PUBLIC_PORT','LLMHUB_PUBLIC_ADMIN','LLMHUB_LOG_LEVEL','GATEWAY_AUTH_DISABLED')
+$LegacyPresent = @($LegacyNames | Where-Object { (Get-Item "Env:$_" -ErrorAction SilentlyContinue) })
+if ($LegacyPresent.Count -gt 0) {
+    Warn ('legacy listener variable(s) in the environment: ' + ($LegacyPresent -join ', ') + '. Ports/zones now come from config.yaml; set server.port / security.public.port there and remove these variables.')
 }
 
 # ----------------------------------------------------------------- preflight ---
 # The verdict is computed by the app's own modules so the rules cannot drift: config.yaml is
-# parsed by the real Pydantic models and the keys are screened by auth.find_weak_keys.
+# parsed by the real Pydantic models, the api_keys row count is read from llmhub.db, and
+# the listener set is Config.listen_ports() - the exact same values serve.py will bind.
 $Probe = @"
 import importlib.util
 import json
@@ -230,8 +247,6 @@ import sys
 MARKER = 'LLMHUB_PREFLIGHT='
 APP_DIR = sys.argv[1]
 sys.path.insert(0, APP_DIR)
-# The image runs with WORKDIR /app and the launcher uses the same working directory, so
-# relative paths from .env resolve identically here and at launch.
 os.chdir(APP_DIR)
 # The app writes its own warnings to stderr; the verdict is the only output wanted here.
 logging.disable(logging.CRITICAL)
@@ -252,8 +267,7 @@ if missing:
     sys.exit(0)
 
 try:
-    from auth import find_weak_keys
-    from config import ConfigManager
+    from config import ConfigManager, LEGACY_LISTENER_ENV
 
     cfg = ConfigManager().config
 except Exception as exc:  # a broken config.yaml must be reported, not traced
@@ -261,18 +275,48 @@ except Exception as exc:  # a broken config.yaml must be reported, not traced
     print(MARKER + json.dumps(report))
     sys.exit(0)
 
+public_port = cfg.security.public.port
+listen_ports = cfg.listen_ports()
+internal_ports = [p for p in listen_ports if public_port is None or p != public_port]
+
+# Caller keys are minted in the console and live only in this table. Count the rows
+# without starting the app so the verdict matches the lifespan guard.
+key_rows = 0
+try:
+    from key_store import ApiKeyStore
+    db_path = ApiKeyStore().db_path
+    if db_path.exists():
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        try:
+            key_rows = int(conn.execute('SELECT COUNT(*) FROM api_keys').fetchone()[0])
+        finally:
+            conn.close()
+except Exception:
+    key_rows = 0
+
+allow_anonymous = bool(cfg.security.internal.allow_anonymous)
 report.update({
     'host': cfg.server.host,
     'port': cfg.server.port,
     'log_level': cfg.server.log_level,
+    'listen_ports': listen_ports,
+    'public_port': public_port,
+    'internal_ports': internal_ports,
     'upstreams': len(cfg.upstreams),
     'aliases': len(cfg.aliases),
-    'auth_enabled': bool(cfg.auth.enabled),
-    'keys': len(cfg.auth.api_keys),
-    'weak': find_weak_keys(cfg.auth.api_keys),
-    'fail_on_weak': bool(cfg.security.fail_on_weak_keys),
+    'keys': key_rows,
     'request_log': bool(cfg.request_log.enabled),
     'admin_password': bool(os.environ.get('ADMIN_PASSWORD', '').strip()),
+    'allow_anonymous': allow_anonymous,
+    'expose_docs': bool(cfg.security.internal.expose_docs),
+    'public_rules': sum(len(v) for v in cfg.security.public.path_allowlist.values()),
+    'legacy_env': [name for name in LEGACY_LISTENER_ENV if os.getenv(name, '').strip()],
+    # Mirrors the lifespan guard: an empty key table is only fatal when the console
+    # cannot mint one either (no ADMIN_PASSWORD) and no anonymous zone exists.
+    'fail_closed': (key_rows == 0
+                    and not os.environ.get('ADMIN_PASSWORD', '').strip()
+                    and not (internal_ports and allow_anonymous)),
 })
 print(MARKER + json.dumps(report))
 "@
@@ -314,24 +358,17 @@ if (@($Check.missing_deps).Count -gt 0) {
 if ($Check.config_error) { Fail "config rejected by the app's own validator - $($Check.config_error)" }
 
 Step 'preflight'
-Note ("upstreams={0}  aliases={1}  auth={2}  keys={3}  request_log={4}" -f `
-    $Check.upstreams, $Check.aliases, $(if ($Check.auth_enabled) { 'enabled' } else { 'disabled' }), $Check.keys, $Check.request_log)
+Note ("upstreams={0}  aliases={1}  listen=[{2}]  public={3}  keys={4}  request_log={5}" -f `
+    $Check.upstreams, $Check.aliases, ($Check.listen_ports -join ','), $Check.public_port, $Check.keys, $Check.request_log)
 
-# Startup refuses to serve an authenticated gateway without any key - say it here instead.
-if ($Check.auth_enabled -and $Check.keys -eq 0) {
-    Fail ("auth.enabled is true but no API key is available. Put GATEWAY_API_KEYS=sk-... in $([System.IO.Path]::GetFileName($EnvFile)), " +
-         "or GATEWAY_API_KEYS_FILE, or set auth.enabled=false in the config.")
-}
-
-$Weak = @()
-if ($Check.weak) { $Weak = @($Check.weak) }
-if ($Weak.Count -gt 0) {
-    $list = $Weak -join '; '
-    if ($Check.fail_on_weak) {
-        Fail ("weak/placeholder API keys would stop the gateway from booting (security.fail_on_weak_keys=true): $list. " +
-             "Use keys of 16+ random chars, or set fail_on_weak_keys=false to only warn.")
-    }
-    Warn "weak/placeholder API keys detected (startup would only warn): $list"
+# The lifespan guard refuses to start in this state - say it here instead of after the bind.
+# An empty table alone is fine (the console mints the key); it is fatal only when there is
+# also no ADMIN_PASSWORD and no anonymous internal zone, i.e. no credential can ever exist.
+if ($Check.fail_closed) {
+    Fail ("the api_keys table is empty, ADMIN_PASSWORD is unset and there is no anonymous internal " +
+          "zone - no credential can exist. Put ADMIN_PASSWORD=<32+ random chars> in " +
+          "$([System.IO.Path]::GetFileName($EnvFile)) and mint the first key at /admin, or set " +
+          "security.internal.allow_anonymous=true in config.yaml for a LAN-only instance.")
 }
 
 if (-not $Check.admin_password) {
@@ -343,29 +380,34 @@ if (-not (Test-Path (Join-Path $AppDir 'web\index.html'))) {
 }
 
 # ------------------------------------------------------------------ endpoint ---
-if ($Port -le 0) { $Port = $Check.port }
-if (-not $Bind) { $Bind = $Check.host }
-if (-not $LogLevel) { $LogLevel = $Check.log_level }
-
-try {
-    $Listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
-} catch {
-    $Listeners = @()
-}
-if ($Listeners.Count -gt 0) {
-    $Owners = ($Listeners | ForEach-Object { $_.OwningProcess } | Select-Object -Unique)
-    $Names = @()
-    foreach ($procId in $Owners) {
-        $procName = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName
-        $Names += ("pid {0}{1}" -f $procId, $(if ($procName) { " ($procName)" } else { '' }))
-    }
-    Fail ("port $Port is already in use by " + ($Names -join ', ') + ". Stop it or pass another -Port.")
-}
-
-$Reload = -not $NoReload
+# serve.py owns every listener in one process; the uvicorn CLI binds only one. Never leave a
+# declared public port unbound - that would silently drop the internet-facing listener.
+$UseServe = $NoReload -or ($Check.public_port -and $Check.public_port -ne $Check.port)
+$Reload = -not $UseServe
 if ($Reload -and -not $Check.watchfiles) {
     Warn 'watchfiles is not installed - starting without auto-reload.'
     $Reload = $false
+}
+
+$Bind = [string] $Check.host
+$Port = [int] $Check.port
+$LogLevel = [string] $Check.log_level
+$AllPorts = @($Check.listen_ports | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+foreach ($listenPort in $AllPorts) {
+    try {
+        $Listeners = @(Get-NetTCPConnection -LocalPort $listenPort -State Listen -ErrorAction SilentlyContinue)
+    } catch {
+        $Listeners = @()
+    }
+    if ($Listeners.Count -gt 0) {
+        $Owners = ($Listeners | ForEach-Object { $_.OwningProcess } | Select-Object -Unique)
+        $Names = @()
+        foreach ($procId in $Owners) {
+            $procName = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName
+            $Names += ("pid {0}{1}" -f $procId, $(if ($procName) { " ($procName)" } else { '' }))
+        }
+        Fail ("port $listenPort is already in use by " + ($Names -join ', ') + ". Stop it or edit server.port / security.public.port in config.yaml.")
+    }
 }
 
 $DisplayHost = $Bind
@@ -373,10 +415,28 @@ if ($DisplayHost -eq '0.0.0.0' -or $DisplayHost -eq '::' -or $DisplayHost -eq '*
 $BaseUrl = "http://${DisplayHost}:$Port"
 
 Step 'ready'
-Note "gateway  $BaseUrl"
-Note "docs     $BaseUrl/docs"
-Note "console  $BaseUrl/admin/"
-Note "models   $BaseUrl/v1/models   (needs an API key header)"
+if ($Check.public_port) {
+    $KeyText = if ($Check.allow_anonymous) { 'key-free' } else { 'key-required' }
+    Note "internal  $BaseUrl  ($KeyText APIs; /docs and /admin reachable; management API is cookie-only)"
+    if ($Check.public_port -eq $Check.port) {
+        Note "public    $BaseUrl  (SAME socket - public-only instance, no anonymous HTTP path)"
+    } else {
+        Note "public    http://${DisplayHost}:$($Check.public_port)  ($($Check.public_rules) configured method+path rule(s); every request needs a key)"
+    }
+}
+Note "config    server.port=$Port  security.public.port=$($Check.public_port)  listen=[$($AllPorts -join ',')]"
+if (@($Check.legacy_env).Count -gt 0) {
+    Note "legacy env still set: $($Check.legacy_env -join ', ') (app migrates/ignores it; remove it from .env)"
+}
+
+if ($UseServe) {
+    Note 'entry     python serve.py  (zone-aware, proxy_headers=False, no auto-reload)'
+} else {
+    Note "gateway   $BaseUrl"
+    Note "docs      $BaseUrl/docs"
+    Note "console   $BaseUrl/admin/"
+    Note 'entry     uvicorn --no-proxy-headers  (single internal listener; no IP header rewrite)'
+}
 
 if ($CheckOnly) {
     Write-Host ''
@@ -385,19 +445,28 @@ if ($CheckOnly) {
 }
 
 # ------------------------------------------------------------------- launch ---
-$UvicornArgs = @('main:app', '--app-dir', $AppDir, '--host', $Bind, '--port', "$Port", '--log-level', $LogLevel)
-if ($Reload) { $UvicornArgs += @('--reload', '--reload-dir', $AppDir) }
-
-Write-Host ''
-Step "uvicorn $($UvicornArgs -join ' ')"
-Note 'press Ctrl-C to stop'
-
-# The working directory is app/, exactly the image's WORKDIR /app, so the relative paths written
-# in .env (../data/config.yaml, ../data/.keys) and next to config.yaml resolve the same way here.
+# The working directory is app/, exactly the image's WORKDIR /app, so the relative path
+# written in .env (../data/config.yaml) resolves the same way here and in the container.
 Push-Location -LiteralPath $AppDir
 try {
-    & $PyExe @PyPrefix -m uvicorn @UvicornArgs
-    $Code = $LASTEXITCODE
+    if ($UseServe) {
+        Step 'python serve.py  (hardened, zone-aware)'
+        Note 'press Ctrl-C to stop'
+        & $PyExe @PyPrefix serve.py
+        $Code = $LASTEXITCODE
+    } else {
+        # --no-proxy-headers is the local equivalent of serve.py's proxy_headers=False:
+        # without it ProxyHeadersMiddleware rewrites scope["client"] from a caller's XFF.
+        $UvicornArgs = @('main:app', '--app-dir', $AppDir, '--host', $Bind, '--port', "$Port",
+                         '--log-level', $LogLevel, '--no-proxy-headers',
+                         '--log-config', 'logging.json')
+        if ($Reload) { $UvicornArgs += @('--reload', '--reload-dir', $AppDir) }
+        Write-Host ''
+        Step "uvicorn $($UvicornArgs -join ' ')"
+        Note 'press Ctrl-C to stop'
+        & $PyExe @PyPrefix -m uvicorn @UvicornArgs
+        $Code = $LASTEXITCODE
+    }
 } finally {
     Pop-Location
 }

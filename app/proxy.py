@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import json
 import logging
+import posixpath
 import time
 from typing import Any
 
 import httpx
-from auth import client_ip
+from auth import client_ip, is_public, read_limited_body
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
-from request_log import extract_token_usage, now_ts, sanitize_body
+from request_log import extract_token_usage, now_ts, sanitize_body, sanitize_query
 
 logger = logging.getLogger("llm_hub")
 
@@ -37,6 +38,9 @@ EXCLUDED_RESPONSE_HEADERS = {
     "te",
     "trailers",
     "upgrade",
+    # An upstream must never be able to plant/overwrite a cookie on the gateway
+    # origin (in particular the llmhub_admin console session).
+    "set-cookie",
 }
 
 # These endpoints stream by default when `stream` is not set (matches Ollama behavior)
@@ -54,6 +58,45 @@ MODELLESS_ENDPOINTS = {
     "api/version",
     "",
 }
+
+#: The closed set of paths this gateway is willing to put on an upstream's wire.
+#:
+#: The catch-all used to forward *anything* it could not match locally, so the
+#: internal listener was an open proxy for the whole upstream API (and for probes
+#: of unrelated paths). Both listeners now answer **404** for a path outside this
+#: set; on the public listener ``security.public.path_allowlist`` has already
+#: narrowed it further.
+#:
+#: The model-management entries are here on purpose: whether they reach the
+#: upstream is decided by ``security.public.admin_endpoints`` (public) and by
+#: nothing at all (trusted internal LAN), and a 403 from that filter is a much
+#: clearer answer than a 404 claiming the endpoint does not exist.
+FORWARDABLE_PATHS = {
+    # Ollama native
+    "api/generate",
+    "api/chat",
+    "api/embed",
+    "api/embeddings",  # deprecated by Ollama, still answered by older instances
+    "api/show",
+    "api/version",
+    # OpenAI-compatible
+    "v1/chat/completions",
+    "v1/completions",
+    "v1/embeddings",
+    # Ollama model management, gated by security.public.admin_endpoints
+    "api/pull",
+    "api/push",
+    "api/create",
+    "api/delete",
+    "api/copy",
+}
+
+#: Prefix-matched forwardable paths (Ollama blob upload/delete: api/blobs/<digest>).
+FORWARDABLE_PREFIXES = ("api/blobs/",)
+
+
+def is_forwardable(path_clean: str) -> bool:
+    return path_clean in FORWARDABLE_PATHS or path_clean.startswith(FORWARDABLE_PREFIXES)
 
 
 class ProxyService:
@@ -100,7 +143,7 @@ class ProxyService:
 
     def _record_error(self, meta: dict[str, Any], status_code: int, error: str) -> None:
         duration_ms = round((time.perf_counter() - meta["started"]) * 1000)
-        logger.debug("Request log: %s /%s -> %s (%d ms)", meta["method"], meta["path"].lstrip("/"), status_code, duration_ms)
+        logger.debug("Request log: %s /%r -> %s (%d ms)", meta["method"], meta["path"].lstrip("/"), status_code, duration_ms)
         self._record(meta, status_code=status_code, duration_ms=duration_ms, error=error)
 
     # ------------------------------------------------------------------ helpers ---
@@ -165,6 +208,17 @@ class ProxyService:
             "authorization",
             "x-api-key",
             "accept-encoding",
+            # Browser state and proxy metadata are never needed by an inference backend.
+            # Forwarding `cookie` used to hand the console session token to every
+            # upstream, including externally hosted providers.
+            "cookie",
+            "referer",
+            "origin",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-real-ip",
+            "x-client-ip",
         }
         for key, value in request.headers.items():
             if key.lower() in skip:
@@ -183,8 +237,9 @@ class ProxyService:
         method = request.method.upper()
         started = time.perf_counter()
 
-        # read and parse the request body
-        raw_body = await request.body()
+        # Read under a hard cap: Content-Length is refused up front and chunked bodies
+        # are counted as they stream in, so a multi-GB POST never lands in memory.
+        raw_body = await read_limited_body(request, cfg.security.max_body_bytes)
         body: dict[str, Any] | None = None
         if raw_body:
             try:
@@ -194,7 +249,20 @@ class ProxyService:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 body = None
 
-        path_clean = path.strip("/")
+        # Normalise BEFORE the blocked-path check and BEFORE building the upstream URL.
+        # `api/../api/delete` used to slip past the literal deny list, and with
+        # follow_redirects enabled the upstream's own path cleaning could turn it into
+        # an actual delete. Reject dot segments outright rather than relying on that.
+        raw_path = path.strip("/")
+        if "\x00" in raw_path or ".." in raw_path.split("/"):
+            logger.warning("Blocked path with dot segments or NUL: %r", path)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Path with '..' segments or NUL bytes is not allowed.",
+            )
+        path_clean = posixpath.normpath(raw_path)
+        if path_clean == ".":
+            path_clean = ""
         # A HEAD carries no body and no answer, and monitors send it continuously, so it is
         # forwarded but never recorded - the log is for calls, not for liveness probes.
         logging_on = self._logging_on(cfg) and method != "HEAD"
@@ -204,7 +272,7 @@ class ProxyService:
             "ts": now_ts(),
             "method": method,
             "path": "/" + path_clean,
-            "query": request.url.query or None,
+            "query": sanitize_query(request.url.query),
             "model": None,
             "requested_model": requested if isinstance(requested, str) else None,
             "upstream": None,
@@ -217,9 +285,23 @@ class ProxyService:
             "logging": logging_on,
         }
 
-        # security hardening: block admin/model-management endpoints on public gateways
-        if cfg.security.is_path_blocked(path_clean):
-            logger.warning("Blocked admin/management endpoint: %s /%s", method, path_clean)
+        # Only the gateway's own API surface reaches an upstream. Anything else is not a
+        # route here, whatever the backend happens to implement, so it is refused with a
+        # 404 instead of being handed to the default upstream as a blind proxy would.
+        if not is_forwardable(path_clean):
+            logger.warning("Not a gateway API path: %s /%r", method, path_clean)
+            detail = (
+                f"Endpoint '/{path_clean}' is not part of this gateway's API. "
+                "See /docs (internal zone) or docs/API.md for the callable paths."
+            )
+            self._record_error(meta, status.HTTP_404_NOT_FOUND, detail)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+        # security hardening: block Ollama model-management endpoints on the PUBLIC
+        # listener only. The internal LAN socket is trusted, and `pull` there is a
+        # normal operation, so `security.public.admin_endpoints` does not apply to it.
+        if cfg.security.is_path_blocked(path_clean, public=is_public(request)):
+            logger.warning("Blocked admin/management endpoint: %s /%r", method, path_clean)
             detail = f"Endpoint '/{path_clean}' is disabled on this public gateway."
             self._record_error(meta, status.HTTP_403_FORBIDDEN, detail)
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
@@ -245,10 +327,26 @@ class ProxyService:
         if upstream is None:
             model = (body or {}).get("model", "")
             meta["model"] = model or None
-            detail = (
-                f"No upstream configured for model '{model}'. "
-                "Add it to an upstream's 'models' list, or set 'default_upstream'."
-            )
+            if model:
+                detail = (
+                    f"No upstream configured for model '{model}'. "
+                    "Add it to an upstream's 'models' list, or set 'default_upstream'."
+                )
+            else:
+                # Model-less calls (`api/pull` sends `name`, `api/tags` sends nothing) are
+                # routed by default_upstream alone. A value that names no upstream therefore
+                # breaks all of them while the old message kept blaming a missing `model`.
+                names = ", ".join(u.name for u in cfg.upstreams) or "none configured"
+                current = (
+                    f"'{cfg.default_upstream}', which matches no upstream"
+                    if cfg.default_upstream
+                    else "not set"
+                )
+                detail = (
+                    f"No default upstream for '/{path_clean}': this call carries no `model`, so it "
+                    f"is routed by default_upstream, and that is {current}. Upstreams in this "
+                    f"config: {names}."
+                )
             self._record_error(meta, status.HTTP_404_NOT_FOUND, detail)
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
         meta["upstream"] = upstream.name
@@ -291,7 +389,7 @@ class ProxyService:
             if options.get("num_ctx") != override:
                 options["num_ctx"] = override
                 logger.info(
-                    "num_ctx clamped: model=%s -> options.num_ctx=%d (client value ignored)",
+                    "num_ctx clamped: model=%r -> options.num_ctx=%d (client value ignored)",
                     resolved.target,
                     override,
                 )
@@ -311,7 +409,7 @@ class ProxyService:
         timeout = upstream.timeout or cfg.server.request_timeout
 
         logger.info(
-            "Forwarding %s /%s -> %s | model=%s | stream=%s",
+            "Forwarding %s /%r -> %r | model=%r | stream=%s",
             method,
             path_clean,
             upstream.name,

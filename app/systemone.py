@@ -6,8 +6,10 @@ Both a laya-server deployment and Ollama 0.40+ (which exposes the same path nati
 can serve it.
 
 Authentication split:
-  - The *caller* authenticates against llm-hub with the gateway's own API key
-    (cfg.auth.api_keys, sourced from `.env` / GATEWAY_API_KEYS - the `.keys` config).
+  - The *caller* authenticates against llm-hub with a key from the SQLite api_keys
+    table (minted at /admin -> API keys), or a console session.
+    On the internal zone this API may be key-free when allow_anonymous is true;
+    the public zone always requires a credential.
   - llm-hub then forwards the request to the configured `backend`, signing it with the
     key read from the environment variable named by `api_key_env` (default
     SYSTEMONE_SERVER_API_KEY). That key never has to live in config.yaml, and a backend
@@ -26,6 +28,7 @@ import os
 from typing import Any
 
 import httpx
+from auth import read_limited_body
 from fastapi import HTTPException, Request, status
 from fastapi.responses import Response
 
@@ -43,6 +46,14 @@ _EXCLUDED_REQUEST_HEADERS = {
     "authorization",
     "x-api-key",
     "accept-encoding",
+    "cookie",
+    "referer",
+    "origin",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-real-ip",
+    "x-client-ip",
 }
 
 # Response headers that must not be forwarded back to the caller.
@@ -57,6 +68,7 @@ _EXCLUDED_RESPONSE_HEADERS = {
     "te",
     "trailers",
     "upgrade",
+    "set-cookie",
 }
 
 
@@ -85,7 +97,7 @@ class SystemOneService:
             )
 
         # Read and parse the request body (pass-through semantics: preserve unknown fields).
-        raw_body = await request.body()
+        raw_body = await read_limited_body(request, cfg.security.max_body_bytes)
         try:
             body: Any = json.loads(raw_body) if raw_body else {}
         except (json.JSONDecodeError, UnicodeDecodeError):

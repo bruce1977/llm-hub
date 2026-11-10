@@ -137,13 +137,17 @@ def main() -> int:
             results = data.get("results", [])
             check("rerank returns results", len(results) > 0, f"count={len(results)}")
 
-        # --------------------------------------------------- Admin blocked ---
-        print("[8] Admin endpoints blocked")
-        r = client.post("/api/delete", headers=headers, json={"name": "test"})
-        check("POST /api/delete is blocked (403)", r.status_code == 403, f"got {r.status_code}")
-
-        r = client.post("/api/pull", headers=headers, json={"name": "test"})
-        check("POST /api/pull is blocked (403)", r.status_code == 403, f"got {r.status_code}")
+        # ------------------------------------------------ Admin endpoints ---
+        print("[8] Admin endpoints (public listener only)")
+        # `security.public.admin_endpoints` guards Ollama model management on the
+        # internet-facing listener. Against the internal port these calls are
+        # forwarded, so the gateway itself must not answer with the admin-block
+        # message; on the public port the allowlist would hide them anyway (404).
+        for path in ("/api/delete", "/api/pull"):
+            r = client.post(path, headers=headers, json={"name": "test"})
+            blocked_by_gateway = r.status_code == 403 and "public gateway" in r.text
+            check(f"POST {path} is not admin-blocked on this listener",
+                  not blocked_by_gateway, f"got {r.status_code}: {r.text[:120]}")
 
         # --------------------------------------------------- API docs hidden ---
         print("[9] API docs hidden by default")

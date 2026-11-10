@@ -494,7 +494,7 @@ const en: MessageSchema = {
     },
     introTitle: 'Overview',
     intro:
-      'Reranking scores and reorders candidate documents with a model after the initial recall stage, improving answer, search and RAG quality. llm-hub exposes {endpoint}: pass {query} and {documents} and the gateway turns the request into something the upstream can execute — a generative model scores by log probability (logprobs), or vectors are scored by cosine similarity (embedding) — then normalises the score into {score}. Use {topN} and {returnDocuments} to shape the output; the scoring mode can be overridden per model.',
+      'Reranking scores and reorders candidate documents with a model after the initial recall stage, improving answer, search and RAG quality. llm-hub exposes {endpoint}: pass {query} and {documents}, and the gateway turns the request into a generative yes/no prompt, scores it by log probability and normalises the result into {score}. Use {topN} and {returnDocuments} to shape the output.',
     config: {
       title: 'Rerank configuration',
     },
@@ -532,7 +532,7 @@ const en: MessageSchema = {
     },
     docs: {
       responseNote: 'Each results[] entry contains index / relevance_score',
-      note: 'Rerank scoring runs on the upstream model (logprobs or embedding); the gateway handles protocol translation and score normalisation. Failed requests can be filtered by status on the Requests page.',
+      note: 'Rerank scoring runs on the upstream model; the gateway handles protocol translation and score normalisation. Failed requests can be filtered by status on the Requests page.',
     },
   },
 
@@ -671,7 +671,7 @@ const en: MessageSchema = {
       },
       security: {
         title: 'Security and quotas',
-        desc: 'API keys from environment variables only, IP allowlists, method and path allowlists, rate limiting, body size caps and security headers',
+        desc: 'Two trust zones decided by the listening port, a mandatory key on the public zone with a method+regex path allowlist, SQLite-backed keys, rate limiting, body caps and security headers',
       },
       insights: {
         title: 'Request details and statistics',
@@ -745,7 +745,7 @@ const en: MessageSchema = {
     saveValidationFailed: 'The following config segments failed validation',
     saveConfirmTitle: 'Overwrite config.yaml?',
     saveConfirmBody:
-      'This overwrites the entire config.yaml with the full configuration object. The four segments edited here (Upstream / Rerank / System One / Web Search) are written; advanced segments not exposed on this page (server / auth / security / aliases, etc.) are kept verbatim from the current file and never lost.',
+      'This overwrites the entire config.yaml with the full configuration object. The four segments edited here (Upstream / Rerank / System One / Web Search) are written; advanced segments not exposed on this page (server / security / aliases, etc.) are kept verbatim from the current file and never lost.',
     saveConfirmYes: 'Overwrite & save',
     addUpstream: 'Add upstream',
     noUpstreams: 'No upstreams yet - click "Add upstream" to create one.',
@@ -801,7 +801,7 @@ const en: MessageSchema = {
     intro: {
       title: 'What this page is for',
       tag: 'overview',
-      body: 'An API key is the credential a caller presents to the gateway. The keys live in the api_keys table of llmhub.db, which holds only the SHA-256 hash of a key plus a display mask - the plaintext appears once, in the dialog that created it, and is gone when that dialog closes. The list shows the mask, the label and the creation time, and any key can be revoked here. Keys found in the environment or in the .keys file are imported once, only while the table is still empty; after that the database is the source of truth.',
+      body: 'An API key is the credential a caller presents to the gateway. The keys live in the api_keys table of llmhub.db, which holds only the SHA-256 hash of a key plus a display mask - the plaintext appears once, in the dialog that created it, and is gone when that dialog closes. The list shows the mask, the label and the creation time, and any key can be revoked here. This page is the only place a key can come from: there is no environment variable, key file or config entry that seeds one, so an empty table simply means no key has been issued yet.',
     },
     list: {
       title: 'Keys',
@@ -829,8 +829,8 @@ const en: MessageSchema = {
       storedValue: 'SHA-256(plaintext) plus a mask, never the plaintext',
       checked: 'How a key is checked',
       checkedValue: 'A hash lookup in memory - no database read per request',
-      seeded: 'First-start import',
-      seededValue: 'Environment and .keys values are imported once, only while the table is empty',
+      seeded: 'Where keys come from',
+      seededValue: 'Minted here only - nothing in the environment or in config.yaml can add one',
     },
     modal: {
       title: 'New API key',

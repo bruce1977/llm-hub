@@ -17,7 +17,7 @@ injection (e.g. `think: false`), and a Vue admin console with live request logs,
 tests, and key management.
 
 [简体中文](README_CN.md) · [Full usage guide](docs/USAGE.md) · [API reference](docs/API.md) ·
-[Deployment](docs/DEPLOY.md) · [Changelog](CHANGELOG.md)
+[Deployment](docs/DEPLOY.md) · [Config reference](docs/CONFIG.md) · [Changelog](CHANGELOG.md)
 
 ![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
@@ -52,18 +52,27 @@ menu at the bottom-left.
 # 1. dependencies + config
 pip install -r requirements.txt
 cp data/config.example.yaml data/config.yaml   # upstreams, aliases, rerank...
-cp .env.example .env                           # GATEWAY_API_KEYS, ADMIN_PASSWORD...
+cp .env.example .env                           # ADMIN_PASSWORD (console login), optional backend key
 # edit both files: real upstream base_urls, real keys
 
 # 2. run (loads ../.env, hot-reloads on save)
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 On Windows, `scripts\start-local.bat` (add `-Install` the first time) runs the same preflight
-checks and starts uvicorn for you. Open **<http://localhost:8000/admin/>** and sign in as `admin`
-with `ADMIN_PASSWORD`; without that variable the console reports itself disabled and every
-management call answers 503. `config.yaml` edits hot-reload in about a second — no restart.
+checks and starts the gateway for you: single-listener development with uvicorn + auto-reload,
+or `-PublicPorts 8001` / `-NoReload` for the hardened `serve.py` entrypoint (multi-listener,
+no auto-reload). Open **<http://localhost:8000/admin/>** and sign in as `admin` with
+`ADMIN_PASSWORD`; without that variable the console reports itself disabled and every
+management call answers 503. **Caller keys come from the console**: sign in and use
+**API keys → Create** — there is no environment variable or key file that seeds them, an empty
+table simply answers 401, and the plaintext is shown exactly once. `config.yaml` edits hot-reload
+in about a second — no restart. The console is served on the internal listener; to reach it on the
+public listener set `security.public.admin_endpoints: allow` (the management plane is still
+cookie-only — the gateway key is not an admin credential).
+Always pass `--no-proxy-headers` when starting uvicorn directly: without it a caller-supplied
+`X-Forwarded-For` can rewrite the client IP used by the whitelist.
 
 ### Docker (recommended)
 
@@ -90,7 +99,7 @@ in `app/web`, so no Node toolchain is needed.
 ### Calling it
 
 ```bash
-KEY=sk-your-gateway-key
+KEY=sk-hub-...   # minted at /admin -> API keys; shown once
 
 # Ollama-native chat (auto-routed; streams NDJSON unless stream=false)
 curl http://localhost:8888/api/chat -H "X-API-Key: $KEY" \
@@ -123,6 +132,7 @@ curl http://localhost:8888/health
 | [USAGE.md](docs/USAGE.md) | Full manual: every `config.yaml` section, LM Studio integration, the admin console, calling examples, FAQ, public-deployment security checklist, local development |
 | [API.md](docs/API.md) | Every endpoint (Anthropic Messages included) with request/response examples, streaming formats, error codes, alias injection, tool calling |
 | [DEPLOY.md](docs/DEPLOY.md) | Deployment: `docker run` and volumes, local Python run, image build/publish scripts, environment variables, troubleshooting, operations |
+| [CONFIG.md](docs/CONFIG.md) | `config.yaml` node by node: how the file is read and hot-reloaded, every key with its default and reader, the public path surface, removed nodes, and how to check that a key actually does something |
 
 Requirements: Docker (or Python 3.12 + `pip install -r requirements.txt`).
 

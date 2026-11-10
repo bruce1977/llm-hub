@@ -14,7 +14,7 @@ search、Messages），支持按别名强制注入参数（如 `think: false`）
 提供实时请求明细、每模型测速与密钥管理。
 
 [English](README.md) · [完整使用手册](docs/USAGE_CN.md) · [接口文档](docs/API_CN.md) ·
-[部署说明](docs/DEPLOY_CN.md) · [更新日志](CHANGELOG.md)
+[部署说明](docs/DEPLOY_CN.md) · [配置节点说明](docs/CONFIG_CN.md) · [更新日志](CHANGELOG.md)
 
 ![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
@@ -47,17 +47,24 @@ search、Messages），支持按别名强制注入参数（如 `think: false`）
 # 1. 安装依赖与准备配置
 pip install -r requirements.txt
 cp data/config.example.yaml data/config.yaml   # 上游、别名、rerank……
-cp .env.example .env                           # GATEWAY_API_KEYS、ADMIN_PASSWORD……
+cp .env.example .env                           # ADMIN_PASSWORD（登录管理台）、可选后端密钥
 # 编辑这两个文件：填真实上游地址和真实密钥
 
 # 2. 启动（自动加载 ../.env，保存即热重载）
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 Windows 可直接用 `scripts\start-local.bat`（首次加 `-Install`），它做同样的启动前检查并拉起
-uvicorn。打开 **<http://localhost:8000/admin/>**，用 `admin` + `ADMIN_PASSWORD` 登录；不设这个
-变量时管理台显示「未启用」，所有管理接口返回 503。改 `config.yaml` 约 1 秒热重载，不用重启。
+网关：默认单监听用 uvicorn + 自动重载，加 `-PublicPorts 8001` 或 `-NoReload` 则走加固入口
+`serve.py`（多监听、无自动重载）。打开 **<http://localhost:8000/admin/>**，用 `admin` +
+`ADMIN_PASSWORD` 登录；不设这个变量时管理台显示「未启用」，所有管理接口返回 503。
+**调用方 Key 只在管理台签发**：登录后进「API Key 管理 → 新建」——没有任何环境变量或密钥文件
+能注入 Key，空表就是正常的首次启动状态（需要 Key 的请求一律 401），明文只显示一次。
+改 `config.yaml` 约 1 秒热重载，不用重启。管理台默认只在内网口提供；要在公网口访问，把
+`security.public.admin_endpoints` 设为 `allow`（管理面仍只认会话 Cookie——网关 Key 不是管理凭据）。
+手动启动 uvicorn 时务必带 `--no-proxy-headers`，
+否则调用方提交的 `X-Forwarded-For` 能改写用于白名单判断的客户端 IP。
 
 ### Docker 部署（推荐）
 
@@ -83,7 +90,7 @@ curl http://localhost:8888/health          # {"ok":true}
 ### 调用方式
 
 ```bash
-KEY=sk-your-gateway-key
+KEY=sk-hub-……   # 在 /admin → API Key 管理 签发，明文只显示一次
 
 # Ollama 原生聊天（自动路由；不写 stream 即流式 NDJSON）
 curl http://localhost:8888/api/chat -H "X-API-Key: $KEY" \
@@ -116,6 +123,7 @@ curl http://localhost:8888/health
 | [USAGE_CN.md](docs/USAGE_CN.md) | 完整手册：`config.yaml` 各段配置详解、集成 LM Studio、管理台使用、调用示例、常见问题、公网安全清单、本地开发 |
 | [API_CN.md](docs/API_CN.md) | 全部端点（含 Anthropic Messages）的请求 / 响应示例、流式格式、错误码、别名参数注入、工具调用 |
 | [DEPLOY_CN.md](docs/DEPLOY_CN.md) | 部署：Docker 运行与目录挂载、本地 Python 运行、镜像构建 / 发布脚本、环境变量、常见问题与运维 |
+| [CONFIG_CN.md](docs/CONFIG_CN.md) | 逐个节点说明 `config.yaml`：文件如何读取与热重载、每个键的默认值与读取方、公网路径范围、已移除的节点，以及如何确认某个键真的生效 |
 
 环境要求：Docker（或 Python 3.12 + `pip install -r requirements.txt`）。
 

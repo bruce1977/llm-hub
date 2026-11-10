@@ -20,14 +20,15 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 # --- the config path must be set before importing app -------------------------------------
 TMP_DIR = tempfile.mkdtemp(prefix="llm-hub-test-")
 CONFIG_FILE = os.path.join(TMP_DIR, "config.json")
 os.environ["CONFIG_PATH"] = CONFIG_FILE
-# API keys are an environment concern: config.yaml has no api_keys node any more.
-os.environ["GATEWAY_API_KEYS"] = "sk-test-1,sk-test-2"
+# Caller keys are minted in the console and stored in llmhub.db; there is no environment
+# variable for them. Each suite inserts its own rows once the app has started.
 
 # The Python modules live directly in APP_DIR; the same layout is mounted at /app in Docker.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -46,6 +47,30 @@ def check(name: str, condition: bool, detail: str = "") -> None:
     else:
         FAILED += 1
         print(f"  [FAIL] {name} {detail}")
+
+
+def seed_api_keys(*secrets: str) -> None:
+    """Write caller-key rows straight into llmhub.db.
+
+    Caller keys are minted at /admin and hashed into llmhub.db; no environment variable,
+    key file or config node can seed them. Tests therefore create the rows themselves, and
+    must do it before the app starts: an empty table with no ADMIN_PASSWORD refuses to boot.
+    """
+    import sqlite3
+
+    from key_store import SCHEMA, hash_key, mask_key, now_ts
+
+    db = Path(os.getenv("LLMHUB_DB") or Path(CONFIG_FILE).parent / "llmhub.db")
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db) as conn:
+        conn.executescript(SCHEMA)
+        for secret in secrets:
+            conn.execute(
+                "INSERT OR IGNORE INTO api_keys (hash, masked, label, source, created_at) "
+                "VALUES (?, ?, '', 'console', ?)",
+                (hash_key(secret), mask_key(secret), now_ts()),
+            )
+        conn.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -268,10 +293,6 @@ def main() -> int:
 
     config = {
         "server": {"host": "127.0.0.1", "port": 8000, "log_level": "warning"},
-        "auth": {
-            "enabled": True,
-            "allow_anonymous_health": True,
-        },
         "routing": {"strict": False},
         "upstreams": [
             {
@@ -320,7 +341,10 @@ def main() -> int:
             "max_concurrency": 4,
             "return_documents": True,
         },
-        "security": {"fail_on_weak_keys": False},
+        "security": {
+            "internal": {"allow_anonymous": False, "expose_version": True, "expose_docs": True},
+            "public": {"port": None, "path_allowlist": {}},
+        },
     }
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
@@ -330,6 +354,10 @@ def main() -> int:
     from main import app
 
     print("\n=== LLM Hub smoke tests ===\n")
+
+    # Keys are minted in the console only, so the fixture writes the rows itself - before the
+    # lifespan runs, because an empty table with no ADMIN_PASSWORD refuses to start.
+    seed_api_keys("sk-test-1", "sk-test-2")
 
     with TestClient(app) as client:
         good = {"Authorization": "Bearer sk-test-1"}
@@ -370,19 +398,87 @@ def main() -> int:
         r = client.get("/v1/models", headers={"X-API-Key": "sk-test-2"})
         check("The second key and the X-API-Key header work", r.status_code == 200, f"got {r.status_code}")
 
-        # ----------------------------------------- GATEWAY_AUTH_DISABLED env var ---
-        print("[2b] GATEWAY_AUTH_DISABLED")
-        os.environ["GATEWAY_AUTH_DISABLED"] = "true"
+        # --------------------------- zone split: internal vs public listener ---
+        print("[2b] zone split (internal / public listener)")
+        # TestClient's scope["server"] port is 80. Declaring 80 as security.public.port
+        # routes EVERY request on this client into the untrusted zone without binding a
+        # second real socket (the same trick verify_security.py uses). zone() reads the
+        # kernel-assigned listener from config, never a header or a client IP.
+        manager = getattr(client.app.state, "manager", None)
+        sec = manager.config.security
+        saved_port = sec.public.port
+        saved_allowlist = dict(sec.public.path_allowlist)
+        saved_anon = sec.internal.allow_anonymous
+        saved_pw = os.environ.get("ADMIN_PASSWORD")
         try:
-            manager = getattr(client.app.state, "manager", None)
-            if manager:
-                manager.reload()
-            r = client.get("/v1/models")
-            check("GATEWAY_AUTH_DISABLED=true skips auth", r.status_code == 200, f"got {r.status_code}")
+            sec.public.port = 80
+            sec.public.path_allowlist = {
+                "GET": [r"^/v1/models$"],
+                "POST": [r"^/api/generate$"],
+            }
+            sec.internal.allow_anonymous = True  # must NOT soften the public zone
+
+            # Only configured method+path pairs exist on the public listener.
+            check("public: listed GET with a key -> 200",
+                  client.get("/v1/models", headers=good).status_code == 200)
+            check("public: listed POST with a key is forwarded (not 401/404)",
+                  client.post("/api/generate", headers=good,
+                              json={"model": "qwen3.5:4b", "prompt": "hi", "stream": False}).status_code == 200)
+            check("public: listed path without a key -> 401",
+                  client.get("/v1/models").status_code == 401)
+            check("public: wrong key -> 403",
+                  client.get("/v1/models", headers={"Authorization": "Bearer wrong-key"}).status_code == 403)
+            check("public: unlisted path -> 404 even with a key",
+                  client.get("/api/tags", headers=good).status_code == 404)
+            check("public: listed path with the wrong verb -> 404",
+                  client.post("/v1/models", headers=good, json={}).status_code == 404)
+            check("public: an unlisted POST endpoint (/v1/messages) -> 404",
+                  client.post("/v1/messages", headers=good, json={}).status_code == 404)
+
+            # Red lines config cannot open: management, console, probes, docs.
+            for hidden in ("/", "/health", "/healthz", "/probe", "/docs", "/openapi.json",
+                           "/api/ps", "/api/version", "/v1/management/config", "/admin"):
+                check(f"public hides {hidden} -> 404",
+                      client.get(hidden, headers=good).status_code == 404)
+
+            # A forged XFF does not change the zone or bypass the key check.
+            check("public: a forged internal XFF cannot bypass the key check",
+                  client.get("/v1/models", headers={"X-Forwarded-For": "192.168.10.5"}).status_code == 401)
+
+            # A console session is a credential in its own right, even on public.
+            from admin_auth import ADMIN_COOKIE_NAME, create_admin_token
+
+            os.environ["ADMIN_PASSWORD"] = "zone-test-admin-password-123456"
+            token = create_admin_token(os.environ["ADMIN_PASSWORD"])
+            check("public: a valid console session unlocks a listed path",
+                  client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: token}).status_code == 200)
+            check("public: a forged console session does not",
+                  client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: "1.deadbeef"}).status_code == 401)
+
+            # Back to a single internal socket: allow_anonymous is the only toggle.
+            sec.public.port = None
+            sec.internal.allow_anonymous = True
+            check("internal: allow_anonymous=true is key-free",
+                  client.get("/v1/models").status_code == 200)
+            check("internal: /health is anonymous either way",
+                  client.get("/health").status_code == 200)
+            sec.internal.allow_anonymous = False
+            check("internal: allow_anonymous=false needs a key",
+                  client.get("/v1/models").status_code == 401)
+            check("internal: /health stays anonymous for the container probe",
+                  client.get("/health").status_code == 200)
+            check("internal: /healthz needs a key",
+                  client.get("/healthz").status_code == 401)
+            check("internal: a forged XFF does not unlock the API",
+                  client.get("/v1/models", headers={"X-Forwarded-For": "10.1.2.3"}).status_code == 401)
         finally:
-            os.environ.pop("GATEWAY_AUTH_DISABLED", None)
-            if manager:
-                manager.reload()
+            sec.public.port = saved_port
+            sec.public.path_allowlist = saved_allowlist
+            sec.internal.allow_anonymous = saved_anon
+            if saved_pw is None:
+                os.environ.pop("ADMIN_PASSWORD", None)
+            else:
+                os.environ["ADMIN_PASSWORD"] = saved_pw
 
         # ------------------------------------------------ /v1/models aggregation ---
         print("[3] Unified /v1/models")
@@ -804,13 +900,117 @@ def main() -> int:
         check("model_name+input aliases work", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
 
         # ------------------------------------------- Security: admin endpoint block ---
-        print("[10] Security - admin endpoint blocking")
+        print("[10] Security - admin endpoints are blocked on the public zone only")
+        # The internal listener is a trusted LAN socket: model management is forwarded,
+        # so the gateway must not answer with its admin-block message here.
         r = client.post("/api/delete", headers=good, json={"name": "some-model"})
-        check("Authenticated /api/delete is blocked (403)", r.status_code == 403, f"got {r.status_code}")
-        r = client.post("/api/pull", headers=good, json={"name": "some-model"})
-        check("Authenticated /api/pull is blocked (403)", r.status_code == 403, f"got {r.status_code}")
-        r = client.post("/api/create", headers=good, json={"name": "some-model", "from": "x"})
-        check("Authenticated /api/create is blocked (403)", r.status_code == 403, f"got {r.status_code}")
+        check(
+            "internal /api/delete is forwarded, not admin-blocked",
+            not (r.status_code == 403 and "public gateway" in r.text),
+            f"got {r.status_code}: {r.text[:120]}",
+        )
+
+        # On the public listener the same call is refused - but only once it has passed
+        # the allowlist, so allow /api/* on purpose for this probe.
+        live = client.app.state.manager.config
+        saved_public_port = live.security.public.port
+        saved_allowlist = {verb: list(pats) for verb, pats in live.security.public.path_allowlist.items()}
+        try:
+            live.security.public.port = 80
+            live.security.public.path_allowlist = {"POST": [r"^/api/.*$"]}
+            for path in ("/api/delete", "/api/pull", "/api/create", "/api/blobs/sha256:abc"):
+                rr = client.post(path, headers=good, json={"name": "some-model"})
+                check(f"public {path} is admin-blocked (403)", rr.status_code == 403, f"got {rr.status_code}")
+            rr = client.post("/api/chat", headers=good, json={"model": "qwen3.5:4b", "messages": []})
+            check("public /api/chat passes the admin filter", rr.status_code != 403, f"got {rr.status_code}")
+        finally:
+            live.security.public.port = saved_public_port
+            live.security.public.path_allowlist = saved_allowlist
+
+        # ------------------------- Security: the catch-all is not an open proxy ---
+        print("[10b] Security - only declared API paths reach an upstream")
+        from proxy import FORWARDABLE_PATHS, is_forwardable
+
+        check("Ollama inference paths are forwardable",
+              {"api/generate", "api/chat", "api/embed", "api/embeddings", "api/show", "api/version"}
+              <= FORWARDABLE_PATHS, str(sorted(FORWARDABLE_PATHS)))
+        check("OpenAI-compatible paths are forwardable",
+              {"v1/chat/completions", "v1/completions", "v1/embeddings"} <= FORWARDABLE_PATHS)
+        check("model management stays in the set so admin_endpoints decides it",
+              {"api/pull", "api/push", "api/create", "api/delete", "api/copy"} <= FORWARDABLE_PATHS)
+        check("blob upload matches by prefix", is_forwardable("api/blobs/sha256:abc"))
+        check("a bare api/blobs is not a route", not is_forwardable("api/blobs"))
+        # /api/tags and /api/ps are answered by the gateway itself (aggregated), and
+        # /v1/rerank is its own service - none of them is ever put on an upstream's wire.
+        for local in ("api/tags", "api/ps", "v1/models", "v1/rerank", "admin/login", "anything"):
+            check(f"{local} is never forwarded", not is_forwardable(local))
+
+        r = client.post("/api/some-private-route", headers=good, json={"model": "qwen3.5:4b"})
+        check("an undeclared path is 404, not proxied (internal)",
+              r.status_code == 404 and "not part of this gateway" in r.text,
+              f"got {r.status_code}: {r.text[:160]}")
+        r = client.get("/api/some-private-route", headers=good)
+        check("an undeclared GET is 404 too (internal)", r.status_code == 404, f"got {r.status_code}")
+        r = client.post("/api/generate", headers=good,
+                        json={"model": "qwen3.5:4b", "prompt": "hi", "stream": False})
+        check("a declared path still forwards", r.status_code == 200, f"got {r.status_code}: {r.text[:120]}")
+
+        # `routing.strict: true` refuses an unknown *model*; it must not veto the Ollama
+        # admin calls, whose body carries `name` and which therefore have no model to
+        # route by. Otherwise `admin_endpoints: allow` + an allowlist entry would still
+        # dead-end in "No upstream configured for model ''".
+        _live = client.app.state.manager.config
+        _saved_strict = _live.routing.strict
+        try:
+            _live.routing.strict = True
+            r = client.post("/api/pull", headers=good, json={"name": "some-model"})
+            check("strict routing still forwards a model-less admin call",
+                  not (r.status_code == 404 and "No upstream configured" in r.text),
+                  f"got {r.status_code}: {r.text[:120]}")
+            r = client.post("/api/chat", headers=good,
+                            json={"model": "no-such-model:1", "messages": [], "stream": False})
+            check("strict routing still refuses an unknown model",
+                  r.status_code == 404 and "No upstream configured" in r.text,
+                  f"got {r.status_code}: {r.text[:120]}")
+        finally:
+            _live.routing.strict = _saved_strict
+
+        # `admin_endpoints: allow` must forward *everything*, blob uploads included. The
+        # blob path used to stay blocked because the prefix test sat outside the mode list.
+        live = client.app.state.manager.config
+        saved_public_port = live.security.public.port
+        saved_allowlist = {verb: list(pats) for verb, pats in live.security.public.path_allowlist.items()}
+        saved_admin_mode = live.security.public.admin_endpoints
+        try:
+            live.security.public.port = 80
+            live.security.public.path_allowlist = {"POST": [r"^/api/.*$"]}
+            for mode, should_block in (("deny", True), ("readonly", True), ("allow", False)):
+                live.security.public.admin_endpoints = mode
+                rr = client.post("/api/blobs/sha256:deadbeef", headers=good, json={"name": "m"})
+                blocked = rr.status_code == 403 and "public gateway" in rr.text
+                check(f"public blob upload blocked under admin_endpoints={mode}",
+                      blocked is should_block, f"got {rr.status_code}: {rr.text[:120]}")
+            # A path the gateway does not serve stays 404 even when the allowlist lists it:
+            # the allowlist opens a route, it does not invent one.
+            live.security.public.admin_endpoints = "allow"
+            rr = client.post("/api/some-private-route", headers=good, json={"model": "qwen3.5:4b"})
+            check("a listed but undeclared path is still 404 on the public zone",
+                  rr.status_code == 404, f"got {rr.status_code}: {rr.text[:120]}")
+        finally:
+            live.security.public.port = saved_public_port
+            live.security.public.path_allowlist = saved_allowlist
+            live.security.public.admin_endpoints = saved_admin_mode
+
+        # ------------------- Schema-visible routes: POST only, on every method ---
+        print("[10c] Every documented pass-through route answers 405 for non-POST")
+        for documented in ("/api/generate", "/api/chat", "/v1/chat/completions", "/v1/completions",
+                           "/api/embed", "/v1/embeddings", "/v1/messages", "/v1/message"):
+            rr = client.get(documented, headers=good)
+            check(f"GET {documented} -> 405", rr.status_code == 405, f"got {rr.status_code}")
+            check(f"{documented} 405 advertises Allow: POST",
+                  rr.headers.get("allow") == "POST", str(dict(rr.headers)))
+            rr = client.put(documented, headers=good, json={})
+            check(f"PUT {documented} -> 405", rr.status_code == 405, f"got {rr.status_code}")
 
         # ----------------------------------------------- Security: unit-level checks ---
         print("[11] Security - unit checks")
@@ -822,16 +1022,28 @@ def main() -> int:
         check("find_weak_keys flags placeholder/short keys", len(wk) == 2, str(wk))
         check("find_weak_keys accepts a strong key", len(find_weak_keys([STRONG])) == 0, "unexpected")
 
-        deny = SecurityConfig(admin_endpoints="deny")
-        check("deny mode blocks api/delete", deny.is_path_blocked("api/delete"))
-        check("deny mode blocks api/pull", deny.is_path_blocked("api/pull"))
-        check("deny mode blocks api/blobs/*", deny.is_path_blocked("api/blobs/sha256:abc"))
-        check("deny mode allows api/chat", not deny.is_path_blocked("api/chat"))
-        readonly = SecurityConfig(admin_endpoints="readonly")
-        check("readonly mode allows api/pull", not readonly.is_path_blocked("api/pull"))
-        check("readonly mode blocks api/delete", readonly.is_path_blocked("api/delete"))
-        allow = SecurityConfig(admin_endpoints="allow")
-        check("allow mode forwards everything", not allow.is_path_blocked("api/delete"))
+        deny = SecurityConfig(public={"admin_endpoints": "deny"})
+        check("deny blocks api/delete on the public zone", deny.is_path_blocked("api/delete", public=True))
+        check("deny blocks api/pull on the public zone", deny.is_path_blocked("api/pull", public=True))
+        check("deny blocks api/blobs/* on the public zone",
+              deny.is_path_blocked("api/blobs/sha256:abc", public=True))
+        check("deny allows api/chat", not deny.is_path_blocked("api/chat", public=True))
+        check("the internal zone is never admin-filtered",
+              not deny.is_path_blocked("api/delete", public=False))
+        readonly = SecurityConfig(public={"admin_endpoints": "readonly"})
+        check("readonly allows api/pull on the public zone",
+              not readonly.is_path_blocked("api/pull", public=True))
+        check("readonly blocks api/delete on the public zone",
+              readonly.is_path_blocked("api/delete", public=True))
+        allow = SecurityConfig(public={"admin_endpoints": "allow"})
+        check("allow forwards everything on the public zone",
+              not allow.is_path_blocked("api/delete", public=True))
+        check("allow forwards blob uploads too",
+              not allow.is_path_blocked("api/blobs/sha256:abc", public=True))
+        check("blocked_paths still applies in both zones",
+              SecurityConfig(blocked_paths=["api/show"]).is_path_blocked("api/show", public=False))
+        check("a legacy root admin_endpoints migrates into public",
+              SecurityConfig(**{"admin_endpoints": "readonly"}).public.admin_endpoints == "readonly")
 
         # --------------------------------------------------- Security: CORS / docs ---
         print("[12] Security - CORS and docs defaults")
@@ -841,8 +1053,18 @@ def main() -> int:
             "access-control-allow-origin" not in r.headers,
             str(dict(r.headers)),
         )
-        r = client.get("/docs")
-        check("API docs are hidden by default (404)", r.status_code == 404, f"got {r.status_code}")
+        check("internal docs visible when expose_docs=true",
+              client.get("/docs").status_code == 200, f"got {client.get('/docs').status_code}")
+        _sec = manager.config.security.internal if (manager := getattr(client.app.state, "manager", None)) else None
+        _saved_docs = _sec.expose_docs
+        try:
+            _sec.expose_docs = False
+            check("internal docs hidden when expose_docs=false",
+                  client.get("/docs").status_code == 404, f"got {client.get('/docs').status_code}")
+            check("openapi.json hidden too when expose_docs=false",
+                  client.get("/openapi.json").status_code == 404, f"got {client.get('/openapi.json').status_code}")
+        finally:
+            _sec.expose_docs = _saved_docs
 
         # ------------------------------------------- Proxy: tool_calls.arguments normalization ---
         print("[13] Proxy - tool_calls.arguments normalization")
@@ -886,7 +1108,7 @@ def main() -> int:
         print("[14] LM Studio upstream integration")
         from config import Config as GatewayConfig
         from config import SecurityConfig
-        from config import build_default_config, collect_env_api_keys
+        from config import build_default_config
 
         lm_cfg = GatewayConfig(
             upstreams=[
@@ -933,138 +1155,140 @@ def main() -> int:
             any(i["id"] == "qwen3.5:9b" for i in lm_cfg.aggregated_models()),
         )
 
-        # ---------------------------------------- API keys from the environment ---
-        print("[16] API keys loaded from the environment")
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as kf:
-            kf.write("fileKey-aaaa1111,fileKey-bbbb2222\n")
-            keyfile = kf.name
-        prev_inline = os.environ.get("GATEWAY_API_KEYS")
-        prev_file = os.environ.get("GATEWAY_API_KEYS_FILE")
+        # ------------------------------- API keys live only in llmhub.db ---
+        print("[16] API keys come from the console, never from the environment")
+        import config as config_module
+
+        check(
+            "no environment seed exists in config.py",
+            not hasattr(config_module, "ENV_API_KEYS")
+            and not hasattr(config_module, "collect_env_api_keys")
+            and not hasattr(config_module, "set_api_keys")
+            and not hasattr(config_module, "get_api_keys")
+            and not hasattr(config_module, "default_keys_file"),
+            "GATEWAY_API_KEYS and the key-file seed must be gone",
+        )
+        check(
+            "Config has no api_keys attribute any more",
+            not hasattr(GatewayConfig(), "api_keys"),
+            "config.yaml and the environment are not key sources",
+        )
+
+        # A stale environment variable must not resurrect a key.
+        os.environ["GATEWAY_API_KEYS"] = "envKey-cccc3333"
         try:
-            os.environ["GATEWAY_API_KEYS"] = "envKey-cccc3333"
-            os.environ["GATEWAY_API_KEYS_FILE"] = keyfile
-            collected = collect_env_api_keys()
-            check("inline env key is collected", "envKey-cccc3333" in collected, str(collected))
-            check(
-                "file-based keys are collected",
-                "fileKey-aaaa1111" in collected and "fileKey-bbbb2222" in collected,
-                str(collected),
+            migrated = GatewayConfig(
+                upstreams=[{"name": "u", "base_url": "http://127.0.0.1:1", "models": ["m"]}],
+                auth={"enabled": True, "api_keys": ["yamlKey-dddd4444"]},
             )
             check(
-                "auth.api_keys in config.yaml is ignored",
-                "yamlKey-dddd4444"
-                not in GatewayConfig(
-                    upstreams=[{"name": "u", "base_url": "http://127.0.0.1:1", "models": ["m"]}],
-                    auth={"enabled": True, "api_keys": ["yamlKey-dddd4444"]},
-                ).auth.api_keys,
-                "a config-file key must not reach the runtime key list",
+                "the removed auth node is migrated, never kept on the config",
+                not hasattr(migrated, "auth"),
+            )
+            check(
+                "auth.enabled=true maps to security.internal.allow_anonymous=false",
+                migrated.security.internal.allow_anonymous is False,
+            )
+            check(
+                "a stale GATEWAY_API_KEYS creates no key",
+                not hasattr(migrated, "api_keys"),
+                "the environment must not be a key source",
             )
         finally:
-            if prev_inline is None:
-                os.environ.pop("GATEWAY_API_KEYS", None)
-            else:
-                os.environ["GATEWAY_API_KEYS"] = prev_inline
-            if prev_file is None:
-                os.environ.pop("GATEWAY_API_KEYS_FILE", None)
-            else:
-                os.environ["GATEWAY_API_KEYS_FILE"] = prev_file
-            try:
-                os.unlink(keyfile)
-            except OSError:
-                pass
+            os.environ.pop("GATEWAY_API_KEYS", None)
 
-        default_auth = build_default_config()["auth"]
+        # The store itself is the single source of truth: a row added there verifies,
+        # and nothing else can add one.
+        store = client.app.state.api_keys
         check(
-            "default config template ships no api_keys node",
-            "api_keys" not in default_auth,
-            str(sorted(default_auth)),
+            "the fixture keys are in the store",
+            store.verify("sk-test-1") and store.verify("sk-test-2"),
+            f"count={store.count()}",
         )
         check(
-            "default config template ships an empty IP whitelist",
-            default_auth["allow_access_ip_whitelist"] == [],
-            str(default_auth.get("allow_access_ip_whitelist")),
+            "an unknown key never verifies",
+            not store.verify("sk-env-only-key-000000"),
+        )
+
+        defaults = build_default_config()
+        check(
+            "default config template has no legacy auth node",
+            "auth" not in defaults,
+            str(sorted(defaults)),
         )
         check(
-            "security.allow_docs was removed from the config model",
-            "allow_docs" not in SecurityConfig.model_fields,
+            "default security has internal + public zone nodes",
+            {"internal", "public"} <= set(defaults["security"]),
+            str(sorted(defaults["security"])),
+        )
+        check(
+            "default public path_allowlist is a method->regex dict",
+            isinstance(defaults["security"]["public"]["path_allowlist"], dict)
+            and all(isinstance(v, list) for v in defaults["security"]["public"]["path_allowlist"].values()),
+            str(defaults["security"]["public"]["path_allowlist"]),
+        )
+        check(
+            "default public listener is closed (port null)",
+            defaults["security"]["public"]["port"] is None,
+        )
+        check(
+            "legacy security fields were removed from the config model",
+            not ({"allowed_http_methods", "path_allowlist", "expose_version", "expose_health_details"}
+                 & set(SecurityConfig.model_fields)),
             str(sorted(SecurityConfig.model_fields)),
         )
-
-        from config import AuthConfig, default_keys_file
-
-        implicit = default_keys_file()
         check(
-            "implicit .keys file sits next to config.yaml",
-            implicit.name == ".keys"
-            and implicit.parent == __import__("pathlib").Path(os.environ["CONFIG_PATH"]).parent,
-            str(implicit),
-        )
-        check(
-            "the allow_access_ip_whilelist misspelling is normalised",
-            AuthConfig(**{"allow_access_ip_whilelist": [r"^10\.0\.0\.1$"]}).allow_access_ip_whitelist
-            == [r"^10\.0\.0\.1$"],
-            "pydantic would otherwise drop the unknown field and leave the whitelist empty",
+            "AuthConfig model was removed with the auth node",
+            not hasattr(__import__("config"), "AuthConfig"),
         )
 
-        # ------------------------- auth.allow_access_ip_whitelist: docs + key bypass ---
-        print("[16b] auth.allow_access_ip_whitelist")
-        manager = getattr(client.app.state, "manager", None)
-        auth_cfg = manager.config.auth
+        # --------------------------- legacy auth/security migration to two zones ---
+        print("[16b] legacy auth/security config migration")
+        legacy = {
+            "server": {"port": 8000},
+            "auth": {"enabled": True, "allow_anonymous_health": True,
+                     "trusted_networks": ["10.0.0.0/8"],
+                     "allow_access_ip_whitelist": [r"^10\.0\.0\.1$"],
+                     "api_keys": ["sk-legacy-ignored"]},
+            "security": {"expose_version": False, "allowed_http_methods": ["GET", "POST"],
+                         "path_allowlist": [r"^/v1/models$"], "expose_health_details": True},
+        }
+        migrated = GatewayConfig(**legacy)
+        check("the auth node is folded away", not hasattr(migrated, "auth"))
+        check("auth.enabled=true -> internal.allow_anonymous=false",
+              migrated.security.internal.allow_anonymous is False)
+        zoned = GatewayConfig(**{**legacy, "security": {**legacy["security"],
+                                                       "public": {"port": 8001}}})
+        check("auth.enabled=true + public listener -> internal stays anonymous",
+              zoned.security.internal.allow_anonymous is True)
+        check("legacy expose_version -> internal.expose_version",
+              migrated.security.internal.expose_version is False)
+        check("legacy global path_allowlist -> public method->regex dict",
+              migrated.security.public.path_allowlist
+              == {"GET": [r"^/v1/models$"], "POST": [r"^/v1/models$"]},
+              str(migrated.security.public.path_allowlist))
+        check("migration never opens a public listener", migrated.security.public.port is None)
+        check("legacy api_keys never enter the runtime key list",
+              not hasattr(migrated, "api_keys"))
+        check("listen_ports() is just the internal socket", migrated.listen_ports() == [8000])
+        check("public_ports() is empty after migration", migrated.public_ports() == frozenset())
+
+        from pydantic import ValidationError
+
         try:
-            auth_cfg.allow_access_ip_whitelist = []
-            check(
-                "/docs is 404 while the whitelist is empty",
-                client.get("/docs").status_code == 404,
-                f"got {client.get('/docs').status_code}",
-            )
-            check(
-                "an address outside the whitelist still needs a key",
-                client.get("/v1/models").status_code == 401,
-                f"got {client.get('/v1/models').status_code}",
-            )
+            GatewayConfig(**{**legacy, "security": {"public": {"path_allowlist": {"FETCH": [r"^/x$"]}}}})
+            check("an unknown HTTP verb in path_allowlist is rejected", False, "expected ValidationError")
+        except ValidationError:
+            check("an unknown HTTP verb in path_allowlist is rejected", True)
+        invalid_regex = GatewayConfig(
+            **{**legacy, "security": {"public": {"path_allowlist": {"GET": ["([", r"^/ok$"]}}}}
+        )
+        check("an invalid regex is dropped, the valid one kept",
+              invalid_regex.security.public.path_allowlist == {"GET": [r"^/ok$"]},
+              str(invalid_regex.security.public.path_allowlist))
 
-            auth_cfg.allow_access_ip_whitelist = [r"^testclient$"]
-            check(
-                "/docs is served to a whitelisted address",
-                client.get("/docs").status_code == 200,
-                f"got {client.get('/docs').status_code}",
-            )
-            check(
-                "/openapi.json is served to a whitelisted address",
-                client.get("/openapi.json").status_code == 200,
-                f"got {client.get('/openapi.json').status_code}",
-            )
-            check(
-                "a whitelisted address skips the API-key check",
-                client.get("/v1/models").status_code == 200,
-                f"got {client.get('/v1/models').status_code}",
-            )
-
-            # The bypass is matched against the TCP peer only: X-Forwarded-For is attacker
-            # supplied, so honouring it here would hand anyone a key-free gateway.
-            auth_cfg.allow_access_ip_whitelist = [r"^10\.1\.2\.3$"]
-            check(
-                "a spoofed X-Forwarded-For does not unlock the gateway",
-                client.get("/v1/models", headers={"X-Forwarded-For": "10.1.2.3"}).status_code == 401,
-                "the whitelist must not read X-Forwarded-For",
-            )
-            check(
-                "a spoofed X-Forwarded-For does not unlock /docs",
-                client.get("/docs", headers={"X-Forwarded-For": "10.1.2.3"}).status_code == 404,
-                "the docs gate must not read X-Forwarded-For",
-            )
-
-            auth_cfg.allow_access_ip_whitelist = ["^(["]
-            check(
-                "a malformed regex grants nothing",
-                client.get("/v1/models").status_code == 401 and client.get("/docs").status_code == 404,
-                "an invalid pattern must fail closed",
-            )
-        finally:
-            auth_cfg.allow_access_ip_whitelist = []
-
-        # --------- auth.trusted_networks: internal/outside split + console session ---
-        print("[16c] auth.trusted_networks / console session cookie")
+        # ------------------------------- console session cookie is an API credential ---
+        print("[16c] console session cookie / session lifecycle")
         from admin_auth import (
             ADMIN_COOKIE_NAME,
             _sign,
@@ -1074,57 +1298,22 @@ def main() -> int:
             session_ttl,
             verify_admin_token,
         )
-        from config import AuthConfig
-        from fastapi.testclient import TestClient as _TestClient
 
-        saved_auth = (
-            auth_cfg.enabled,
-            list(auth_cfg.allow_access_ip_whitelist),
-            list(auth_cfg.trusted_networks),
-            os.environ.get("ADMIN_PASSWORD"),
-        )
+        saved_pw = os.environ.get("ADMIN_PASSWORD")
+        # The single TestClient socket is the internal zone. Its allow_anonymous is false
+        # in this fixture, so every business call needs a key OR a valid console session.
+        os.environ["ADMIN_PASSWORD"] = "test-admin-password-123456"
+        pw = os.environ["ADMIN_PASSWORD"]
+        token = create_admin_token(pw)
         try:
-            try:
-                AuthConfig(trusted_networks=["not-a-network"])
-                check("invalid trusted_networks is rejected", False, "expected ValidationError")
-            except Exception:
-                check("invalid trusted_networks is rejected", True)
-
-            internal = _TestClient(client.app, client=("192.168.10.5", 41000))
-            external = _TestClient(client.app, client=("167.104.161.192", 41001))
-            no_key_bad = {"Authorization": "Bearer definitely-wrong"}
-            auth_cfg.allow_access_ip_whitelist = []
-            auth_cfg.trusted_networks = ["192.168.10.0/24"]
-            auth_cfg.enabled = False
-
-            check("internal /v1/models needs no key", internal.get("/v1/models").status_code == 200)
-            check("internal /v1/models ignores an invalid key",
-                  internal.get("/v1/models", headers=no_key_bad).status_code == 200)
-            check("internal /docs is visible", internal.get("/docs").status_code == 200)
-            check("external /v1/models needs a key", external.get("/v1/models").status_code == 401)
-            check("external /v1/models rejects an invalid key",
-                  external.get("/v1/models", headers=no_key_bad).status_code == 403)
-            check("external /docs stays hidden", external.get("/docs").status_code == 404)
-            check("a forged internal X-Forwarded-For does not unlock the API",
-                  external.get("/v1/models", headers={"X-Forwarded-For": "192.168.10.5"}).status_code == 401)
-            check("external /health stays anonymous", external.get("/health").status_code == 200)
-
-            auth_cfg.enabled = True
-            check("enabled=true: internal is still anonymous", internal.get("/v1/models").status_code == 200)
-            check("enabled=true: external still needs a key", external.get("/v1/models").status_code == 401)
-
-            # A console sign-in is a credential in its own right, from outside too.
-            os.environ["ADMIN_PASSWORD"] = "test-admin-password-123456"
-            pw = os.environ["ADMIN_PASSWORD"]
-            token = create_admin_token(pw)
-            check("a valid console session unlocks the API from outside",
-                  external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: token}).status_code == 200)
+            check("a valid console session unlocks the API",
+                  client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: token}).status_code == 200)
             check("a forged console session does not",
-                  external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: "1.deadbeef"}).status_code == 401)
+                  client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: "1.deadbeef"}).status_code == 401)
             past = int(__import__("time").time()) - 10
             expired = f"{past}.{_sign(str(past), pw)}"
             check("an expired console session does not",
-                  external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: expired}).status_code == 401)
+                  client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: expired}).status_code == 401)
             check("session_remaining reports a live session",
                   (session_remaining(token, pw) or 0) > session_ttl() // 2)
             check("a fresh session is not due for renewal", refresh_due(token, pw) is False)
@@ -1135,18 +1324,15 @@ def main() -> int:
             due_expiry = int(__import__("time").time()) + session_ttl() // 4
             due = f"{due_expiry}.{_sign(str(due_expiry), pw)}"
             check("a session past half its TTL is due for renewal", refresh_due(due, pw) is True)
-            renewed = external.get("/v1/models", cookies={ADMIN_COOKIE_NAME: due})
+            renewed = client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: due})
             check("middleware re-issues the session cookie",
                   renewed.cookies.get(ADMIN_COOKIE_NAME) not in (None, due),
                   str(renewed.cookies.get(ADMIN_COOKIE_NAME)))
         finally:
-            auth_cfg.enabled = saved_auth[0]
-            auth_cfg.allow_access_ip_whitelist = saved_auth[1]
-            auth_cfg.trusted_networks = saved_auth[2]
-            if saved_auth[3] is None:
+            if saved_pw is None:
                 os.environ.pop("ADMIN_PASSWORD", None)
             else:
-                os.environ["ADMIN_PASSWORD"] = saved_auth[3]
+                os.environ["ADMIN_PASSWORD"] = saved_pw
             os.environ.pop("ADMIN_SESSION_TTL", None)
 
         # ------------------------- OpenCode gateway upstream type + web search config ---
@@ -1309,7 +1495,10 @@ def run_e2e(client, headers) -> None:
 
     e2e_config = {
         "server": {"host": "127.0.0.1", "port": 8000, "log_level": "warning"},
-        "auth": {"enabled": True, "allow_anonymous_health": True},
+        "security": {
+            "internal": {"allow_anonymous": False, "expose_version": True, "expose_docs": True},
+            "public": {"port": None, "path_allowlist": {}},
+        },
         "upstreams": [
             {
                 "name": "real",
@@ -1327,7 +1516,6 @@ def run_e2e(client, headers) -> None:
             "normalize": True,
             "max_concurrency": 4,
         },
-        "security": {"fail_on_weak_keys": False},
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
         json.dump(e2e_config, fh)

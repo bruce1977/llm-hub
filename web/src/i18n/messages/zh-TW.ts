@@ -498,7 +498,7 @@ const zhTW: MessageSchema = {
     },
     introTitle: '功能介紹',
     intro:
-      '重排（Rerank）在初步召回之後，用模型對候選文件逐條評分並重新排序，提升問答、搜尋與 RAG 的命中品質。llm-hub 暴露 {endpoint}：傳入 {query} 與 {documents}，閘道把請求轉換成上游可執行的形式——產生式模型依對數機率評分（logprobs），或依向量餘弦相似度評分（embedding），再把分數正規化為 {score}，可用 {topN} 與 {returnDocuments} 控制輸出，評分方式可按模型覆蓋。',
+      '重排（Rerank）在初步召回之後，用模型對候選文件逐條評分並重新排序，提升問答、搜尋與 RAG 的命中品質。llm-hub 暴露 {endpoint}：傳入 {query} 與 {documents}，閘道把請求轉換成產生式重排模型可執行的形式，依對數機率評分並正規化為 {score}，可用 {topN} 與 {returnDocuments} 控制輸出。',
     config: {
       title: 'Rerank 設定',
     },
@@ -536,7 +536,7 @@ const zhTW: MessageSchema = {
     },
     docs: {
       responseNote: 'results[] 每項含 index / relevance_score',
-      note: 'rerank 由上游模型評分（logprobs 或 embedding），閘道負責協定轉換與結果正規化；失敗請求可在 Requests 頁依狀態篩選檢視。',
+      note: '重排分數由上游模型給出，閘道負責協定轉換與分數正規化；失敗請求可在 Requests 頁依狀態篩選檢視。',
     },
   },
 
@@ -675,7 +675,7 @@ const zhTW: MessageSchema = {
       },
       security: {
         title: '安全與配額',
-        desc: 'API Key 只來自環境變數、IP 白名單、方法與路徑白名單、限流、請求本體上限與安全回應標頭',
+        desc: '依監聽埠區分內外網雙區、外網強制 Key 並用方法+正則收斂路徑、Key 存 SQLite、限流、請求本體上限與安全回應標頭',
       },
       insights: {
         title: '請求明細與統計',
@@ -749,7 +749,7 @@ const zhTW: MessageSchema = {
     saveValidationFailed: '以下設定段驗證未通過',
     saveConfirmTitle: '確認覆蓋 config.yaml？',
     saveConfirmBody:
-      '這個動作會以「完整設定物件」覆蓋整個 config.yaml。本頁編輯的 4 個段（Upstream / Rerank / System One / Web Search）會被寫入；未在此頁開放的高級段（server / auth / security / aliases 等）將依目前檔案原樣保留，不會遺失。',
+      '這個動作會以「完整設定物件」覆蓋整個 config.yaml。本頁編輯的 4 個段（Upstream / Rerank / System One / Web Search）會被寫入；未在此頁開放的高級段（server / security / aliases 等）將依目前檔案原樣保留，不會遺失。',
     saveConfirmYes: '覆蓋儲存',
     addUpstream: '新增上游',
     noUpstreams: '尚無上游，點「新增上游」新增一個。',
@@ -805,7 +805,7 @@ const zhTW: MessageSchema = {
     intro: {
       title: '功能介紹',
       tag: 'overview',
-      body: 'API Key 是呼叫閘道時出示的憑證，儲存在 llmhub.db 的 api_keys 表裡。庫裡只存密鑰的 SHA-256 雜湊和一段遮罩，明文只在你點「產生密鑰」的那次彈出視窗裡出現一次，關閉之後就再也看不到；清單上看得到的是遮罩、描述和建立時間，隨時可以撤銷。環境變數與 .keys 檔案裡的舊密鑰只在表為空時匯入一次，之後一律以資料庫為準。',
+      body: 'API Key 是呼叫閘道時出示的憑證，儲存在 llmhub.db 的 api_keys 表裡。庫裡只存密鑰的 SHA-256 雜湊和一段遮罩，明文只在你點「產生密鑰」的那次彈出視窗裡出現一次，關閉之後就再也看不到；清單上看得到的是遮罩、描述和建立時間，隨時可以撤銷。密鑰只能在本頁簽發——環境變數、密鑰檔案、設定檔都無法注入；表為空就只是還沒簽發過。',
     },
     list: {
       title: '密鑰清單',
@@ -833,8 +833,8 @@ const zhTW: MessageSchema = {
       storedValue: 'SHA-256(明文) 與遮罩，不含明文',
       checked: '驗證方式',
       checkedValue: '請求時比對記憶體中的雜湊，不查詢資料庫',
-      seeded: '首次匯入',
-      seededValue: '環境變數與 .keys 只在表為空時匯入一次，之後以資料庫為準',
+      seeded: '金鑰來源',
+      seededValue: '只能在本頁簽發，環境變數與 config.yaml 都無法注入',
     },
     modal: {
       title: '新建 API Key',

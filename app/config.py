@@ -32,72 +32,151 @@ CONFIG_PATH = os.getenv("CONFIG_PATH", "/data/config.yaml")
 #: keeps working: it is loaded (with a warning) instead of being replaced by a fresh template.
 LEGACY_CONFIG_NAME = "config.json"
 
-
-#: Environment variables that provide API keys without writing them into config.yaml
-ENV_API_KEYS = "GATEWAY_API_KEYS"
-ENV_API_KEYS_FILE = "GATEWAY_API_KEYS_FILE"
-
-#: Environment variable to disable authentication entirely (e.g. GATEWAY_AUTH_DISABLED=true)
-ENV_AUTH_DISABLED = "GATEWAY_AUTH_DISABLED"
-
-#: API keys are configured by the environment only: inline `GATEWAY_API_KEYS`, or
-#: `GATEWAY_API_KEYS_FILE` pointing at a mounted secret file (`data/.keys`). They live in this
-#: module-level store instead of on `AuthConfig`, so config.yaml - which gets committed, pasted
-#: into issues and read by the console - can neither carry nor revive a credential.
-_runtime_api_keys: list[str] = []
-
-
-def set_api_keys(keys: list[str]) -> None:
-    """Replace the runtime key list; called once per config load."""
-    global _runtime_api_keys
-    _runtime_api_keys = list(keys)
+# --------------------------------------------------------------------------- #
+# Guards for config-controlled outbound destinations and credential names.
+#
+# A caller who can write config.yaml could otherwise point `api_key_env` at
+# ADMIN_PASSWORD and have the gateway mail that value to a host of their choosing
+# as an Authorization header. Note that RFC1918 / loopback
+# addresses are **allowed**: routing to local Ollama / LM Studio instances is the
+# whole point of this gateway. What is refused are non-HTTP schemes and the cloud
+# metadata endpoints that are never a legitimate inference backend.
+# --------------------------------------------------------------------------- #
+_KEY_ENV_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*_(?:API_KEY|API_TOKEN)$")
+_METADATA_HOSTS = {
+    "metadata",
+    "metadata.google.internal",
+    "169.254.169.254",
+    "100.100.100.200",
+}
 
 
-def get_api_keys() -> list[str]:
-    """The keys collected from the environment by the last config load."""
-    return _runtime_api_keys
+def validate_key_env(name: str) -> str:
+    """Only provider-key variable names may be read from the process environment."""
+    if not name:
+        return name  # "" = unsigned upstream (websearch default)
+    if not _KEY_ENV_PATTERN.fullmatch(name):
+        raise ValueError(
+            f"api_key_env {name!r} must be a provider key name (uppercase, ending in "
+            "_API_KEY / _API_TOKEN); pointing it at ADMIN_PASSWORD would leak the console "
+            "password to the upstream"
+        )
+    return name
 
 
-def default_keys_file() -> Path:
-    """The implicit key file: `.keys` next to config.yaml (e.g. /config/.keys, /data/.keys).
+def validate_service_url(url: str) -> str:
+    """Reject schemes and metadata targets that must never be an outbound backend."""
+    from urllib.parse import urlsplit
 
-    Resolved from the *current* CONFIG_PATH environment value rather than the module
-    constant, so a test or launcher that repoints CONFIG_PATH also repoints the secret.
+    parsed = urlsplit(str(url).strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"URL {url!r} must use http or https")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError(f"URL {url!r} has no host")
+    if host in _METADATA_HOSTS or "169.254." in host:
+        raise ValueError(f"URL {url!r} points at a cloud metadata endpoint")
+    if parsed.username or parsed.password:
+        raise ValueError(f"URL {url!r} must not embed credentials")
+    return str(url).strip()
+
+
+#: Listener selection and zone policy live ONLY in config.yaml now (server.port and
+#: security.public.port). These names are kept so a stale deployment can be warned
+#: about instead of silently ignoring a port an operator thought they had opened.
+LEGACY_LISTENER_ENV = (
+    "LLMHUB_PORT",
+    "LLMHUB_PUBLIC_PORTS",
+    "LLMHUB_PUBLIC_PORT",
+    "LLMHUB_PUBLIC_ADMIN",
+    "LLMHUB_HOST",
+    "LLMHUB_LOG_LEVEL",
+    "GATEWAY_AUTH_DISABLED",
+)
+
+#: HTTP verbs accepted as keys of `security.public.path_allowlist`. A method that is
+#: absent from the mapping is simply not served on the public listener (404).
+HTTP_METHOD_NAMES = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+
+#: Ready-made public surface. The *config file* is authoritative - this only seeds a
+#: fresh config.yaml so opening a public listener is useful out of the box. Narrow it
+#: in `security.public.path_allowlist` to the endpoints you actually expose.
+DEFAULT_PUBLIC_PATHS: dict[str, list[str]] = {
+    "GET": [r"^/v1/models$"],
+    "POST": [
+        r"^/v1/chat/completions$",
+        r"^/v1/messages$",
+        r"^/api/generate$",
+        r"^/api/chat$",
+    ],
+}
+
+def apply_legacy_listener_env(raw: dict[str, Any]) -> dict[str, Any]:
+    """Map the pre-1.3 listener env vars onto the new config tree, with warnings.
+
+    ``config.yaml`` is now the single source of truth for ports and zones. An upgrade
+    must not silently close a port an operator believes is public, though, so the
+    legacy variables are read *once per load* only to fill gaps the file left open.
+    Explicit values in config.yaml always win. Everything else in
+    :data:`LEGACY_LISTENER_ENV` is ignored with a warning - notably
+    ``LLMHUB_PUBLIC_ADMIN`` (the console is internal-only now) and ``LLMHUB_PORT``
+    (the internal port comes from ``server.port``).
     """
-    return Path(os.getenv("CONFIG_PATH", CONFIG_PATH)).parent / ".keys"
+    present = [name for name in LEGACY_LISTENER_ENV if os.getenv(name, "").strip()]
+    if not present:
+        return raw
+    logger.warning(
+        "Legacy listener environment variable(s) %s: ports and zone policy now live in "
+        "config.yaml (server.port / security.public.port). Remove them from the environment; "
+        "they are honoured only as a one-time migration hint and explicit config wins.",
+        ", ".join(present),
+    )
 
+    raw = dict(raw)
+    sec = dict(raw.get("security") or {})
+    public = dict(sec.get("public") or {})
+    internal = dict(sec.get("internal") or {})
 
-def collect_env_api_keys() -> list[str]:
-    """Collect API keys from the environment.
+    legacy_ports = (
+        os.getenv("LLMHUB_PUBLIC_PORTS", "").strip()
+        or os.getenv("LLMHUB_PUBLIC_PORT", "").strip()
+    )
+    if legacy_ports and public.get("port") is None:
+        tokens = [t.strip() for t in legacy_ports.replace(";", ",").split(",") if t.strip()]
+        valid = [int(t) for t in tokens if t.isdigit() and 1 <= int(t) <= 65535]
+        if valid:
+            public["port"] = valid[0]
+            logger.warning(
+                "Migrating legacy public listener port %d into security.public.port; write it "
+                "into config.yaml and delete the environment variable",
+                valid[0],
+            )
+            if len(valid) > 1:
+                logger.warning(
+                    "Legacy %s listed %d ports; only the first (%d) is supported now. "
+                    "A two-listener layout needs one internal and one public port.",
+                    "LLMHUB_PUBLIC_PORTS",
+                    len(valid),
+                    valid[0],
+                )
+        else:
+            logger.warning("Ignoring unparseable legacy public port value %r", legacy_ports)
 
-    Three sources are supported (they may be combined):
-      - GATEWAY_API_KEYS      inline value, comma/newline/space separated
-      - GATEWAY_API_KEYS_FILE path to a file holding the keys (Docker/Kubernetes secrets
-                              are mounted as files, which keeps them out of `docker inspect`)
-      - `.keys` beside config.yaml, read automatically when GATEWAY_API_KEYS_FILE is unset,
-        so a deployment only has to mount `/config/.keys` (or `/data/.keys`) - no extra
-        environment variable. An explicitly set GATEWAY_API_KEYS_FILE always wins.
-    """
-    collected: list[str] = []
+    disabled = os.getenv("GATEWAY_AUTH_DISABLED", "").strip().lower() in ("true", "1", "yes")
+    if disabled and "allow_anonymous" not in internal:
+        internal["allow_anonymous"] = True
+        logger.warning(
+            "Migrating GATEWAY_AUTH_DISABLED=true into security.internal.allow_anonymous=true; "
+            "the public zone still requires a key and cannot be disabled"
+        )
 
-    inline = os.getenv(ENV_API_KEYS, "").strip()
-    if inline:
-        collected.extend(p.strip() for p in re.split(r"[\s,]+", inline) if p.strip())
-
-    key_file = os.getenv(ENV_API_KEYS_FILE, "").strip()
-    if not key_file:
-        implicit = default_keys_file()
-        if implicit.is_file():
-            key_file = str(implicit)
-    if key_file:
-        try:
-            content = Path(key_file).read_text(encoding="utf-8")
-            collected.extend(p.strip() for p in re.split(r"[\s,]+", content) if p.strip())
-            logger.info("Loaded API key(s) from %s", key_file)
-        except OSError as exc:
-            logger.error("Failed to read %s=%s: %s", ENV_API_KEYS_FILE, key_file, exc)
-
-    return collected
+    if public:
+        sec["public"] = public
+    if internal:
+        sec["internal"] = internal
+    if sec:
+        raw["security"] = sec
+    return raw
 
 
 # Qwen3-Reranker official prompt template (yes/no binary scoring)
@@ -128,6 +207,14 @@ DEFAULT_RERANK_INSTRUCTION = (
 # Configuration models
 # --------------------------------------------------------------------------- #
 class ServerConfig(BaseModel):
+    """Base listener settings. This is the only place a port is configured.
+
+    ``port`` is the internal (trusted) listener. The internet-facing listener, if
+    any, is ``security.public.port``. Matching the two values makes a public-only
+    instance. No `LLMHUB_PORT` / `LLMHUB_PUBLIC_PORTS` environment override exists
+    any more: a socket that serves untrusted traffic must be visible in config.yaml.
+    """
+
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
@@ -136,66 +223,167 @@ class ServerConfig(BaseModel):
     upstream_keepalive_expiry: float = 30.0
 
 
-class AuthConfig(BaseModel):
-    """Caller authentication. Keys are never configured here - see ENV_API_KEYS above."""
+class InternalSecurityConfig(BaseModel):
+    """Policy for the trusted ``server.port`` listener.
 
-    enabled: bool = True
-    allow_anonymous_health: bool = True
-    # Regexes for client addresses that may open /docs and are exempt from the API-key check.
-    # Matched against the TCP peer, deliberately not X-Forwarded-For: any client can put an
-    # arbitrary address in that header, and honouring it here would be a key bypass.
-    allow_access_ip_whitelist: list[str] = Field(default_factory=list)
-    # CIDR blocks (or single IPs) that count as the trusted internal network.
-    # Declaring at least one turns `enabled: false` into an internal/outside split:
-    # only these networks stay anonymous, every other client still needs a valid
-    # key. Empty keeps the legacy behaviour (fully anonymous while auth is off);
-    # the startup self-check warns loudly in that case.
-    trusted_networks: list[str] = Field(default_factory=list)
+    The kernel-assigned local port is the trust anchor: a request that arrived on
+    ``server.port`` and NOT on ``security.public.port`` is on the LAN zone. There is
+    no IP / X-Forwarded-For allowlist to configure here - a header can be forged,
+    and one socket cannot be both trusted and untrusted.
+    """
 
-    @field_validator("trusted_networks")
+    allow_anonymous: bool = True
+    # Anonymous `GET /` still answers {"name": ...}; opt in to also carrying the build.
+    expose_version: bool = True
+    # Interactive docs and their vendored Swagger assets are an internal-only
+    # convenience. The public zone can never reach them (404 via path_allowlist).
+    expose_docs: bool = True
+
+
+class PublicSecurityConfig(BaseModel):
+    """Policy for the internet-facing listener.
+
+    ``port`` is the *only* switch that opens a public listener. Setting it equal to
+    ``server.port`` makes this a public-only instance (one socket, untrusted zone);
+    setting it to a different port gives a two-listener internal + public layout;
+    leaving it null means no public listener at all.
+
+    Every request on this listener needs a valid caller key or console session, and
+    only method+path pairs listed in ``path_allowlist`` exist here - everything else
+    returns 404 *before* routing. The *config file* is the complete source of the
+    public surface; no code-level hidden-path list complements it. There is
+    deliberately no `require_api_key` toggle: key enforcement is not configurable
+    away on the public zone.
+
+    ``admin_endpoints`` is public-only and governs the whole management plane there:
+    Ollama's own model API (`api/pull`, `api/push`, `api/create`, `api/delete`,
+    `api/copy`, `api/blobs/*`) **and** the console (`/admin`) plus `/v1/management/*`.
+    The internal listener is a trusted LAN socket where pulling a model or opening
+    the console is a normal operation, so nothing is blocked there:
+
+      "deny"     (default) - admin calls, the console and `/v1/management/*` are 404
+      "readonly" - `pull` (model download) passes the admin filter, the rest is 404
+      "allow"    - every admin call is forwarded untouched, `api/blobs/*` included,
+                   and the management plane opens: `/admin` and `/v1/management/*`
+                   stop being 404 and are routed to their real handlers
+
+    For Ollama's endpoints no mode opens a path on its own: the request has to
+    survive ``path_allowlist`` first, so `pull` needs ``readonly`` **or** ``allow``
+    *and* a ``POST: [^/api/pull$]`` entry; changing the mode while the path stays
+    unlisted changes nothing (the 404 comes from the allowlist).
+
+    The management plane is the opposite kind of rule - a prefix, not an entry - so
+    ``allow`` opens it as a unit and ``path_allowlist`` is not consulted. That is
+    deliberate: an operator asking for a remote console would otherwise have to
+    enumerate every `/admin/assets/*` file in a regex. It is still never anonymous.
+    Only the console shell (a static SPA holding no data) and
+    ``POST /v1/management/auth/login`` (where the session cookie is obtained) skip
+    the credential check; every other management route keeps requiring that cookie,
+    and a gateway API key is never an admin credential.
+    """
+
+    port: int | None = None
+    path_allowlist: dict[str, list[str]] = Field(
+        default_factory=lambda: {verb: list(patterns) for verb, patterns in DEFAULT_PUBLIC_PATHS.items()}
+    )
+    admin_endpoints: Literal["deny", "readonly", "allow"] = "deny"
+
+    @field_validator("port")
     @classmethod
-    def _validate_networks(cls, networks: list[str]) -> list[str]:
-        for cidr in networks:
-            try:
-                ipaddress.ip_network(cidr, strict=False)
-            except ValueError as exc:
+    def _check_port(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool) or not (1 <= value <= 65535):
+            raise ValueError("security.public.port must be a TCP port in 1..65535 or null")
+        return value
+
+    @field_validator("path_allowlist", mode="before")
+    @classmethod
+    def _normalise_allowlist(cls, value: Any) -> Any:
+        """Upper-case the verb keys and keep only syntactically valid regexes.
+
+        An invalid regex is dropped with a warning rather than aborting config load:
+        with a whitelist, dropping a rule can only *narrow* the public surface.
+        """
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            return value  # let pydantic produce the type error
+        out: dict[str, list[str]] = {}
+        for method, patterns in value.items():
+            verb = str(method).strip().upper()
+            if verb not in HTTP_METHOD_NAMES:
                 raise ValueError(
-                    f"auth.trusted_networks entry {cidr!r} is not a valid IPv4/IPv6 CIDR: {exc}"
-                ) from exc
-        return networks
+                    f"security.public.path_allowlist: {method!r} is not an HTTP method "
+                    f"({', '.join(sorted(HTTP_METHOD_NAMES))})"
+                )
+            if isinstance(patterns, str):
+                patterns = [patterns]
+            if not isinstance(patterns, (list, tuple)):
+                raise ValueError(f"security.public.path_allowlist[{verb}] must be a list of regex strings")
+            kept: list[str] = []
+            for pat in patterns:
+                if not isinstance(pat, str):
+                    raise ValueError(f"security.public.path_allowlist[{verb}] contains a non-string pattern")
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    logger.warning("Ignoring invalid public path_allowlist regex %r for %s: %s", pat, verb, exc)
+                    continue
+                kept.append(pat)
+            out[verb] = kept
+        return out
 
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_legacy_api_keys(cls, data: Any) -> Any:
-        if isinstance(data, dict) and "api_keys" in data:
-            logger.warning(
-                "auth.api_keys no longer exists - %d key(s) in config.yaml are ignored; "
-                "supply keys through %s / %s (the .keys file) instead",
-                len(data["api_keys"] or []),
-                ENV_API_KEYS,
-                ENV_API_KEYS_FILE,
-            )
-            data = {k: v for k, v in data.items() if k != "api_keys"}
+    _compiled_cache: ClassVar[dict[tuple[str, tuple[str, ...]], tuple[re.Pattern, ...]]] = {}
 
-        if isinstance(data, dict):
-            # Pydantic ignores unknown fields by default, so the common misspelling
-            # "whilelist" would silently leave the whitelist empty (/docs 404, no key
-            # bypass) without any error. Accept it, warn, and normalise to the real name.
-            for typo in ("allow_access_ip_whilelist", "allow_ip_whitelist"):
-                if typo in data:
-                    value = data.pop(typo)
-                    logger.warning(
-                        "auth.%s is not a field - read as auth.allow_access_ip_whitelist; "
-                        "please rename it in config.yaml",
-                        typo,
-                    )
-                    data.setdefault("allow_access_ip_whitelist", value)
-        return data
+    def allows(self, method: str, path: str) -> bool:
+        """True when ``path`` fullmatches one of the regexes for ``method``.
 
-    @property
-    def api_keys(self) -> list[str]:
-        """Keys collected from the environment by the last load; unreadable from config.yaml."""
-        return _runtime_api_keys
+        Full match only - a prefix rule like `^/v1/` would otherwise admit
+        `/v1/../../api/delete` (the catch-all normalises dot segments upstream).
+        """
+        verb = method.upper()
+        patterns = tuple(self.path_allowlist.get(verb, ()))
+        if not patterns:
+            return False
+        key = (verb, patterns)
+        compiled = self._compiled_cache.get(key)
+        if compiled is None:
+            compiled = tuple(re.compile(p) for p in patterns)
+            self._compiled_cache[key] = compiled
+        return any(rx.fullmatch(path) for rx in compiled)
+
+    def visible_paths(self) -> list[str]:
+        """Stable, log-friendly rendering of the configured public surface."""
+        return [f"{verb} {pat}" for verb in sorted(self.path_allowlist) for pat in self.path_allowlist[verb]]
+
+    # Ollama management endpoints that are unsafe to forward on an untrusted listener.
+    ADMIN_DESTRUCTIVE: ClassVar[set] = {"api/delete", "api/copy", "api/create", "api/push"}
+    ADMIN_DISK_FILL: ClassVar[set] = {"api/pull"}  # downloads models -> can fill the disk
+    ADMIN_BLOBS: ClassVar[set] = {"api/blobs"}  # blob upload / delete
+
+    def blocked_admin_paths(self) -> set:
+        if self.admin_endpoints == "allow":
+            return set()
+        blocked = set(self.ADMIN_DESTRUCTIVE) | set(self.ADMIN_BLOBS)
+        if self.admin_endpoints == "deny":
+            blocked |= set(self.ADMIN_DISK_FILL)
+        return blocked
+
+    def reachable_admin_paths(self) -> list[str]:
+        """Admin endpoints that survive BOTH the mode and the allowlist.
+
+        ``admin_endpoints`` never opens a path by itself - ``path_allowlist`` is the
+        surface, so ``allow`` with no matching ``POST`` rule leaves every admin endpoint
+        at 404 and looks like the setting "does nothing". This is what the startup log
+        reports, so that confusion is answered by the log instead of by a bare 404.
+        """
+        blocked = self.blocked_admin_paths()
+        names = ["api/pull", "api/push", "api/create", "api/delete", "api/copy"]
+        reachable = [n for n in names if n not in blocked and self.allows("POST", "/" + n)]
+        if "api/blobs" not in blocked and self.allows("POST", "/api/blobs/<digest>"):
+            reachable.append("api/blobs/*")
+        return reachable
 
 
 class RoutingConfig(BaseModel):
@@ -230,6 +418,11 @@ class UpstreamConfig(BaseModel):
     # Scheduling priority used when the SAME model is declared by several upstreams.
     # The lowest value wins; ties keep the order in which upstreams are listed.
     priority: int = 0
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_base_url(cls, value: str) -> str:
+        return validate_service_url(value)
 
     def base_url_stripped(self) -> str:
         return self.base_url.rstrip("/")
@@ -363,7 +556,7 @@ class SystemOneConfig(BaseModel):
 
     Two kinds of backend serve that path: a laya-server deployment, and Ollama 0.40+,
     which exposes it natively. llm-hub authenticates the *caller* with its own API key
-    (cfg.auth.api_keys, sourced from `.env` / GATEWAY_API_KEYS - the `.keys` config), then
+    (minted at /admin -> API keys and hashed into the SQLite api_keys table), then
     forwards to `backend` and signs that call with the key read from the environment
     variable named by `api_key_env` (default SYSTEMONE_SERVER_API_KEY), so the backend key
     never has to live in config.yaml. A backend that needs no credential just ignores it.
@@ -387,6 +580,16 @@ class SystemOneConfig(BaseModel):
     # Endpoint path on the System One backend.
     path: str = "v1/systemone"
     timeout: float = 60.0
+
+    @field_validator("backend")
+    @classmethod
+    def _check_backend(cls, value: str) -> str:
+        return validate_service_url(value)
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _check_key_env(cls, value: str) -> str:
+        return validate_key_env(value)
 
 
 class WebSearchConfig(BaseModel):
@@ -414,6 +617,11 @@ class WebSearchConfig(BaseModel):
     # Name of the environment variable holding the provider API key; "" = no signing.
     api_key_env: str = ""
     timeout: float = 60.0
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _check_key_env(cls, value: str) -> str:
+        return validate_key_env(value)
 
 
 class ApiModelsConfig(BaseModel):
@@ -474,57 +682,129 @@ class RateLimitConfig(BaseModel):
 
 
 class SecurityConfig(BaseModel):
-    """Public-facing hardening. All Ollama model-management endpoints are blocked by default.
+    """One security tree for BOTH listeners, split into ``internal`` and ``public``.
 
-    admin_endpoints:
-      "deny"     (default) - block pull/push/create/delete/copy and blob up/downloads
-      "readonly" - block delete/copy/push/create and blobs (still allow `pull` to fetch models)
-      "allow"    - forward everything (only for trusted internal networks)
+    Everything that is not zone-specific stays here as a common hardening base.
+    Ollama's model-management blocklist is **not** here: it lives in
+    ``security.public.admin_endpoints`` and is only enforced on the public
+    listener, because pulling a model is a normal operation on a trusted LAN.
 
-    allowed_http_methods:
-      only these verbs are served; anything else (PUT/PATCH/DELETE/HEAD/TRACE/OPTIONS)
-      is rejected with 405. Defaults to GET/POST - that is all an LLM gateway needs.
-
-    path_allowlist:
-      regex perimeter control - when non-empty, a request path must match at least one
-      pattern or it is rejected with 403. Empty = allow every path (disabled).
-
-    rate_limit:
-      optional in-memory token-bucket limiter to blunt brute-force / DoS.
+    ``internal`` controls the trusted ``server.port`` listener; ``public`` controls the
+    internet-facing ``security.public.port`` listener. Authentication is *not* a
+    toggle any more: the public zone always requires a key or console session and
+    serves only the method+path pairs in ``public.path_allowlist``. The former
+    ``auth`` node, ``allowed_http_methods``, global ``path_allowlist``,
+    ``allow_anonymous_health``, ``expose_health_details`` and IP trust anchors have
+    been removed - see ``_migrate_legacy_security`` below for the upgrade mapping.
     """
 
-    admin_endpoints: Literal["deny", "readonly", "allow"] = "deny"
+    internal: InternalSecurityConfig = Field(default_factory=InternalSecurityConfig)
+    public: PublicSecurityConfig = Field(default_factory=PublicSecurityConfig)
+
     blocked_paths: list[str] = Field(default_factory=list)
     cors_origins: list[str] = Field(default_factory=list)
     max_body_bytes: int = 32 * 1024 * 1024
     allow_query_api_key: bool = False
-    # Legacy: /health answers {"ok": true} only, so nothing reads this any more.
-    expose_health_details: bool = False
-    fail_on_weak_keys: bool = True
     allowed_client_ips: list[str] = Field(default_factory=list)
-    # Only these HTTP methods are accepted; everything else returns 405.
-    allowed_http_methods: list[str] = Field(default_factory=lambda: ["GET", "POST"])
-    # Regex path allowlist (perimeter control). Empty = allow all paths (disabled).
-    path_allowlist: list[str] = Field(default_factory=list)
+    # CIDR list of reverse proxies whose X-Forwarded-For may be trusted for IP
+    # fencing, rate-limit buckets and request-log audit rows. This is NOT a zone
+    # anchor: with proxy_headers=False, an undeclared proxy is simply untrusted.
+    trusted_proxies: list[str] = Field(default_factory=list)
     # In-memory token-bucket rate limiter (DoS / brute-force mitigation).
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
 
-    # Ollama management endpoints that are unsafe to expose on a public gateway.
-    ADMIN_DESTRUCTIVE: ClassVar[set] = {"api/delete", "api/copy", "api/create", "api/push"}
-    ADMIN_DISK_FILL: ClassVar[set] = {"api/pull"}  # downloads models -> can fill the disk
-    ADMIN_BLOBS: ClassVar[set] = {"api/blobs"}  # blob upload / delete
+    @field_validator("allowed_client_ips", "trusted_proxies")
+    @classmethod
+    def _validate_cidrs(cls, values: list[str]) -> list[str]:
+        for entry in values:
+            try:
+                ipaddress.ip_network(entry, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"security CIDR entry {entry!r} is invalid: {exc}") from exc
+        return values
 
-    def blocked_admin_paths(self) -> set:
-        if self.admin_endpoints == "allow":
-            return set()
-        blocked = set(self.ADMIN_DESTRUCTIVE) | set(self.ADMIN_BLOBS)
-        if self.admin_endpoints == "deny":
-            blocked |= set(self.ADMIN_DISK_FILL)
-        return blocked
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_security(cls, data: Any) -> Any:
+        """Translate the pre-1.3 flat security fields into the two-zone tree.
 
-    def is_path_blocked(self, path_clean: str) -> bool:
-        if path_clean in self.blocked_admin_paths() or path_clean.startswith("api/blobs"):
-            return True
+        Old ``path_allowlist`` was a global list of regexes with no verb information.
+        It is mapped onto every verb from old ``allowed_http_methods`` (default
+        GET/POST) so a restrictive deployment does not silently widen on upgrade.
+        If the new ``public.path_allowlist`` is present it always wins.
+        """
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        legacy_methods = data.pop("allowed_http_methods", None)
+        legacy_paths = data.pop("path_allowlist", None)
+        legacy_version = data.pop("expose_version", None)
+        legacy_admin = data.pop("admin_endpoints", None)
+        had_health_details = "expose_health_details" in data
+        data.pop("expose_health_details", None)
+
+        dropped = []
+        if had_health_details:
+            dropped.append("expose_health_details (no-op)")
+        if legacy_methods is not None:
+            dropped.append("allowed_http_methods (now public.path_allowlist keys)")
+        if legacy_paths is not None:
+            dropped.append("path_allowlist (now public.path_allowlist values)")
+        if legacy_version is not None:
+            dropped.append("expose_version (now internal.expose_version)")
+        if legacy_admin is not None:
+            dropped.append("admin_endpoints (now public.admin_endpoints)")
+        if dropped:
+            logger.warning(
+                "Legacy security field(s) migrated/ignored: %s. Update config.yaml to the "
+                "security.internal / security.public structure",
+                "; ".join(dropped),
+            )
+
+        internal = dict(data.get("internal") or {})
+        if legacy_version is not None and "expose_version" not in internal:
+            internal["expose_version"] = bool(legacy_version)
+        if internal:
+            data["internal"] = internal
+
+        public = dict(data.get("public") or {})
+        if legacy_admin is not None and "admin_endpoints" not in public:
+            public["admin_endpoints"] = legacy_admin
+        if legacy_paths and "path_allowlist" not in public:
+            verbs = [str(v).strip().upper() for v in (legacy_methods or ["GET", "POST"])]
+            mapped = {v: list(legacy_paths) for v in verbs if v in HTTP_METHOD_NAMES}
+            if mapped:
+                public["path_allowlist"] = mapped
+                logger.warning(
+                    "Migrated legacy global path_allowlist (%d pattern(s)) to "
+                    "security.public.path_allowlist for verbs %s; verify this is the "
+                    "public surface you want",
+                    len(legacy_paths),
+                    ", ".join(sorted(mapped)),
+                )
+        if public:
+            data["public"] = public
+        return data
+
+    # Ollama management endpoints are blocked on the PUBLIC zone only
+    # (``security.public.admin_endpoints``); see ``is_path_blocked``.
+
+    def is_path_blocked(self, path_clean: str, public: bool = True) -> bool:
+        """Whether the proxy must refuse this path.
+
+        ``public`` selects the zone: the Ollama admin blocklist is applied only to
+        the untrusted listener (the default, so a caller that forgets the flag stays
+        fail-closed). ``blocked_paths`` is an explicit operator deny-list and applies
+        everywhere.
+
+        ``api/blobs/<digest>`` is a prefix, not a literal name, so it is matched
+        separately - but only when the mode actually blocks blobs, so
+        ``admin_endpoints: allow`` really forwards every admin call.
+        """
+        if public:
+            blocked = self.public.blocked_admin_paths()
+            if path_clean in blocked or ("api/blobs" in blocked and path_clean.startswith("api/blobs")):
+                return True
         for pat in self.blocked_paths:
             p = pat.strip("/")
             if p == path_clean or (p.endswith("*") and path_clean.startswith(p[:-1])):
@@ -534,7 +814,6 @@ class SecurityConfig(BaseModel):
 
 class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
-    auth: AuthConfig = Field(default_factory=AuthConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     upstreams: list[UpstreamConfig] = Field(default_factory=list)
     default_upstream: str | None = None
@@ -554,6 +833,94 @@ class Config(BaseModel):
 
     # Names generated by `_expand_upstream_aliases` below; never read from config.yaml.
     _renamed_alias_names: set[str] = PrivateAttr(default_factory=set)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_auth_node(cls, data: Any) -> Any:
+        """Fold the removed top-level ``auth`` node into ``security.internal``.
+
+        ``auth.enabled: true`` meant "callers need a key" on the only listener that
+        existed. That is no longer the axis: the public listener is keyed
+        unconditionally, so ``auth.enabled`` only decides whether the *LAN* socket is
+        keyed, and only when no ``security.public.port`` exists (a single, possibly
+        internet-exposed socket stays fail-closed). With a public listener configured
+        the LAN socket goes back to anonymous - the whole point of splitting the
+        zones. An explicit ``security.internal.allow_anonymous`` always wins.
+
+        The IP whitelists and ``allow_anonymous_health`` are dropped: the zone is now
+        decided by the listening socket, and liveness probes follow the same zone rule
+        as every other path. A stale ``auth.api_keys`` list never reaches the key
+        store; keys live in the SQLite ``api_keys`` table.
+        """
+        if not isinstance(data, dict) or "auth" not in data:
+            return data
+        data = dict(data)
+        auth = data.pop("auth")
+        if not isinstance(auth, dict):
+            logger.warning("Top-level auth is not a mapping - ignoring it; use security.internal / security.public")
+            return data
+
+        sec = dict(data.get("security") or {})
+        internal = dict(sec.get("internal") or {})
+        if "enabled" in auth and "allow_anonymous" not in internal:
+            # Legacy `auth.enabled: true` locked the only listener that existed. The
+            # internet-facing side is now keyed by definition, so what is left to decide
+            # is the LAN socket:
+            #   * a public listener is configured -> the old intent is already covered
+            #     there, and the LAN socket goes back to being key-free (the point of
+            #     having two zones);
+            #   * no public listener -> this single socket may still face the internet,
+            #     so stay fail-closed and keep it keyed.
+            public_raw = sec.get("public") or {}
+            public_port = (
+                public_raw.get("port")
+                if isinstance(public_raw, dict)
+                else getattr(public_raw, "port", None)
+            )
+            keyed = bool(auth["enabled"]) and public_port is None
+            internal["allow_anonymous"] = not keyed
+            if keyed:
+                logger.warning(
+                    "Migrating auth.enabled=true to security.internal.allow_anonymous=false: "
+                    "no security.public.port is configured, so this single socket may still be "
+                    "reachable from the internet. For a key-free LAN listener plus a keyed "
+                    "internet listener, set security.public.port to a second port and "
+                    "security.internal.allow_anonymous: true"
+                )
+            else:
+                logger.warning(
+                    "Legacy auth.enabled=%s is obsolete: security.public.port=%s already "
+                    "requires a key on every request, so security.internal.allow_anonymous "
+                    "defaults to true for the LAN socket. Set it explicitly if you want the "
+                    "LAN keyed as well",
+                    auth["enabled"],
+                    public_port,
+                )
+        for key in ("allow_anonymous_health", "trusted_networks", "allow_access_ip_whitelist",
+                    "allow_access_ip_whilelist", "allow_ip_whitelist", "api_keys"):
+            if key in auth:
+                logger.warning(
+                    "auth.%s is no longer supported and is ignored: trust zones are decided "
+                    "by server.port / security.public.port, keys live in the SQLite api_keys table",
+                    key,
+                )
+        if internal:
+            sec["internal"] = internal
+        data["security"] = sec
+        return data
+
+    def public_ports(self) -> frozenset[int]:
+        """Sockets that serve untrusted traffic (empty = no public listener)."""
+        port = self.security.public.port
+        return frozenset({port}) if port is not None else frozenset()
+
+    def listen_ports(self) -> list[int]:
+        """Every distinct TCP port ``serve.py`` must bind, internal first."""
+        ports = [self.server.port]
+        public = self.security.public.port
+        if public is not None and public not in ports:
+            ports.append(public)
+        return ports
 
     @model_validator(mode="after")
     def _expand_upstream_aliases(self) -> Config:
@@ -659,7 +1026,10 @@ class Config(BaseModel):
             )
 
         upstream = self.find_upstream_for_model(model)
-        if upstream is None and not self.routing.strict:
+        # `routing.strict` refuses to guess a *named* model; an empty name is not a guess
+        # but the "no model in this body" case (GETs and the Ollama admin calls, which
+        # carry `name`), so those always land on the default upstream.
+        if upstream is None and (not self.routing.strict or not model):
             upstream = self.default_upstream_obj()
         return ResolvedTarget(
             requested=model,
@@ -737,16 +1107,6 @@ def build_default_config() -> dict[str, Any]:
             "request_timeout": 600.0,
             "max_concurrency": 64,
         },
-        "auth": {
-            # Keys are not configurable here: provide them through the GATEWAY_API_KEYS env var
-            # or GATEWAY_API_KEYS_FILE (data/.keys), so secrets never live in config.yaml.
-            "enabled": True,
-            "allow_anonymous_health": True,
-            # Regexes for addresses that may open /docs and skip the API-key check.
-            "allow_access_ip_whitelist": [],
-            # CIDR blocks of the trusted internal network (empty = legacy behaviour).
-            "trusted_networks": [],
-        },
         "routing": {"strict": False},
         "upstreams": [
             {
@@ -801,7 +1161,7 @@ def build_default_config() -> dict[str, Any]:
         "systemone": {
             # Proxy for the System One decision API (laya-server, or Ollama 0.40+ which
             # exposes /v1/systemone natively and needs a real model name instead of "auto").
-            # The caller authenticates with the gateway's own API key (GATEWAY_API_KEYS);
+            # The caller authenticates with a gateway API key (minted at /admin);
             # the gateway then forwards to `backend` using the key from `api_key_env`.
             "enabled": False,
             "backend": "http://127.0.0.1:8080",
@@ -812,7 +1172,7 @@ def build_default_config() -> dict[str, Any]:
         },
         "websearch": {
             # Web search served by an OpenCode API Gateway upstream (see `upstreams`).
-            # The caller authenticates with the gateway's own API key (GATEWAY_API_KEYS);
+            # The caller authenticates with a gateway API key (minted at /admin);
             # the provider address comes from the selected upstream's `base_url`.
             "enabled": False,
             "upstream": "",
@@ -834,6 +1194,33 @@ def build_default_config() -> dict[str, Any]:
             "systemone": [],
             "websearch": [],
         },
+        "security": {
+            "internal": {
+                # Trusted LAN listener (server.port). Callers here may be anonymous.
+                "allow_anonymous": True,
+                "expose_version": True,
+                "expose_docs": True,
+            },
+            "public": {
+                # null = no public listener. Set to 8001 for a two-zone instance, or
+                # to server.port (8000) for a public-only instance.
+                "port": None,
+                # The COMPLETE public surface. Unlisted method+path pairs are 404
+                # before routing; every listed pair still needs a key or session.
+                "path_allowlist": {verb: list(pats) for verb, pats in DEFAULT_PUBLIC_PATHS.items()},
+                # Ollama model management (pull/push/create/delete/copy/blobs) is
+                # blocked on the public listener only; the internal LAN listener
+                # forwards these untouched.
+                "admin_endpoints": "deny",
+            },
+            "blocked_paths": [],
+            "cors_origins": [],
+            "max_body_bytes": 32 * 1024 * 1024,
+            "allow_query_api_key": False,
+            "allowed_client_ips": [],
+            "trusted_proxies": [],
+            "rate_limit": {"enabled": False, "per_minute": 60, "burst": 20, "by": "ip"},
+        },
     }
 
 
@@ -844,7 +1231,8 @@ def _dump_yaml(data: dict[str, Any]) -> str:
     """Render the config mapping as YAML: readable, order-preserving, non-ASCII kept literal."""
     header = (
         "# llm-hub gateway configuration.\n"
-        "# Secrets do not belong here: API keys come from GATEWAY_API_KEYS / GATEWAY_API_KEYS_FILE.\n"
+        "# Secrets do not belong here: caller API keys live in llmhub.db and are minted\n"
+        "# at /admin -> API keys; the console password is ADMIN_PASSWORD in the environment.\n"
     )
     return header + yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
@@ -889,11 +1277,7 @@ class ConfigManager:
                 logger.info("Default config written to %s (edit upstreams and aliases as needed)", path)
             except Exception as exc:  # pragma: no cover
                 logger.error("Failed to write the default config: %s", exc)
-            cfg = Config(**build_default_config())
-            # The template is a first-run deployment, and a first run is exactly when the
-            # environment keys are seeded into the api_keys table - so they have to be applied
-            # here too, not only on the branch below that reads an existing file.
-            set_api_keys(collect_env_api_keys())
+            cfg = Config(**apply_legacy_listener_env(build_default_config()))
             return cfg
 
         try:
@@ -910,26 +1294,34 @@ class ConfigManager:
             )
             return self._config
 
+        # Listener/zone env vars are a migration hint only; config.yaml values win.
+        raw = apply_legacy_listener_env(raw)
+
         try:
             cfg = Config(**raw)
         except Exception as exc:
             logger.error("Config validation failed: %s, keeping the previous config", exc)
             return self._config
 
-        # Keys come from the environment only, so config.yaml never has to hold a secret.
-        set_api_keys(collect_env_api_keys())
-
-        # Allow disabling auth via environment variable (takes precedence over config file)
-        if os.getenv(ENV_AUTH_DISABLED, "").lower() in ("true", "1", "yes"):
-            cfg.auth.enabled = False
-            logger.info("Authentication disabled via %s=true", ENV_AUTH_DISABLED)
+        # `default_upstream` is the ONLY routing input for calls that carry no `model`
+        # (api/pull sends `name`, api/tags sends nothing). A value that names no upstream is
+        # otherwise silent until those calls answer 404 with a message about a missing model.
+        if cfg.default_upstream and cfg.get_upstream(cfg.default_upstream) is None:
+            logger.error(
+                "default_upstream=%r names no upstream in this config (available: %s). Every call "
+                "without a `model` field - api/pull, api/push, api/create, api/delete, api/copy, "
+                "api/tags, api/ps - answers 404 until it matches an upstream's `name`.",
+                cfg.default_upstream,
+                ", ".join(u.name for u in cfg.upstreams) or "none",
+            )
 
         logger.info(
-            "Config loaded: %s | upstreams=%d | aliases=%d | api_keys=%d",
+            "Config loaded: %s | upstreams=%d | aliases=%d | listen=%s | public=%s",
             path,
             len(cfg.upstreams),
             len(cfg.aliases),
-            len(cfg.auth.api_keys),
+            ",".join(str(p) for p in cfg.listen_ports()),
+            ",".join(str(p) for p in sorted(cfg.public_ports())) or "none",
         )
         return cfg
 

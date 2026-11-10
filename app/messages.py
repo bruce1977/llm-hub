@@ -38,6 +38,7 @@ import uuid
 from typing import Any, AsyncIterator
 
 import httpx
+from auth import read_limited_body
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -167,7 +168,7 @@ class MessagesService:
     # ----------------------------------------------------------- entrypoint ---
     async def handle(self, request: Request) -> Response:
         cfg = self.manager.config
-        raw = await request.body()
+        raw = await read_limited_body(request, cfg.security.max_body_bytes)
         try:
             parsed = json.loads(raw) if raw else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -229,15 +230,25 @@ class MessagesService:
         timeout = upstream.timeout or cfg.server.request_timeout
 
         logger.info(
-            "Messages: %s -> %s | model=%s | stream=%s",
+            "Messages: %r -> %r | model=%r | stream=%s",
             "auto" if (not model or model == "auto") else model,
             upstream.name,
             target,
             req.stream,
         )
 
+        # `upstreams[].headers` (provider Authorization, custom routing headers) used to
+        # be dropped here entirely, so an upstream that requires a key always answered
+        # 401. Only configured headers are attached - never the caller's own headers.
+        custom = getattr(upstream, "headers", None)
+        upstream_headers = (
+            {str(k): str(v) for k, v in custom.items()} if isinstance(custom, dict) and custom else None
+        )
+
         try:
-            http_req = self.client.build_request("POST", url, json=payload, timeout=timeout)
+            http_req = self.client.build_request(
+                "POST", url, json=payload, timeout=timeout, headers=upstream_headers
+            )
             resp = await self.client.send(http_req, stream=req.stream)
         except httpx.ConnectError as exc:
             raise HTTPException(

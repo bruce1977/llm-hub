@@ -493,7 +493,7 @@ const zhCN = {
     },
     introTitle: '功能介绍',
     intro:
-      '重排（Rerank）在初步召回之后，用模型对候选文档逐条打分并重新排序，提升问答、搜索与 RAG 的命中质量。llm-hub 暴露 {endpoint}：传入 {query} 与 {documents}，网关把请求转换成上游可执行的形式——生成式模型按对数概率打分（logprobs），或按向量余弦相似度打分（embedding），再把分数归一化为 {score}，可用 {topN} 与 {returnDocuments} 控制输出，打分方式可按模型覆盖。',
+      '重排（Rerank）在初步召回之后，用模型对候选文档逐条打分并重新排序，提升问答、搜索与 RAG 的命中质量。llm-hub 暴露 {endpoint}：传入 {query} 与 {documents}，网关把请求转换成生成式重排模型可执行的形式，按对数概率打分并归一化为 {score}，可用 {topN} 与 {returnDocuments} 控制输出。',
     config: {
       title: 'Rerank 配置',
     },
@@ -531,7 +531,7 @@ const zhCN = {
     },
     docs: {
       responseNote: 'results[] 每项含 index / relevance_score',
-      note: 'rerank 由上游模型打分（logprobs 或 embedding），网关负责协议转换与结果归一化；失败请求可在 Requests 页按状态筛选查看。',
+      note: '重排分数由上游模型给出，网关负责协议转换与分数归一化；失败请求可在 Requests 页按状态筛选查看。',
     },
   },
 
@@ -670,7 +670,7 @@ const zhCN = {
       },
       security: {
         title: '安全与配额',
-        desc: 'API Key 只来自环境变量、IP 白名单、方法与路径白名单、限流、请求体上限与安全响应头',
+        desc: '按监听端口区分内外网双区、外网强制 Key 并用方法+正则收敛路径、Key 存 SQLite、限流、请求体上限与安全响应头',
       },
       insights: {
         title: '请求明细与统计',
@@ -744,7 +744,7 @@ const zhCN = {
     saveValidationFailed: '以下配置段校验未通过',
     saveConfirmTitle: '确认覆盖 config.yaml？',
     saveConfirmBody:
-      '此操作将以「完整配置对象」覆盖整个 config.yaml。本页编辑的 4 个段（Upstream / Rerank / System One / Web Search）会被写入；未在此页开放的高级段（server / auth / security / aliases 等）将按当前文件原样保留，不会丢失。',
+      '此操作将以「完整配置对象」覆盖整个 config.yaml。本页编辑的 4 个段（Upstream / Rerank / System One / Web Search）会被写入；未在此页开放的高级段（server / security / aliases 等）将按当前文件原样保留，不会丢失。',
     saveConfirmYes: '覆盖保存',
     addUpstream: '添加上游',
     noUpstreams: '暂无上游，点击「添加上游」新增一个。',
@@ -800,7 +800,7 @@ const zhCN = {
     intro: {
       title: '功能介绍',
       tag: 'overview',
-      body: 'API Key 是调用网关时出示的凭证，保存在 llmhub.db 的 api_keys 表里。库里只存密钥的 SHA-256 哈希和一段掩码，明文只在你点击「生成密钥」的那次弹窗里出现一次，关闭之后就再也看不到；清单上能看到的是掩码、描述和创建时间，随时可以撤销。环境变量与 .keys 文件里的旧密钥只在表为空时导入一次，之后一律以数据库为准。',
+      body: 'API Key 是调用网关时出示的凭证，保存在 llmhub.db 的 api_keys 表里。库里只存密钥的 SHA-256 哈希和一段掩码，明文只在你点击「生成密钥」的那次弹窗里出现一次，关闭之后就再也看不到；清单上能看到的是掩码、描述和创建时间，随时可以撤销。密钥只能在本页签发——环境变量、密钥文件、配置文件都无法注入；表为空就只是还没签发过。',
     },
     list: {
       title: '密钥清单',
@@ -829,7 +829,7 @@ const zhCN = {
       checked: '校验方式',
       checkedValue: '请求时比对内存中的哈希，不查询数据库',
       seeded: '首次导入',
-      seededValue: '环境变量与 .keys 只在表为空时导入一次，之后以数据库为准',
+      seededValue: '只能在本页签发，环境变量与 config.yaml 都无法注入',
     },
     modal: {
       title: '新建 API Key',

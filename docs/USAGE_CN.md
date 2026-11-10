@@ -2,7 +2,8 @@
 
 完整文档：配置详解、接口清单、Web 管理台、部署与安全。想先快速了解这是什么、看一眼界面截图、
 五分钟跑起来，请回到 [README_CN.md](../README_CN.md)；English：[USAGE.md](USAGE.md)。
-接口文档：[API_CN.md](API_CN.md)。部署：[DEPLOY_CN.md](DEPLOY_CN.md)。
+接口文档：[API_CN.md](API_CN.md)。配置逐节点参考：[CONFIG_CN.md](CONFIG_CN.md)。
+部署：[DEPLOY_CN.md](DEPLOY_CN.md)。
 
 **目录** ·
 [特性](#特性) ·
@@ -25,15 +26,16 @@
 |------|------|
 | **多上游路由** | 按请求体中的 `model` 字段，转发到对应端口的 Ollama 实例 |
 | **API Key 鉴权** | 多 Key 并存，兼容 `Bearer` / `X-API-Key`；校验拿请求里的 Key 算一次 `sha256`，与内存中的摘要集合比对（Key 存在 SQLite 的 `api_keys` 表），明文既不落盘也不参与比较 |
-| **Rerank API** | 提供 `/v1/rerank`，支持生成式（`logprobs`）与向量（`embedding`）两种打分 |
+| **Rerank API** | 提供 `/v1/rerank`，使用生成式（`logprobs`）yes/no 打分 |
 | **联网检索** | `POST /v1/tools/web-search`，把 OpenCode API Gateway 的关键词网页检索收敛到统一入口 |
 | **Anthropic Messages** | `POST /v1/messages`（含单数别名 `/v1/message`）：把 Anthropic 请求转成上游的 chat 格式（Ollama NDJSON 或 OpenAI SSE），回答再包回 Anthropic 信封（`content` 块、`stop_reason`、`usage`）；流式按 `message_start → content_block_delta → message_stop` 的事件序重新编排，不是原样透传 |
 | **统一模型列表** | `/v1/models` 聚合配置中所有实例与别名，而非代理到单个实例 |
 | **别名 + 参数注入** | `qwen3.5:4b-nothink` → 转发 `qwen3.5:4b` 并强制注入 `think: false`；`aliases` 里的每一项都是一个独立模型（管理台单独成行），`model_aliases` 只改名 |
 | **流式透传** | NDJSON（`/api/chat`、`/api/generate`）与 SSE（`/v1/chat/completions`）原样转发 |
-| **管理 API** | `/v1/management/*`：上游/显存总览（含今日请求数与今日 token 合计）、config.yaml 各上游**声明**的模型清单（`model_aliases` 短名优先显示，根 `aliases:` 的派生模型独立成行，前缀通配按上游模型列表展开）与运行态设备/显存内存、配置投影（Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点）、每模型测速（启动 / 轮询 / 历史）与每端点的接口测试（按家族给出可用模型并服务端执行），凭据为管理台会话 Cookie 或网关 API Key |
+| **封闭的 API 暴露面** | **两个区**都只转发网关已声明的路径，其余一律 **404**，内网监听因此不是通向上游整套 API 的开放代理（见[网关转发哪些路径](#网关转发哪些路径)） |
+| **管理 API** | `/v1/management/*`：上游/显存总览（含今日请求数与今日 token 合计）、config.yaml 各上游**声明**的模型清单（`model_aliases` 短名优先显示，根 `aliases:` 的派生模型独立成行，前缀通配按上游模型列表展开）与运行态设备/显存内存、配置投影（Rerank / System One / Web Search）、请求明细与时序与分布统计（SQLite 埋点）、每模型测速（启动 / 轮询 / 历史）与每端点的接口测试（按家族给出可用模型并服务端执行），凭据**只有**管理台会话 Cookie——网关 API Key 不是管理凭据 |
 | **Web 管理台** | Vue 3 + TypeScript + Element Plus + ECharts 单页应用，构建后由网关在 `/admin` 直接提供（镜像内不含 node）：总览、上游、模型清单（配置声明 + 通配展开 + 运行态）、请求明细与图表、每模型测速、每个 API 文档参数表右上角**测试**按钮打开的浮层测试窗口，以及 API Key 管理（签发 / 吊销，列表只显示掩码）；除 Settings 页（唯一保存 `config.yaml` 的编辑器）外，其余页面不再提供写配置入口 |
-| **API Key 管理** | 调用方 Key 是 `llmhub.db` 中 `api_keys` 表的一行，库里只存 `sha256(明文)` 与掩码，**永不存明文**。在管理台签发（`sk-hub-` 开头、共 47 字符）与吊销，新生成的明文只显示一次。`GATEWAY_API_KEYS` / `data/.keys` 只在表为空的首次启动导入一次 |
+| **API Key 管理** | 调用方 Key 是 `llmhub.db` 中 `api_keys` 表的一行，库里只存 `sha256(明文)` 与掩码，**永不存明文**。在管理台签发（`sk-hub-` 开头、共 47 字符）与吊销，新生成的明文只显示一次。管理台是**唯一**来源：没有 seed 变量、没有密钥文件、配置里也没有节点 |
 | **模型测速** | Models · LLM 的 `测速` 按钮用同一段提示词跑 N 轮，给出 TTFT、decode tok/s、prefill tok/s：上游自己报了 `eval_duration` / `prompt_eval_duration` / `predicted_ms` 就用服务端计时（`timing_source: server`），否则退回客户端计时并标记；每个「上游 + 模型」保留最近 3 次，悬停即可查历史 |
 | **接口测试** | 每个 `API 用法` 标签页里，每个端点「请求参数」标题右侧都有一个**测试**按钮，点开是浮层测试窗口（`/api/generate`、`/v1/chat/completions`、`/v1/messages`、`/api/embed`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、`/v1/tools/web-search`）：模型选择框按 `api_models` 收窄（`/api/...` 原生端点只列 `type: ollama` 上游的模型）且只列名字/别名，文档里的参数基本都能填并**一打开就带着默认值**，可预览将要发送的请求体，结果给出状态码、耗时、实际路由到的模型与别名注入的参数、从 JSON / NDJSON / SSE 抽出的回答。请求由**服务端**用网关自己的服务发出，别名注入与请求明细入库跟外部调用完全一致；需要额外密钥的端点只显示只读 `••••••` |
 | **三语界面** | 简体中文（源语言）、繁體中文与英文，账户菜单右侧子菜单切换、按浏览器记忆（`localStorage`）；首次访问按 `navigator.language` 猜（`zh-TW` / `zh-HK` / `zh-MO` / `zh-Hant` → 繁体，`en*` → 英文，其余 → 简体），Element Plus 自带的控件（日期面板、分页）也跟着切换。漏翻的键会让构建失败（`MessageSchema`），不会把原始 key 渲染到界面 |
@@ -51,6 +53,8 @@ llm-hub/
 │   ├── main.py       # FastAPI 入口与特殊端点（/v1/messages 等路由在此注册）
 │   ├── config.py     # 配置模型、加载与热重载、别名解析
 │   ├── auth.py       # API Key 鉴权
+│   ├── serve.py      # 加固入口：同一进程绑定所有监听（proxy_headers=False）
+│   ├── bridge.py     # 外网区路径策略（白名单 + 硬 404）——不是第二个代理服务
 │   ├── admin_auth.py # 管理台登录会话（admin 密码、12 小时 Cookie、登录失败节奏限制）
 │   ├── key_store.py  # 调用方 API Key 的 SQLite 存储（只存 sha256 摘要与掩码，签发/吊销）
 │   ├── proxy.py      # 反向代理与流式透传
@@ -70,7 +74,7 @@ llm-hub/
 ├── docs/
 │   ├── images/       # README 直接引用的图：架构图、界面截图、公众号二维码
 │   ├── screenshots/  # 管理台逐页实拍（en/ 与 zh/，由 capture-live.js 连真实网关抓取）
-│   └── ...           # 接口（API.md / API_CN.md）、部署（DEPLOY.md / DEPLOY_CN.md）、管理台实现说明
+│   └── ...           # 接口（API.md / API_CN.md）、配置逐节点参考（CONFIG.md / CONFIG_CN.md）、部署（DEPLOY.md / DEPLOY_CN.md）、管理台实现说明
 ├── tests/            # 独立运行的测试脚本（smoke / gateway / management / security / 联机 E2E）
 └── data/
     └── config.yaml   # 配置文件（挂载到容器 /data）
@@ -132,8 +136,9 @@ curl http://localhost:8888/health
 管理台前端随镜像发布在 `app/web`（`npm run build` 的产物，与模块同级）；上面第 3 步把宿主机的
 `app` 目录挂到 `/app`，所以那份也必须是构建过的，否则 `/admin` 会返回 503。
 
-> **密钥通过 `.env` 提供**：`--env-file` 读取其中的 `GATEWAY_API_KEYS` 并注入容器，
-> `config.yaml` 里因此不需要写任何密钥。请妥善保管 `.env`，切勿提交到版本库；换密钥时只改这一处即可。
+> **密钥通过 `.env` 提供**：`--env-file` 读取其中的 `ADMIN_PASSWORD`（以及后端需要时的
+> `SYSTEMONE_SERVER_API_KEY`）并注入容器，`config.yaml` 里因此不需要写任何凭据。调用方 API Key
+> 之后在管理台签发。请妥善保管 `.env`，切勿提交到版本库。
 > Windows 下 `--env-file` / `-v` 的路径务必使用盘符形式（`${target folder}`），不要写 `/d/...`（docker 找不到文件）。
 
 日志查看：`docker logs -f llm-hub`
@@ -148,7 +153,7 @@ curl http://localhost:8888/health
 | 模板 | 复制为 | 说明 |
 |------|--------|------|
 | `data/config.example.yaml` | `data/config.yaml` | 网关配置样例，含 `upstreams` / `aliases` / `rerank` / `security` 全字段，已示范 `priority` 路由优先级 |
-| `.env.example` | `.env` | 密钥样例，只需把 `GATEWAY_API_KEYS` 换成你自己的随机串（≥16 位）。这些值只在 `api_keys` 表为空的首次启动导入一次，之后请在 `/admin` 的 API Key 管理页签发，改文件不再有效果 |
+| `.env.example` | `.env` | 模板只列这个服务读取的三个变量：`CONFIG_PATH`（注释形式，标注默认值）、`ADMIN_PASSWORD`（这一项必须改，≥32 位随机）、`SYSTEMONE_SERVER_API_KEY`（注释形式，可选）。其余全部在 `config.yaml`；调用方 Key 在 `/admin` 签发，没有任何变量 |
 
 ```bash
 cp data/config.example.yaml data/config.yaml
@@ -205,6 +210,11 @@ docker push registry.example.com/llm-hub:1.0.0
 `config.yaml`，网关会读取它并打印一条警告，老部署不会因此失效；JSON 本身就是合法 YAML，需要时
 直接改名为 `config.yaml` 即可。
 
+本章讲的是你真正会去改的那些节点，以及它们对一次调用的影响。**每个键的逐节点参考**——默认值、
+由谁读取、改动何时生效，以及那些坑（未声明的 YAML 键会被静默忽略、`rerank.endpoint` 只是个标签、
+`api_models` 里的 `- ''` 占位符会被丢弃、`default_upstream` 按 `upstreams[].name` 解析）——在
+[CONFIG_CN.md](CONFIG_CN.md)。
+
 ### `server` —— 网关自身
 
 | 字段 | 默认 | 说明 |
@@ -214,64 +224,98 @@ docker push registry.example.com/llm-hub:1.0.0
 | `request_timeout` | `600` | 上游默认超时（秒） |
 | `max_concurrency` | `64` | HTTP 连接池上限 |
 
-### `auth` —— 鉴权
+### `security` —— 分区、鉴权与加固
+
+网关有**两个信任区**，由**内核分配的本地监听端口**（`scope["server"]`）判定——不看客户端 IP、
+不看 `X-Forwarded-For`、也不看 API Key。同一个 socket 不可能既可信又不可信；`app/serve.py`
+以 `proxy_headers=False` 启动 uvicorn，因此任何请求头都改不了这个锚点。端口与分区策略**只写在
+本文件**：`server.port` 是内网监听，`security.public.port` 打开外网监听。不存在端口环境变量
+（见 `.env.example`）。
 
 ```yaml
-auth:
-  enabled: true
-  allow_anonymous_health: true
-  allow_access_ip_whitelist: []
-  trusted_networks: []            # CIDR，如 192.168.10.0/24、127.0.0.1/32
+server:
+  port: 8000                 # 内网（可信 LAN）监听
+security:
+  internal:                  # 作用于 server.port 这个 socket 的策略
+    allow_anonymous: true    # true = 该端口上业务 API 免 Key
+    expose_version: true     # `/` 是否回显构建版本
+    expose_docs: true        # /docs、/openapi.json、/static/swagger/*
+  public:                    # 作用于外网 socket 的策略
+    port: null               # null = 不开；8001 = 双监听；8000（= server.port）= 纯公网单端口
+    path_allowlist:          # 方法 -> re.fullmatch 正则列表；这就是外网的全部暴露面
+      GET:  ["^/v1/models$"]
+      POST: ["^/v1/chat/completions$", "^/v1/messages$", "^/api/generate$", "^/api/chat$"]
 ```
 
-- **密钥不再写在 `config.yaml`**：`api_keys` 字段已移除，配置里放不下任何凭据（真源是下面说的
-  `api_keys` 表）。若旧配置里还留着 `api_keys`，启动时会打印警告并忽略它
-- 密钥来源：`GATEWAY_API_KEYS` 环境变量与 `GATEWAY_API_KEYS_FILE` 指向的密钥文件（如 `data/.keys`），两者合并去重
-- `GATEWAY_API_KEYS`：`GATEWAY_API_KEYS=key1,key2`（逗号/换行分隔）
-- `GATEWAY_API_KEYS_FILE`：指向存放密钥的文件路径，适合 Docker/K8s secrets（`docker inspect` 也不会泄露）
-- **上面两个来源只负责给空的 `api_keys` 表喂第一次数据**：真正生效的凭据是 `llmhub.db` 里 `api_keys`
-  表的行，每行只存 `sha256(明文)` 与一段掩码，**库里没有明文**。首次启动把这些 Key 以
-  `source: "file"` 导入，之后**文件不再被读取**——在管理台吊销的 Key 不会随重启复活，改文件也不会
-  新增 Key。环境变量里还有表里没有的 Key 时，启动日志会用掩码逐条告警，提醒它们已经失效。
-  签发与吊销在 `/admin` → 账户菜单 → **API Key 管理**，明文只显示一次
-- **Key 格式与长度**：`sk-hub-` + 40 位 base62（`secrets` 采样）= **固定 47 字符**，约 238 位随机。
-  前缀不是密钥，它的作用是让一个疑似泄漏的字符串在日志或客户端配置里一眼可辨。掩码保留前缀与主体
-  首尾各 4 位（`sk-hub-FNdc…SVvw`）；从文件导入的旧 Key 形状任意，退化为整串首 8 尾 4，12 字符及更短
-  的全部打点。选 SHA-256 而不是 bcrypt/argon2：238 位随机数没有可暴破的弱口令，而网关在**每一笔**
-  请求上都要校验，慢速 KDF 只会给每次调用加几十毫秒、把网关自己变成 DoS 目标
+- **内网区** —— 请求落在 `server.port`，且该端口不等于外网端口：
+  - `/` 与 `/health` **恒匿名**（存活探针），不受 `allow_anonymous` 影响。`/healthz` 不是探针别名，
+    `allow_anonymous: false` 时它要 Key
+  - `allow_anonymous: true` → 其余业务 API（`/v1/models`、`/api/tags`、`/v1/chat/completions` …）
+    在本端口免 Key；`false` → 需要有效 Key 或管理台会话 Cookie（无 Key `401`、无效 Key `403`）
+  - `expose_docs` 控制 `/docs` / `/openapi.json` / Swagger 静态资源；`expose_version` 控制匿名的
+    `/` 是否回显构建版本
+  - 管理接口（`/v1/management/*`）与 `/admin` 在本端口可达；管理接口**始终只认管理台会话 Cookie**，
+    网关 Key 永远不是管理凭据
+- **外网区** —— 请求落在 `security.public.port`：
+  - **每个请求都必须带有效 Key 或管理台会话 Cookie，强制且不可关闭**——没有 `require_api_key`
+    这类开关
+  - 只有 `public.path_allowlist` 里的 `方法 + 路径` 对存在。每个值是**全匹配**正则
+    （`re.fullmatch`，不是前缀），key 为全大写 HTTP 方法。末尾斜杠算不同路径；
+    **未列出的组合一律 404，带不带 Key 都一样**。非法正则会被丢弃并告警（失败关闭）；
+    非法方法名直接让配置校验失败
+  - 配置**打不开**的红线：`/v1/management/*`、`/admin*`（404），以及任何含 `..` 段或 NUL 字节的
+    路径。因此 `/`、`/health`、`/docs`、`/openapi.json`、`/probe`、`/api/tags`、`/api/ps`、
+    `/api/version` 默认都不存在，除非你显式列出；管理与控制台无论如何都是 404
+  - `security.public.port: null` = 不开外网监听。`= server.port`（例如都为 `8000`）得到
+    **纯公网单 socket**，**没有任何匿名 HTTP 路径**——此时容器 HEALTHCHECK 必须改用 TCP 端口探测，
+    不能用 `GET /health`。否则（如内网 `8000`、外网 `8001`）由 `serve.py` 在同一进程绑定两个监听，
+    共享 Key 缓存与限流桶
+- **API Key 存在 `llmhub.db` 的 `api_keys` 表**，不在 `config.yaml`——配置文件里没有任何凭据。
+  每行只存 `sha256(明文)` 与一段显示掩码，**不存明文**。Key 只有一种诞生方式：在 `/admin` →
+  **API Key 管理**签发，明文只显示一次（见 [Web 管理台](#web-管理台)）。早期版本的
+  `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` / `.keys` 三种入口都已删除——环境变量、文件、
+  `config.yaml` 都不能再注入或复活一把 Key。空表是**正常的首次启动状态**：签发第一把之前，
+  所有需要 Key 的请求都返回 401
+- **Key 格式**：`sk-hub-` + 40 位 base62 = **47 字符**，约 238 位随机。前缀不是密钥，它的作用是
+  让一个疑似泄漏的字符串在日志或客户端配置里一眼可辨。掩码保留前缀与主体首尾各 4 位
+  （`sk-hub-FNdc…SVvw`）；从文件导入的旧 Key 形状任意，退化为整串首 8 尾 4。选 SHA-256 而不是
+  bcrypt/argon2：238 位随机数没有可暴破的弱口令，而网关在**每一笔**请求上都要校验，慢速 KDF 只会
+  给每次调用加几十毫秒、把网关自己变成 DoS 目标
 - **校验走内存**：启动时把全部 hash 读成一个集合，`verify()` 只做一次查表，请求路径不碰 sqlite；
   每次签发 / 吊销 / 导入都会重载该集合，所以新 Key 立即可用、吊销立即失效，无需重启
-- `allow_access_ip_whitelist`：字符串数组，按正则 **fullmatch** 匹配 ASGI 的客户端地址（直连时就是
-  **TCP 对端**；网关代码本身**不读取** `X-Forwarded-For`，因为它可被伪造）。命中的地址可以打开
-  `/docs` 与 `/openapi.json`，调用网关 API 时也免 API Key 检查。默认 `[]`（无人豁免）；非法正则会
-  记录警告并跳过。注意 uvicorn 的 `ProxyHeadersMiddleware` 在**受信代理**（`--forwarded-allow-ips`，
-  默认仅 `127.0.0.1`）转发时会用转发头改写客户端地址——经本机反代部署时，命中判定看到的是真实来源，
-  因此必须确保反代正确设置并清理 `X-Forwarded-For`
-- **`trusted_networks`：内网免 Key / 外网必须 Key 的显式开关**（CIDR 数组，如 `192.168.10.0/24`、
-  `10.0.0.0/8`、`127.0.0.1/32`，也接受单个 IP）。填写后：
-  - 可信网段内访问**任何路径**都免 Key，即使带了无效 Key 也放行；`/docs`、`/openapi.json`
-    与 `/static/swagger/*` 同样只对可信来源可见——文档可见性与免 Key 共用 `trusted_peer()`
-    一个判定，不会再出现「文档被挡、API 却全裸」的假象
-  - 网段外访问**所有业务 API**（含 `/v1/models`、`/api/tags`、`/v1/chat/completions`）都必须带
-    有效 Key：无 Key `401`、无效 Key `403`。仅 `/` 与 `/health` 仍按 `allow_anonymous_health`
-    保持匿名（容器健康检查 / 负载均衡探针），设为 `false` 可一并关闭
-  - `enabled: false` **不再是全局匿名**：只有可信网段内免 Key，外网依然要 Key。若 `api_keys`
-    表为空，外网请求会全部 `401`，启动日志会提示去 `/admin` 签发 Key
-  - 留空 `[]` 保持旧行为（`enabled: false` = 全部匿名），但启动日志会明确告警「所有 API 匿名，
-    隐藏 `/docs` 不是安全边界」
-  - 判定同样只看 TCP 对端（`request.client.host`），**不读 `X-Forwarded-For`**。经本机反代时
-    uvicorn 会用转发头改写它，所以反代必须用 `proxy_set_header X-Forwarded-For $remote_addr;`
-    **覆盖**（不要用 `$proxy_add_x_forwarded_for` 追加），否则外部可伪造内网 IP 绕过鉴权
-- **管理台登录后的会话 Cookie 也是业务 API 的凭据**：登录拿到的签名 Cookie 可直接调用 `/v1/models`
-  等业务端点，浏览器无需持有调用方 Key。有效期由 `ADMIN_SESSION_TTL` 控制（秒，默认 `43200`
-  = 12 小时，钳制在 5 分钟 ~ 7 天），用过半后每次成功请求自动续期，活跃会话不会硬掉线。
-  退出登录只清除浏览器 Cookie——服务端没有会话表，被复制出去的 Cookie 在到期或
+- **管理台登录后的会话 Cookie 在**两个区的业务 API 上**都是有效凭据**：登录拿到的签名
+  `llmhub_admin` Cookie 可直接调用 `/v1/models` 等业务端点，浏览器无需持有调用方 Key。有效期由
+  `ADMIN_SESSION_TTL` 控制（秒，默认 `43200` = 12 小时，钳制在 5 分钟 ~ 7 天），用过半后每次成功
+  请求自动续期。退出登录只清除浏览器 Cookie——服务端没有会话表，被复制出去的 Cookie 在到期或
   `ADMIN_PASSWORD` 变更之前仍然有效
-- ⚠️ 启用鉴权（`enabled: true`）而 `api_keys` 表在导入后仍然一行都没有时，网关**拒绝启动**并给出
-  补救办法：先用 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` 把空表喂上再重启，或改
-  `auth.enabled: false`——避免误暴露无鉴权服务
-- `allow_anonymous_health`：`/health` 免鉴权（建议保持 `true`，否则容器健康检查会失败）
-- `enabled: false` 可临时关闭鉴权
+- **Key 自检**：空表本身是正常的（Key 只能在管理台签发）。只有彻底无路可走时网关才**拒绝启动**：
+  表为空**且** `ADMIN_PASSWORD` 未设置（管理台无法签发）**且**没有可匿名的内网区——即系统不可能
+  存在任何凭据。设置 `ADMIN_PASSWORD` 启动后，到 `/admin` 签发第一把即可
+
+其余 `security.*` 键（`blocked_paths`、`cors_origins`、`max_body_bytes`、`allow_query_api_key`、
+`allowed_client_ips`、`trusted_proxies`、`rate_limit`）是**两个区共享**的加固项，
+表格见[安全](#安全公网暴露必读)，每个键的默认值见
+[CONFIG_CN.md](CONFIG_CN.md#security)。
+
+`admin_endpoints` **不属于**共享项——它在 `security.public` 下，只在外网监听上生效：
+
+| 取值 | 对外网监听的作用 |
+|------|------|
+| `deny`（默认） | 拦截 `api/delete`、`api/copy`、`api/create`、`api/push`、`api/blobs/*` **以及** `api/pull`；`/admin*` 与 `/v1/management/*` 保持 **404** |
+| `readonly` | 只放行 `api/pull`；破坏性调用、`api/blobs/*` 与管理面仍被拦截（404） |
+| `allow` | 放行全部模型管理调用，**包括 `api/blobs/*`**，**并打开管理面**：`/admin*` 与 `/v1/management/*` 会被路由到真实处理器 |
+
+`api/show` 与 `api/version` 永不被这项拦截。在 `server.port`（可信 LAN 监听）上这个取值根本不会被
+应用，所以在那里改它必然没有任何效果——在 LAN 上拉模型、开管理台都是正常操作。
+
+两半的行为有意不同：
+
+- **Ollama 的端点**是普通路径，取值只负责「撤掉过滤器」，请求仍要过
+  `security.public.path_allowlist`。要把 `pull` 暴露到外网，取值与一条 `POST` 规则两者都得有
+  （常见问题里 [`admin_endpoints: allow` 没有任何效果](#常见问题)一条列出全部三个原因）。
+- **管理面是一个前缀**，在 `bridge_denial()` 里、查白名单**之前**判定，所以 `allow` 会整体打开它——
+  没有哪条正则能可靠地枚举 `/admin/assets/*`。但它永远不匿名：只有静态外壳与
+  `POST /v1/management/auth/login` 免凭据，其余管理路由仍要会话 Cookie，网关 Key 从来不是管理凭据。
 
 ### `upstreams` —— 后端实例列表（Ollama / LM Studio / OpenCode）
 
@@ -326,7 +370,24 @@ upstreams:
 ### `routing` —— 路由策略
 
 - `strict: false`（默认）：模型未匹配任何实例时，转发到 `default_upstream`
-- `strict: true`：未声明的模型直接返回 404，避免误打到默认实例
+- `strict: true`：**带名字**的模型若没有任何上游声明、也没有别名能解析，直接返回 404，
+  避免误打到默认实例
+- **不带 `model` 的请求恒退回 `default_upstream`，即使 `strict: true` 也一样。** Ollama 的模型管理
+  调用（`api/pull`、`api/create`、`api/delete`、`api/copy`、`api/blobs/*`）带的是 `name` 而不是
+  `model`，`GET` 则两者都不带。strict 拒绝的是替一个**有名字**的模型瞎猜；空名字不是猜，
+  而是「这个请求体里没有模型」的情形
+- `default_upstream` 按 **`upstreams[].name`** 匹配。名字悬空（或为 `null`）就解析不到任何上游，
+  兜底于是静默变成 **404**，不带模型的 admin 调用也无路可走——改过上游名字后务必回头核对。
+  字段细节见 [CONFIG_CN.md](CONFIG_CN.md#default_upstream)
+
+```bash
+# routing.strict: true 时同样可用——请求体没有 model，因此落到 default_upstream
+#（它必须指向一个真实存在的上游）
+curl http://localhost:8000/api/pull \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"qwen3:4b"}'
+```
 
 ### `aliases` —— 别名与参数注入
 
@@ -484,19 +545,24 @@ rerank:
   normalize: false
   max_concurrency: 8
   return_documents: true
-  model_modes:
-    bge-m3:latest: embedding
+  upstream_api: auto
+  options:
+    num_ctx: 8192
+  keep_alive: 3m
 ```
 
-两种打分模式：
+只支持一种打分方式：**`logprobs`**——构造 yes/no 二分类 prompt，取首个回答 token 的 logprobs 做
+二分类 softmax 得到概率，这正是 `qwen3-reranker:4b` 这类生成式重排模型回答的形式。`model_modes`
+仍可按模型覆盖，且被接受的各种同义写法（`generation`、`cross-encoder`、`yes_no` 等）都归一到
+`logprobs`。
 
-| 模式 | 适用模型 | 原理 |
-|------|----------|------|
-| `logprobs` | Qwen3-Reranker 等生成式重排模型 | 构造 yes/no 二分类 prompt，读取首个 token 的 logprobs 做 softmax |
-| `embedding` | bge-m3 等向量模型 | 分别取 query 与文档向量，计算余弦相似度 |
+曾经存在的另一种方式已移除：**`embedding`**（用向量模型分别编码 query 与文档，再算余弦相似度）。
+用产生检索向量的同一个模型再打一遍分不会带来任何额外信号，因此现在选中它会返回 **400** 并说明
+原因，而不是静默退化成一个没有意义的分数。请改用生成式重排模型，或省去重排这一步。
 
-`mode` 是全局默认打分方式；当 reranker 混用不同类型模型（如生成式 `qwen3-reranker:4b` + 向量 `bge-m3:latest`）时，
-可用 `model_modes` 为单个模型单独指定模式，例如 `{"bge-m3:latest": "embedding"}`。
+`options.num_ctx` 要收紧：Ollama 会一次性预分配整个 KV cache，决定显存占用的是上下文长度而不是参数
+量——`qwen3-reranker:4b` 用默认的 40960 上下文约需 9.3 GB，改成 8192 只需约 4.0 GB，分数一致。
+`keep_alive` 再负责在两次请求之间把它请出显存：重排是脉冲式的，常驻一个 4B 模型只会挤占对话模型的显存。
 
 ### `websearch` —— 联网检索配置
 
@@ -550,8 +616,8 @@ request_log:
   `tokens` / `error`（响应结果，token 按输入/输出分两列存，`tokens` 是总量）；
   响应体各截断 8 KB，凭据字段写盘前替换为 `***`；旧库启动时自动 `ALTER TABLE` 补列
 - **`HEAD` 请求只转发、不记录**：它没有请求体也没有响应体，监控探活又会持续发送，记下来只会
-  淹没真实调用。默认 `allowed_http_methods: [GET, POST]` 下 HEAD 会直接收到 `405`；
-  若把它加进白名单，请求仍会正常转发，只是不写明细
+  淹没真实调用。catch-all 的 `HTTP_METHODS` 里包含 `HEAD`（已无全局方法白名单），
+  所以它会正常转发，只是不写明细
 
 ## Web 管理台
 
@@ -575,7 +641,7 @@ Models · LLM 上的每模型测速、每个 `API 用法` 标签页里的接口�
 「新建密钥」弹窗要求填写描述（必填，好让 Key 以后认得出来），随后一次性展示生成的 47 字符明文，
 带复制按钮与「我已保存」确认；关掉弹窗就重新拉取列表，此后这把 Key 只能被删除，无法再被找回。
 吊销是行内的两步操作（「撤销」→「确认撤销」/「取消」），因为一次误点不该打断正在使用它的客户端。
-这三个接口只认管理台会话 Cookie：网关 API Key 是任何客户端都持有的凭据，不能拿它再造一把钥匙。
+包括这三个接口在内，所有管理接口都只认管理台会话 Cookie：网关 API Key 是任何客户端都持有的凭据，不能等同于管理员权限。
 
 Models · LLM 表格与 Upstreams 的行展开列出的是**该上游在 config.yaml 里声明**的模型
 （`upstreams[].models`，`model_aliases` 的短名作为显示名、根 `aliases:` 的每一项单独成行；`opencode/*`
@@ -629,9 +695,11 @@ npm run dev      # 开发服务器 http://localhost:5173/admin/，/v1/management
 npm run build    # 先类型检查，再写入 app/web —— 该目录需要提交，镜像连同 app/ 一起 COPY
 ```
 
-数据全部来自 `/v1/management/*`。这些接口接受**两种凭据**：管理台会话 Cookie，或网关
-API Key（`Bearer` / `X-API-Key`，供脚本与 curl 复用已有的 key）。`ADMIN_PASSWORD` 只是
-登录页凭据，把它当作请求头凭据提交一律 401；未设置 `ADMIN_PASSWORD` 时所有接口返回 503。
+数据全部来自 `/v1/management/*`。这些接口**只认管理台会话 Cookie**。网关 API Key
+会分发给每个调用方，不能等同于管理员凭据：否则任一调用方都能读取完整配置、导出所有人的
+请求正文并改写上游，因此用它访问管理接口一律 401。`ADMIN_PASSWORD` 只是登录页凭据，
+把它当作请求头凭据提交同样 401；未设置 `ADMIN_PASSWORD` 时所有接口返回 503。
+同一来源连续 5 次登录失败锁定 15 分钟。
 
 ```bash
 # 设置管理员密码（不设置时管理接口统一返回 503）
@@ -641,11 +709,8 @@ ADMIN_PASSWORD=<至少 16 位随机串>
 curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
   -H "Content-Type: application/json" -d '{"password": "'"$ADMIN_PASSWORD"'"}'
 
-# 之后用 Cookie 认证（浏览器就是这么做的）
+# 之后用 Cookie 认证（浏览器就是这么做的；网关 API Key 在这里返回 401）
 curl -b cookie.txt http://localhost:8888/v1/management/overview
-
-# 或者直接用网关 API Key（查询串里的 key 不被接受）
-curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overview
 ```
 
 | 路径 | 说明 |
@@ -740,12 +805,75 @@ curl http://localhost:8000/api/chat \
   -d '{"model":"unknown-model","messages":[{"role":"user","content":"hi"}]}'
 # 404 {"detail":"No upstream configured for model 'unknown-model'."}
 
-# 被阻止的管理端点
-curl http://localhost:8000/api/delete \
+# 被阻止的管理端点 —— 只在公网监听端口生效（security.public.admin_endpoints: deny）。
+# 内网端口（8000）原样转发这个调用，不做管理员过滤。
+curl http://localhost:8001/api/delete \
   -H "Authorization: Bearer sk-key" \
   -d '{"name":"model"}'
 # 403 {"detail":"Endpoint '/api/delete' is disabled on this public gateway."}
+# 想拿到这个 403，前提是 path_allowlist 里已经列出 POST ^/api/delete$；
+# 没有这一条，公网分区在管理员过滤之前就先回答 404。
 ```
+
+### 网关转发哪些路径
+
+网关不是一台盲转发的反向代理：**两个分区**都只把网关自己声明过的路径送到上游，其余一律由网关回答
+**404**，无论后端实际实现了什么。因此内网监听端口不是通向上游整套 API 的开放代理。
+
+**转发给持有 `model` 的那个上游：**
+
+| 类别 | 路径 |
+|------|------|
+| Ollama 原生 | `api/generate`、`api/chat`、`api/embed`、`api/embeddings`、`api/show`、`api/version` |
+| OpenAI 兼容 | `v1/chat/completions`、`v1/completions`、`v1/embeddings` |
+| Ollama 模型管理 | `api/pull`、`api/push`、`api/create`、`api/delete`、`api/copy`、`api/blobs/*` |
+
+模型管理这些路径是**故意**留在集合里的：在内网监听端口它们本来就是正常操作，在公网监听端口则由
+`security.public.admin_endpoints` 决定放行与否 —— 那个过滤器给出的 **403** 比声称端点不存在的 404
+更清楚。它们要在公网端口存在，仍然必须先在 `security.public.path_allowlist` 里列出。
+
+**本地回答、永不转发：** `/`、`/health`、`/probe`、`/v1/models`、`/models`、`/api/tags`、`/api/ps`
+（跨上游聚合）、`/v1/rerank`（以及 `/rerank`、`/api/rerank`）、`/v1/messages`（以及 `/v1/message`）、
+`/v1/systemone`、`/v1/tools/web-search`、`/v1/management/*`、`/admin/*`、`/docs`、`/openapi.json`。
+
+```bash
+# 网关没有声明过的路径：两个分区都是 404，带不带 Key 都一样
+curl http://localhost:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer sk-gateway-example-key"
+# 404 {"detail":"Endpoint '/v1/audio/transcriptions' is not part of this gateway's API. See /docs (internal zone) or docs/API.md for the callable paths."}
+```
+
+有两点后果值得知道：
+
+- `security.blocked_paths` 只有在一条路径确实是网关 API 时才会回答 **403**。未知路径先被 **404**
+  拦掉，再屏蔽它没有任何变化。
+- 在 `security.public.path_allowlist` 里列出一条路径同样不会凭空造出它：一个不可转发的
+  method+path 仍然拿到 proxy 自己那句 **404**。
+
+**两个判断，不是一个。** 在公网端口上，「这条路径存不存在」和「这个调用者能不能用」是两个独立的
+步骤，都由 `app/bridge.py` 在请求中间件里按顺序回答：
+
+| 步骤 | 问题 | 结果 |
+|---|---|---|
+| 1 | 这个 method+path 在这个端口上存在吗？ | 未列出 → **404**，带着有效 Key 也一样 |
+| 2 | 这个调用者有凭据吗？ | 没有 Key 也没有管理台会话 → **401**，Key 无效 → **403** |
+
+第 2 步属于**分区**，而不属于某条路由自己声明的依赖，所以它在路由之前执行：`path_allowlist` 里加
+一条永远不可能把端点变成匿名端点，一个将来漏写 `Depends(require_api_key)` 的 handler 也一样会被
+公网侧拦住。它排在限流之后（被限速的调用者仍然看到 **429**），也排在 CORS 预检应答之后（预检按
+设计不携带凭据）。内网监听端口刻意不做这一步的凭据检查 —— 它的匿名路径（`/admin` 静态资源、`/`、
+`/health`，以及 `security.internal.allow_anonymous: true` 时的全部业务 API）由并非业务端点的路由回答。
+
+预检是唯一一个不用带凭据就能到达浏览器的请求，但第 1 步照样把它当成一个 method+path：公网端口上
+要让浏览器能用，必须在 `GET:`、`POST:` 旁边补上 `OPTIONS:` 条目，否则预检就是 **404**，真正的调用
+根本发不出去。预检的应答是 `204` 且**不带任何 body 字节** —— 那里多出的字节会把连接打乱。
+
+**Swagger 里能看到什么。** 六个转发路径是带请求 schema、示例和 404/405 响应的显式文档路由：
+`POST /api/generate`、`/api/chat`、`/v1/chat/completions`、`/v1/completions`、`/api/embed`、
+`/v1/embeddings`。所有只允许 POST 的路由 —— 这六条加上 `/v1/rerank`、`/rerank`、`/api/rerank`、
+`/v1/systemone`、`/v1/tools/web-search`、`/v1/messages`、`/v1/message` —— 遇到其它方法时由网关回答
+**405** 并带上 `Allow: POST`，而不是转发。`/docs` 本身只在内网分区提供，受
+`security.internal.expose_docs` 控制。
 
 ### 转发请求（与 Ollama 完全兼容）
 
@@ -916,7 +1044,7 @@ curl -X POST http://localhost:8000/v1/tools/web-search \
 curl http://localhost:8000/health
 ```
 
-返回各上游的连通性、模型数量与 Ollama 版本。任一上游不可达时返回 503。**无需 API 密钥**（当 `auth.allow_anonymous_health` 为 `true` 时，默认即为此值）。
+返回各上游的连通性、模型数量与 Ollama 版本。任一上游不可达时返回 503。`/` 与 `/health` 在**内网区**（`server.port`）**恒匿名**，与 `security.internal.allow_anonymous` 无关。在**外网区**同一路径返回 **404**（即使带有效 Key），除非你在 `security.public.path_allowlist` 里显式列出 `GET ^/health$`。因此这个探针要留在内网端口（8000）。
 
 ## 启动第二个 Ollama 实例
 
@@ -946,8 +1074,45 @@ OLLAMA_HOST=0.0.0.0:11435 OLLAMA_MODELS=/data/ollama-big ollama serve
 
 **健康检查一直失败？**
 
-若把 `allow_anonymous_health` 设为 `false`，`/health` 也需要鉴权，
-容器内置的 HEALTHCHECK 会因 401 判定失败。请保持该项为 `true`。
+把探针指向**内网**端口（`server.port`）——那里的 `/health` 恒匿名，`security.internal.allow_anonymous`
+设成什么都不影响。两种情况会让容器 HEALTHCHECK 失败：去探被声明为 `security.public.port` 的端口
+（按设计 → 404，带 Key 也一样），或跑**纯公网**实例（`security.public.port == server.port`）——
+它没有任何匿名 HTTP 路径，改为对该端口做 TCP 连接探测。
+
+**某条路径回答 404 `is not part of this gateway's API`？**
+
+这就是封闭的可转发集合，它同样作用于内网监听端口：你没声明过的路径是 **404**，而不是把上游碰巧
+提供的任何接口透传出去。可调用的路径清单见[网关转发哪些路径](#网关转发哪些路径)和
+[API_CN.md](API_CN.md)。确实需要集合之外的接口，就直接连那台实例。`security.blocked_paths` 不可能是
+原因：它回答 **403**，而且只对本来就是网关 API 的路径生效。
+
+**`admin_endpoints: allow`（或 `readonly`）改了没效果？**
+
+三个互相独立的成因，按值得排查的顺序：
+
+1. **你调的是内网端口。** 这个模式只在公网监听端口上强制执行；`server.port` 永远不会应用它，
+   所以在内网场景下改它必定是空操作。
+2. **路径没有列进公网允许清单。** `security.public.path_allowlist` 就是公网的全部暴露面，它在
+   管理员过滤**之前**就对未列出的 method+path 回答 **404** —— 模式本身永远不打开一条路径。公网开放
+   `pull` 需要两半都齐：
+
+   ```yaml
+   security:
+     public:
+       port: 8001
+       admin_endpoints: readonly        # 允许 pull；delete/copy/create/push/blobs 仍是 403
+       path_allowlist:                  # 公网的全部暴露面 —— 留下调用方真正需要的
+         GET:  ["^/v1/models$"]
+         POST: ["^/v1/chat/completions$", "^/api/pull$"]
+   ```
+
+3. **`default_upstream` 没设或者指向一个不存在的上游。** 管理调用的请求体带的是 `name` 而不是
+   `model`，于是这次调用解析出空模型名并落到 `default_upstream` —— `routing.strict: true` 也是如此。
+   这个名字悬空就没有可去之处，调用 **404**。
+
+模式回顾：`deny`（默认）拦住破坏性调用、`api/blobs/*` 和 `api/pull`；`readonly` 只放行 `pull`；
+`allow` 全部转发，**包括 `api/blobs/*`**，并额外打开公网管理面（`/admin*` 与 `/v1/management/*`，
+仍只认会话 Cookie）。
 
 **`think: false` 不生效？**
 
@@ -956,13 +1121,25 @@ OLLAMA_HOST=0.0.0.0:11435 OLLAMA_MODELS=/data/ollama-big ollama serve
 
 **Rerank 分数全是 0？**
 
-说明未能从上游响应中提取到 logprobs。把 `log_level` 调成 `debug` 观察原始响应，
-或改用 `embedding` 模式（需向量模型）。
+说明上游没有返回可用的 yes/no token logprobs，于是退化成文本兜底并把答案判为未知
+（`rerank.fallback_unknown`，故意取 `0.0`）。把 `log_level` 调成 `debug` 观察原始响应，并确认这个模型
+确实是用 `yes` / `no` 回答的生成式重排模型；词表不同时，用 `rerank.yes_token` / `no_token`
+（或 `yes_aliases` / `no_aliases`）改成它实际输出的词。
 
 **改了配置没生效？**
 
 配置热重载依赖文件 mtime 变化。某些编辑器或网络挂载（NFS / SMB）可能不更新 mtime，
 此时执行 `docker restart llm-hub` 即可。
+
+**某个配置键看起来完全没作用？**
+
+配置模型没有禁止多余属性，所以一个未知或拼错的 YAML 键会被解析、丢弃且不产生任何日志。先对照
+[CONFIG_CN.md](CONFIG_CN.md) 检查这个键 —— 那份文档逐节点列出默认值和读取它的代码 —— 再去验证效果
+而不是解析结果：`log_level: debug` 会打印路由决策，`GET /v1/management/config` 会给出管理台读到的
+掩码投影，公网端口的改动要么改变一个 **404** 要么不变，因为监听 socket 在启动时绑定，需要重启。
+三个坑值得点名：`rerank.endpoint` 只是一个标签（路由是固定的）、`api_models` 列表里的 `- ''`
+占位项会被丢弃而不是变成一个空选项，以及 `default_upstream` 按 `upstreams[].name` 解析，所以一次改名
+就会悄悄让兜底失效。
 
 **工具调用返回 400 / `cannot unmarshal object into ... arguments of type string`？**
 
@@ -974,63 +1151,115 @@ Ollama 的 gin 解析器会严格拒绝此类请求并报 400。网关在转发�
 
 ## 安全（公网暴露必读）
 
-网关默认按「公网不可信」设计。新增的 `security` 段统一收口加固项：
+网关有**两个信任区**，由内核分配的监听 socket 判定——不看客户端 IP、不看 `X-Forwarded-For`、
+也不看 Key。端口与分区策略**只写在 `config.yaml`**（`server.port`、`security.public.port`），
+不存在端口环境变量（见 `.env.example`）。两个分区节点之下的加固项对两个区同时生效：
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
-| `admin_endpoints` | `deny` | `deny` 拦截 pull/push/create/delete/copy/blobs；`readonly` 额外放行 `pull`；`allow` 全部转发（仅内网） |
-| `blocked_paths` | `[]` | 额外封禁的路径前缀，如 `["api/show"]` 或 `["api/*"]` |
-| `cors_origins` | `[]` | 显式允许的跨域来源；留空则完全不返回 CORS 头（不再有 `*`） |
-| `max_body_bytes` | `33554432` | 请求体上限（32MB），超过返回 413，防大 body 打挂 |
+| `blocked_paths` | `[]` | 额外封禁的路径前缀，如 `["api/show"]` 或 `["api/*"]`——两个区都生效 |
+| `cors_origins` | `[]` | 显式允许的跨域来源；留空则完全不返回 CORS 头。预检应答是不带 body 的 `204`，且在公网端口只有当该路径的 `OPTIONS` 也列进 `security.public.path_allowlist` 时才会到达这一步 |
+| `max_body_bytes` | `33554432` | 请求体上限（32 MiB）：先按 `Content-Length` 预检，chunked 请求边读边计数，超限直接 413，不会把整个 body 读进内存 |
 | `allow_query_api_key` | `false` | 是否接受 `?api_key=` 查询参数（默认关，避免密钥进日志/浏览器历史） |
-| `expose_health_details` | `false` | 为兼容保留、当前**未被读取**：`/health` 固定只回 `{"ok": true}`，不再回显 `config_path` 或上游 `base_url` |
-| `fail_on_weak_keys` | `true` | 启动时检测到弱密钥/占位密钥直接拒绝启动 |
-| `allowed_client_ips` | `[]` | 客户端 IP 白名单（支持 CIDR，如 `10.0.0.0/8`），留空不限制 |
-| `allowed_http_methods` | `["GET","POST"]` | 只放行这些 HTTP 动词，其余（PUT / PATCH / DELETE / HEAD / OPTIONS）一律返回 **405**。LLM 网关只需 GET（模型/健康/标签）与 POST（对话/重排），这是安全默认值 |
-| `path_allowlist` | `[]` | 正则 perimeter 控制：非空时，请求路径必须匹配其中至少一个正则，否则返回 **403**；留空则不过滤。非法正则会被记录并忽略（坏正则绝不会放开网关），例如 `["^/health$", "^/v1/(models\|chat/completions\|rerank)$", "^/api/tags$"]` |
-| `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | 内存令牌桶限流（单进程）：`by` 选择桶的维度（`ip` 或 `key`），`burst` 为桶容量（瞬时上限），`per_minute` 为持续补充速率；超量返回 **429**。可在反向代理后开启，或作为公网第一道廉价防线 |
+| `allowed_client_ips` | `[]` | 客户端 IP 围栏（支持 CIDR，如 `10.0.0.0/8`），留空不限制。判定只看真实 TCP 对端 / `client_ip()`，不理可伪造的 `X-Forwarded-For` |
+| `trusted_proxies` | `[]` | 可信反向代理的 CIDR 列表：只有这些对端发来的 `X-Forwarded-For` 才会影响 `client_ip()`，用于 IP 围栏、限流分桶与审计日志。`client_ip()` 取**最右侧的不受信跳**，伪造最左值无法伪装内网地址。**它不是分区锚点**——无法把请求在两个区之间搬移 |
+| `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | 内存令牌桶限流（单进程）：`by` 选 `ip` / `key`，`burst` 为桶容量，`per_minute` 为补充速率；超量返回 **429** 并带 `Retry-After`。**公网实例务必开启**（或由反代限流） |
 
-> `/docs` 与 `/openapi.json` 的可见性**不在 `security` 段**：只有 `auth.allow_access_ip_whitelist`
-> 命中的来源地址能打开（其余一律 **404**），这些地址调用 API 时同时免 API Key。
-> 文档页使用收窄后的 CSP，每个端点的 **Parameters** 区都有 `X-API-Key` 输入框，顶部 **Authorize**
-> 也可填 `Authorization: Bearer` / `X-API-Key`。
+`security.public.admin_endpoints`（`deny` / `readonly` / `allow`）是唯一**不属于**「两个区共享」的一项：
+它**只在外网监听**上生效，同时驱动 Ollama 模型管理过滤与管理面（见上方分区说明）。`deny`（默认）拦住 `api/delete`、`api/copy`、
+`api/create`、`api/push`、`api/blobs/*` 和 `api/pull`；`readonly` 放行 `pull`、其余照拦；`allow` 全部
+转发，**包括 `api/blobs/*`**。`api/show` 与 `api/version` 永不因管理员过滤被拦。内网监听从不应用这个
+模式——在可信 LAN 上拉模型是正常操作，因此对着 `server.port` 改它必定是空操作。
+
+这个过滤器同样**永远不打开一条路径**：它位于 `security.public.path_allowlist` *之后*，未列出的
+method+path 已经先被 **404**。所以公网开放 `pull` 需要两半都齐——`admin_endpoints: readonly`（或
+`allow`）**并且**列出 `POST: ["^/api/pull$"]`；缺了后者你看到的是白名单的 404，而不是模式没生效。
+最小 YAML 与第三个成因（`default_upstream` 悬空）见[常见问题](#常见问题)里的
+「`admin_endpoints: allow`（或 `readonly`）改了没效果？」。
+
+两个监听端口都**只转发网关自己声明过的 API 路径**。集合之外的路径在哪个区都是 **404**，与有没有 Key
+无关，因此内网监听不是通向上游整套 API 的开放代理；公网白名单只能在这个面之上继续收窄，不能拓宽。
+完整的转发清单与本地应答清单见[网关转发哪些路径](#网关转发哪些路径)。
+
+`security.internal.expose_docs` 控制**仅内网区**的 `/docs` / `/openapi.json` / Swagger 静态资源；
+外网区永不提供这些，也不再有 `auth.allow_access_ip_whitelist`。文档页使用收窄后的 CSP，每个端点的
+**Parameters** 区都有 `X-API-Key` 输入框，顶部 **Authorize** 也可填 `Authorization: Bearer` /
+`X-API-Key`。
 
 所有响应默认还会带上加固响应头：`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、
 `Referrer-Policy: no-referrer`、`Cross-Origin-Opener-Policy: same-origin`、
 `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`，以及严格的 `Permissions-Policy`。
-这些头无法关闭（只加固响应，不会泄露数据）。
-唯一例外是 `/docs` 与 `/openapi.json`：它们使用收窄后的 CSP（`script-src`/`style-src 'self' 'unsafe-inline'`），
-以便内置的 Swagger UI 能正常加载——否则页面会渲染成一片空白；其余响应仍保持 `default-src 'none'`。
+这些头无法关闭。唯一例外是 `/docs` 与 `/openapi.json`（收窄的 CSP
+`script-src`/`style-src 'self' 'unsafe-inline'`），以便内置的 Swagger UI 能正常加载。
 
-> **容器健康检查：** Docker 的 `HEALTHCHECK` 现在改为每小时探测一次 `/health`（`--interval=1h`），
-> 而非每 30 秒一次。网关本身不做周期性轮询，只在收到 `/health` 时应答，因此该间隔只是 Docker 侧的存活探测节奏。
+> **容器健康检查：** Docker 的 `HEALTHCHECK` 每小时探测一次 `/health`（`--interval=1h`）。把它指向
+> 内网端口（`server.port`），那里的 `/health` 恒匿名。纯公网实例没有任何匿名 HTTP 路径——改用
+> TCP 端口探测。
+
+### 信任区与客户端 IP 的来源
+
+镜像通过 `python serve.py` 启动，显式设置 uvicorn 的 `proxy_headers=False`。直接执行
+`python -m uvicorn main:app` 则会让 `ProxyHeadersMiddleware` 用调用方提交的 `X-Forwarded-For`
+改写 `scope["client"]`，这正是过去基于 IP 的控制可被绕过的根因。现在分区可信度完全不依赖该地址：
+判定依据是内核分配的**本地监听端口**，调用方无法伪造。
+
+端口与分区只写在 `config.yaml`：
+
+```yaml
+server:
+  port: 8000        # 内网（可信 LAN）监听
+security:
+  public:
+    port: 8001      # null = 不开；= server.port（8000）= 纯公网；其余 = 双监听
+    path_allowlist: # 外网的全部暴露面（方法 -> re.fullmatch 正则）
+      GET:  ["^/v1/models$"]
+      POST: ["^/v1/chat/completions$", "^/v1/messages$", "^/api/generate$", "^/api/chat$"]
+  internal:
+    allow_anonymous: true
+```
+
+| 分区 | 何时生效 | 普通 API | 管理 / 文档 / `/admin` |
+|---|---|---|---|
+| `internal` | `server.port`，且该端口不是外网端口 | `security.internal.allow_anonymous: true` 时免 Key（否则要 Key/会话）；`/` + `/health` 恒匿名 | 管理接口只认 Cookie；`/docs`、`/openapi.json`、`/admin` 可访问（文档受 `expose_docs` 控制）——**只发布到内网** |
+| `public` | `security.public.port`（如 8001），**或 `= server.port` 时的唯一端口** | **一律要 Key/会话**（无开关）；这条检查属于分区（中间件里的 `bridge.public_auth_denial()`）而不属于路由，所以列进白名单永远不会把端点变成匿名。只有 `public.path_allowlist` 里的 方法+`re.fullmatch` 路径存在，其余 **404**（带不带 Key 都一样） | `/v1/management/*`、`/admin*` 及含 `..`/NUL 的路径**硬 404**；`/docs`、`/openapi.json`、`/`、`/probe`、`/health` 与探查类路径除非显式列出否则 404（管理与控制台永远 404） |
+
+`security.public.port: null` = 不开外网监听。`= server.port` = **纯公网**单 socket，
+**没有任何匿名 HTTP 路径**——把容器 HEALTHCHECK 与负载均衡改为 TCP 连接探测，或另开一个内网监听。
+否则 `serve.py` 会在同一进程绑定两个监听（共享 Key 缓存与限流桶）。把两个**宿主**端口映射到
+同一个**容器**端口并不会产生两个区——容器内只看到一个 socket。
+
+旧环境变量 `LLMHUB_HOST`、`LLMHUB_PORT`、`LLMHUB_LOG_LEVEL`、`LLMHUB_PUBLIC_PORTS`、
+`LLMHUB_PUBLIC_PORT`、`LLMHUB_PUBLIC_ADMIN` 与 `GATEWAY_AUTH_DISABLED` 只作为一次性迁移提示被读取
+（显式配置优先）并打印警告——请从 `.env` / compose 中删掉。特别是 `LLMHUB_PUBLIC_PORTS` 不再打开
+任何监听，请改用 `security.public.port`。
 
 ### 把密钥移出配置文件（唯一方式）
 
-`config.yaml` 已不再接受 `api_keys`，密钥只能从运行环境注入：
+已经没有任何 Key 变量了。`config.yaml` 不接受 `api_keys`，`GATEWAY_API_KEYS` 被忽略（Windows 启动
+脚本还会把它从环境里删掉），`GATEWAY_API_KEYS_FILE` 与 `.keys` 文件也一并移除。Key 只以 hash 行的
+形式存在于 `llmhub.db`，由管理台创建：
 
 ```bash
-# 容器 / 进程环境变量，逗号或换行分隔多个 Key
-export GATEWAY_API_KEYS="sk-gateway-example-key,sk-gateway-example-two"
-# 或者指向一个密钥文件（Docker / K8s secret），文件名例如 data/.keys
-export GATEWAY_API_KEYS_FILE=/data/.keys
+# 1. 设置管理台密码并启动网关
+export ADMIN_PASSWORD="$(openssl rand -hex 24)"
+
+# 2. 登录并签发第一把 Key（明文只返回这一次）
+curl -s -c jar.txt http://127.0.0.1:8000/v1/management/auth/login \
+  -H 'content-type: application/json' -d '{"password":"<你的 ADMIN_PASSWORD>"}'
+curl -s -b jar.txt http://127.0.0.1:8000/v1/management/api-keys \
+  -H 'content-type: application/json' -d '{"label":"first"}'
 ```
 
-未设置 `GATEWAY_API_KEYS_FILE` 时，网关会**自动读取 `config.yaml` 同目录下的 `.keys`**——所以只要把
-`/config/.keys`（或默认布局的 `/data/.keys`）挂进去就够了，不必再加环境变量；显式设置的
-`GATEWAY_API_KEYS_FILE` 优先。
-
-网关启动时读取以上来源并合并去重；旧配置里残留的 `api_keys` 只会打印一条忽略警告。
-`auth.allow_access_ip_whitelist`（正则数组，按 **TCP 对端**匹配，绝不看 `X-Forwarded-For`）中的地址
-可以打开 `/docs` 与 `/openapi.json`，调用网关 API 时也免 Key 检查；白名单非空时即使没有任何 Key
-网关也能启动（受信任网络模式，启动日志有警告）。常见拼写错误 `allow_access_ip_whilelist` 会被
-自动纠正为 `allow_access_ip_whitelist` 并打印警告。
+`config.yaml` 里残留的 `api_keys` 只会打印一条忽略警告。已经不存在「某个 IP 白名单可以免 Key」
+这回事——可信度由监听区决定：内网区可通过 `security.internal.allow_anonymous` 免 Key，外网区则
+一律要 Key 或管理台会话。只有当系统不可能存在任何凭据时（表为空、`ADMIN_PASSWORD` 未设置、
+内网区不允许匿名）网关才**拒绝启动**。
 
 ### System One（laya-server 与 Ollama 代理）
 
 网关可把 System One 结构化决策 API（`POST /v1/systemone`，兼容 Jev 线协议）统一收敛进来。后端两种都支持：`1panel/laya-server`，以及 **Ollama 0.40+**（原生提供该端点）：
 
-- **调用方鉴权**用网关自己的 Key（`.env` / `GATEWAY_API_KEYS`，即 `.keys` 配置）；
+- **调用方鉴权**用网关自己的 Key（在 `/admin` 签发，存于 `api_keys` 表）；
 - 网关再以 `config.yaml` 里 `systemone.api_key_env`（默认 `SYSTEMONE_SERVER_API_KEY`）环境变量中的密钥对后端签名；
 - 请求体 / 响应体**原样透传**，网关不做改写。
 
@@ -1058,40 +1287,59 @@ export GATEWAY_API_KEYS_FILE=/data/.keys
 
 ### 公网部署 checklist
 
-- [ ] `admin_endpoints` 保持 `deny`（或至少 `readonly`），绝不 `allow`
-- [ ] 所有密钥都是随机的：优先用管理台签发的 47 字符 `sk-hub-…`；首次启动从 `GATEWAY_API_KEYS` /
-      `GATEWAY_API_KEYS_FILE`（如 `data/.keys`）导入的旧 Key 也要 ≥ 16 位随机串。库里只存摘要，
-      所以 `llmhub.db` 要与原来的密钥文件同等保护
+- [ ] `security.public.admin_endpoints: allow` 要想清楚再开。它同时做两件事：一是不再过滤 Ollama 的
+      管理调用（`api/pull`/`push`/`create`/`delete`/`copy`/`blobs/*` 全放行，且每条仍需自己的
+      `path_allowlist` 规则）；二是**在公网监听上打开管理面**——`/admin` 与 `/v1/management/*`
+      不再 404。管理面永远不匿名（只有静态外壳与登录握手免凭据，其余仍需会话 Cookie），但公网可达
+      的管理台必须配 32 位以上随机 `ADMIN_PASSWORD` 并开启 `security.rate_limit`
+- [ ] 管理台只在 LAN 使用时把 `security.public.admin_endpoints` 保持在 `deny`
+- [ ] 所有密钥都是随机的：管理台签发的 47 字符 `sk-hub-…`，约 238 位熵，已不存在弱 Key 或导入 Key。
+      库里只存摘要，所以 `llmhub.db` 要与密钥文件同等保护
 - [ ] 前面有反向代理（Nginx/Caddy）终止 TLS
-- [ ] 如需限制来源，`security.allowed_client_ips` 填可信网段
-- [ ] `auth.allow_access_ip_whitelist` 保持 `[]`；确实要开 `/docs` 时只填可信来源——判定用的是 ASGI 客户端地址，直连即 TCP 对端；经本机反代时 uvicorn 会按受信转发头改写它，务必确保反代清理 `X-Forwarded-For`
-- [ ] 不要暴露 11434/11435 等上游端口，只暴露网关 8000
+- [ ] 如需限制来源，`security.allowed_client_ips` 填可信网段（两个区同时生效）
+- [ ] 除非内网端口确实在可信 LAN 上，否则保持 `security.internal.allow_anonymous: false`；内网端口
+      对外可达时保持 `security.internal.expose_docs: false`。已不存在可免 Key 的 IP 白名单——可信度
+      就是监听 socket
+- [ ] 在 `config.yaml` 设置 `security.public.port: 8001`（纯公网实例则 `= server.port`），并把
+      `security.public.path_allowlist` 收敛到最小的方法+正则对；用 `python serve.py` 启动镜像，
+      不要用裸 `uvicorn main:app`
+- [ ] 从 `.env` / compose 中删掉所有旧 `LLMHUB_*` 端口变量；管理工作走内网端口 / VPN
+      （`/v1/management/*` 与 `/admin` 在外网区硬 404）
+- [ ] 从公网验收：只有白名单里的组合有响应（无 Key → 401，带 Key → 200），其余一律 404；
+      `/v1/management/*` 与 `/admin` → 404
+- [ ] 不要暴露 11434/11435 等上游端口，只暴露网关内网 8000（LAN）与外网 8001（经 TLS 反代）
 
 ## 本地开发（不依赖 Docker）
 
 ### 启动脚本（Windows）
 
-`scripts\start-local.bat`（或直接 `scripts\start-local.ps1`）是最短路径：它定位 python、读取 `.env`、找到 `data\config.yaml`，然后调用应用**自己的**规则做启动前检查——缺少依赖、Pydantic 模型拒绝配置、开启鉴权却没有 API Key、弱/占位 Key、端口被占用、控制台未构建——网关启动后打印各入口地址。
+`scripts\start-local.bat`（或直接 `scripts\start-local.ps1`）是最短路径：它定位 python、读取 `.env`、找到 `data\config.yaml`，然后调用应用**自己的**规则做启动前检查——缺少依赖、Pydantic 模型拒绝配置、`api_keys` 表为空且内网区不允许匿名（失败关闭）、弱/占位 Key、**内网或外网端口被占用**、控制台未构建——然后打印解析后的分区布局和各入口地址。**端口与分区只来自 `config.yaml`**（`server.port`、`security.public.port`）；启动脚本会对 `.env` 里残留的旧 `LLMHUB_*` 端口变量告警，但不会使用它们。它按场景自动选择入口：
+
+- 单个内网监听（默认）：uvicorn + `--no-proxy-headers` + 自动重载。
+- 配置了独立的外网监听，或带 `-NoReload`：`python serve.py`，同一进程绑定所有监听端口并执行外网路径策略；无自动重载。
 
 ```powershell
-scripts\start-local.bat                      # 检查通过后启动 uvicorn（自动重载）
-scripts\start-local.bat -CheckOnly           # 只做检查，不启动
-scripts\start-local.bat -Install -Port 8888  # 先执行 pip install -r requirements.txt
-scripts\start-local.bat -NoReload            # 保存 .py 时不重启
+scripts\start-local.bat                               # 单监听，uvicorn + 自动重载
+scripts\start-local.bat -CheckOnly                    # 只做检查，不启动
+scripts\start-local.bat -Install                      # 先执行 pip install -r requirements.txt
+scripts\start-local.bat -NoReload                     # 加固入口 serve.py，无自动重载
+# 要开外网监听：先在 data\config.yaml 里设 security.public.port: 8001，然后
+scripts\start-local.bat -NoReload                     # serve.py 同时绑定 8000 + 8001
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `-Port` / `-Bind` | 覆盖配置里的 `server.port` / `server.host` |
 | `-Config` | 指定 `config.yaml`（默认取 `.env` 的 `CONFIG_PATH`，按镜像的方式相对 `app/` 解析，解析不到则用 `data\config.yaml`） |
 | `-EnvFile` | 指定环境变量文件（默认 `<repo>\.env`；shell 中已设置的变量优先于文件） |
 | `-Python` | 指定解释器（默认 `python`，其次 `py -3`） |
-| `-LogLevel` | 覆盖 `server.log_level` |
-| `-NoReload` | 不带 `--reload` 启动 |
+| `-NoReload` | 用加固入口 `serve.py` 替代 uvicorn；无自动重载（开外网监听时也必须用） |
 | `-Install` | 先执行 `pip install -r requirements.txt` |
-| `-CheckOnly` | 打印检查结果后退出 |
+| `-CheckOnly` | 打印解析后的分区布局与结论后退出，不绑定端口 |
 
-脚本在 `app/` 目录下以 `--app-dir app` 启动 uvicorn，工作目录与镜像的 `WORKDIR /app` 一致，因此 `.env` 中的相对路径（`../data/config.yaml`、`../data/.keys`）在本地和容器里解析结果相同。
+> 已移除的参数：`-Port`、`-Bind`、`-LogLevel`、`-PublicPorts`、`-PublicAdmin`。绑定地址、端口与分区
+> 请改在 `config.yaml` 里设置。
+
+两种入口都在 `app/` 目录下运行，工作目录与镜像的 `WORKDIR /app` 一致，因此 `.env` 中的相对路径（`../data/config.yaml`）在本地和容器里解析结果相同。手动启动 uvicorn（不经脚本）时务必带 `--no-proxy-headers`，避免调用方提交的 `X-Forwarded-For` 改写客户端 IP。
 
 ### 快速开始
 
@@ -1103,14 +1351,19 @@ pip install -r requirements.txt
 cp data/config.example.yaml data/config.yaml
 # 编辑 data/config.yaml，填入真实的上游地址
 
-# 3. 准备密钥文件（.env）—— 下文的 --env-file 会自动加载
+# 3. 准备环境变量文件（.env）—— 下文的 --env-file 会自动加载
 cp .env.example .env
-# 编辑 .env：设置 GATEWAY_API_KEYS、SYSTEMONE_SERVER_API_KEY 等
+# 编辑 .env：设置 ADMIN_PASSWORD（后端需要时再设 SYSTEMONE_SERVER_API_KEY）
 
-# 4. 启动服务（自动加载 ../.env）
+# 4. 启动单监听开发服务（自动加载 ../.env）
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
+# 生产 / 双区：cd app && python serve.py（在 config.yaml 里设 security.public.port: 8001 开外网监听）
 ```
+
+凡是会暴露到本机的场景，优先用 `python serve.py`（或 Windows 启动脚本加 `-NoReload`）：
+它在同一进程绑定所有监听端口，并从代码层禁用代理头改写。上面的
+`--no-proxy-headers` 让单监听 uvicorn 得到同等保护。
 
 ### Windows PowerShell 启动
 
@@ -1118,36 +1371,39 @@ python -m uvicorn main:app --reload --port 8000 --env-file ../.env
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 准备密钥文件（.env）
+# 2. 准备环境变量文件（.env）
 Copy-Item .env.example .env
-# 编辑 .env：设置 GATEWAY_API_KEYS、SYSTEMONE_SERVER_API_KEY 等
+# 编辑 .env：设置 ADMIN_PASSWORD（后端需要时再设 SYSTEMONE_SERVER_API_KEY）
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 
-# 3. 启动服务（自动加载 ../.env）
+# 3. 启动单监听开发服务（自动加载 ../.env）
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 ### 指定配置文件运行
 
 ```bash
 cd app
-CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
+CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 ```powershell
 # Windows PowerShell
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 cd app
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 ### 后台运行（Linux/macOS）
 
 ```bash
 cd app
-nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env > ../llm-hub.log 2>&1 &
+nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers > ../llm-hub.log 2>&1 &
 ```
+
+绑定的地址/端口不是 loopback 时，请用 `python serve.py` 替代 uvicorn，以便从代码层禁用代理头改写，
+并让 `security.public.port` 声明的外网监听生效。
 
 ### 注册为 Windows 服务（使用 NSSM）
 
@@ -1159,6 +1415,9 @@ nssm set LLMHub AppEnvironmentExtra "CONFIG_PATH=D:\workspace\github\llm-hub\dat
 nssm start LLMHub
 ```
 
-> **说明：**`uvicorn --env-file` 会在启动时一次性读取 `.env` 并把其中的变量注入为环境变量（如 `GATEWAY_API_KEYS`、`SYSTEMONE_SERVER_API_KEY` 等），**不会热重载**——改了 `.env` 后需重启 uvicorn。而 `config.yaml` 的改动仍无需重启即可热加载。
+> **说明：**`uvicorn --env-file` 会在启动时一次性读取 `.env` 并把其中的变量注入为环境变量（如 `ADMIN_PASSWORD`、`SYSTEMONE_SERVER_API_KEY` 等），**不会热重载**——改了 `.env` 后需重启 uvicorn。而 `config.yaml` 的改动仍无需重启即可热加载。调用方 Key 完全不在 `.env` 里：它们存于 `llmhub.db`，在 `/admin` 管理。
 
-交互式文档：<http://localhost:8000/docs>（仅对 `auth.allow_access_ip_whitelist` 命中的来源开放，其余地址返回 **404**；这些来源同时可免 API Key 调用 API。文档页每个端点的 **Parameters** 区都有 `X-API-Key` 输入框——**Try it out** 后填写，**Execute** 时随该次请求发送；顶部 **Authorize** 则可一次性填入 `Authorization: Bearer` 或 `X-API-Key` 供所有请求使用）
+交互式文档：<http://localhost:8000/docs>（仅内网区可用，且要求 `security.internal.expose_docs: true`；
+外网区对文档一律返回 **404**。文档页每个端点的 **Parameters** 区都有 `X-API-Key` 输入框——
+**Try it out** 后填写，**Execute** 时随该次请求发送；顶部 **Authorize** 则可一次性填入
+`Authorization: Bearer` 或 `X-API-Key` 供所有请求使用）

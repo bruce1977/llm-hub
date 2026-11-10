@@ -693,9 +693,9 @@
           <div class="card-h">功能介绍 <span class="tag">rerank</span></div>
           <div class="feature-intro">
             重排（Rerank）在初步召回之后，用模型对候选文档逐条打分并重新排序，提升问答、搜索与 RAG 的命中质量。llm-hub
-            暴露 <code>POST /v1/rerank</code>：传入 <code>query</code> 与 <code>documents</code>，网关把请求转换成上游可执行的形式——生成式模型按对数概率打分（logprobs），或按向量余弦相似度打分（embedding），再把分数归一化为
+            暴露 <code>POST /v1/rerank</code>：传入 <code>query</code> 与 <code>documents</code>，网关把请求转换成生成式重排模型可执行的形式，按对数概率打分并归一化为
             <code>results[].relevance_score</code>，可用 <code>top_n</code> 与
-            <code>return_documents</code> 控制输出，打分方式可按模型覆盖。
+            <code>return_documents</code> 控制输出。
           </div>
         </div>
         <div class="card">

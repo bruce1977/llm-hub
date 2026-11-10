@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -157,19 +158,65 @@ def _redact(value: Any) -> Any:
     return value
 
 
+# Fallback for bodies that are truncated (and therefore no longer valid JSON) or not
+# JSON at all: mask the *value* of any credential-shaped field in the raw text. Without
+# this, an oversized body containing `"api_key": "…"` used to go to disk verbatim.
+_REDACT_TEXT = re.compile(
+    r'("(?:[A-Za-z0-9_.-]*(?:api[_-]?key|authorization|password|secret|token)[A-Za-z0-9_.-]*)"'
+    r'\s*:\s*")((?:\\.|[^"\\])*)(")',
+    re.IGNORECASE,
+)
+
+
+def _redact_text(text: str) -> str:
+    return _REDACT_TEXT.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
+
+
 def sanitize_body(raw: bytes | None) -> tuple[str | None, bool]:
-    """Return (text, truncated) for storage: 8 KB cap, credentials masked."""
+    """Return (text, truncated): mask the FULL buffer first, then keep 8 KB.
+
+    The old order (truncate -> parse JSON -> mask) meant any body over 8 KB could no
+    longer be parsed and was stored unredacted, exposing `api_key` / `authorization`
+    values in SQLite and in the console JSON pane.
+    """
     if not raw:
         return None, False
     truncated = len(raw) > MAX_BODY_CHARS
-    data = raw[:MAX_BODY_CHARS]
-    text = data.decode("utf-8", errors="replace")
-    if not truncated:
+    text = raw.decode("utf-8", errors="replace")
+    if len(raw) <= 65536:
         try:
-            text = json.dumps(_redact(json.loads(data)), ensure_ascii=False)
+            text = json.dumps(_redact(json.loads(text)), ensure_ascii=False)
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
-    return text, truncated
+    text = _redact_text(text)
+    return text[:MAX_BODY_CHARS], truncated
+
+
+_SENSITIVE_QUERY_KEYS = {
+    "api_key",
+    "key",
+    "token",
+    "access_token",
+    "refresh_token",
+    "password",
+    "secret",
+    "authorization",
+}
+
+
+def sanitize_query(query: str | None) -> str | None:
+    """Mask credential values in the query string before it is written to SQLite.
+
+    `security.allow_query_api_key` deliberately allows a key in the URL; forwarding
+    already strips `api_key`, but the log used to keep the plaintext query forever.
+    """
+    if not query:
+        return None
+    from urllib.parse import parse_qsl, urlencode
+
+    parts = parse_qsl(query, keep_blank_values=True)
+    cleaned = [(k, "***" if k.lower() in _SENSITIVE_QUERY_KEYS else v) for k, v in parts]
+    return urlencode(cleaned) or None
 
 
 def _as_int(value: Any) -> int | None:

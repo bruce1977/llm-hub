@@ -1,0 +1,77 @@
+"""Log formatting shared by every entrypoint (``serve.py``, ``main.py``, the Windows launcher).
+
+uvicorn installs its own logging configuration when it starts (``uvicorn.config.LOGGING_CONFIG``),
+which replaces whatever ``logging.basicConfig()`` set up. Its stock formatters carry **no
+timestamp**, so a burst of access lines looks like::
+
+    INFO:     167.104.161.192:33932 - "GET /v1/models HTTP/1.1" 404 Not Found
+
+That is impossible to line up against a restart, a config change or a scan window after the fact.
+``app/logging.json`` is the single source of truth for the format and is consumed three ways:
+
+  * ``serve.py`` passes the loaded dict to ``uvicorn.Config(log_config=...)``;
+  * ``main.py``'s ``setup_logging()`` reuses ``LOG_FORMAT`` / ``DATE_FORMAT`` for its
+    ``basicConfig`` so application log lines match byte-for-byte;
+  * ``scripts/start-local.ps1`` passes ``--log-config logging.json`` to the uvicorn CLI
+    (auto-reload path), where a file path is the only thing uvicorn accepts.
+
+Handlers stay on stderr for server/app lines and stdout for access lines, exactly as uvicorn
+ships them, so existing log collectors keep working.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+#: Used by ``main.py``'s basicConfig. Must match the ``fmt`` values in logging.json.
+LOG_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s | %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+LOG_CONFIG_PATH = Path(__file__).with_name("logging.json")
+
+
+def uvicorn_log_config(level: str = "info") -> dict[str, Any]:
+    """Return logging.json with every level pinned to ``server.log_level``.
+
+    uvicorn would otherwise apply ``--log-level`` to ``uvicorn.error``/``uvicorn.access`` only,
+    leaving root and ``llm_hub`` at the file's default. Doing it here keeps one knob
+    (``server.log_level``) authoritative for the whole process.
+    """
+    config: dict[str, Any] = json.loads(LOG_CONFIG_PATH.read_text(encoding="utf-8"))
+    name = str(level or "info").upper()
+    for logger_config in config.get("loggers", {}).values():
+        logger_config["level"] = name
+    config.get("root", {})["level"] = name
+    return config
+
+
+def apply_to_existing_handlers(level: str = "info") -> None:
+    """Re-format handlers uvicorn has ALREADY installed (the ``uvicorn main:app`` path).
+
+    Only the formatters are replaced - handler class, stream and logger levels stay exactly as
+    uvicorn set them, so stdout/stderr routing and ``--log-level`` are untouched. In the
+    ``serve.py`` path this is a harmless no-op: ``logging.json`` already supplied these
+    formatters. It matters when uvicorn's stock LOGGING_CONFIG ran instead, because then every
+    access line would print without a timestamp.
+    """
+    try:
+        from uvicorn.logging import AccessFormatter, DefaultFormatter
+    except ImportError:  # pragma: no cover - uvicorn is a hard dependency
+        return
+
+    config = uvicorn_log_config(level)
+    formatters = config["formatters"]
+    default_fmt = formatters["default"]
+    access_fmt = formatters["access"]
+    for logger_name, formatter_cls, spec in (
+        ("uvicorn", DefaultFormatter, default_fmt),
+        ("uvicorn.error", DefaultFormatter, default_fmt),
+        ("uvicorn.access", AccessFormatter, access_fmt),
+    ):
+        for handler in logging.getLogger(logger_name).handlers:
+            handler.setFormatter(
+                formatter_cls(fmt=spec["fmt"], datefmt=spec["datefmt"], use_colors=False)
+            )

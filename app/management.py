@@ -1,11 +1,13 @@
 """
 Read-only management API for the web console (``/v1/management``).
 
-Every route except login/logout depends on :func:`admin_auth.require_admin`, so it
-accepts only the signed admin session cookie minted by ``POST /auth/login``; the admin
-password is a login-page credential, never a request credential. Nothing here writes
-configuration: the console is a projection of ``config.yaml`` plus live probes of the
-upstreams.
+Every route except login/logout depends on :func:`admin_auth.require_admin_session`,
+so it accepts only the signed admin session cookie minted by ``POST /auth/login``.
+A caller API key is deliberately NOT an admin credential: those keys are distributed
+to every client, and granting them management access would expose the full config,
+all request bodies and the config writer. The admin password is a login-page
+credential only. The console is otherwise a projection of ``config.yaml`` plus live
+probes of the upstreams; the one write path is ``PUT /config``.
 
 Live probes reuse the same ``httpx.AsyncClient`` as forwarding, with a short timeout
 so one dead upstream never stalls the whole view.
@@ -19,6 +21,7 @@ import hmac
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -30,12 +33,11 @@ from admin_auth import (
     ADMIN_USERNAME,
     create_admin_token,
     get_admin_password,
-    require_admin,
     require_admin_session,
     set_admin_cookie,
 )
 from api_test import MAX_RESPONSE_BYTES, KINDS, execute, get_kind
-from auth import client_ip
+from auth import client_ip, peer_ip
 from bench import BenchError, BenchOptions, run_bench
 from bench_store import BenchStore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -65,6 +67,21 @@ MASK = "••••••"
 PROBE_TIMEOUT = 5.0
 _STATUS_FILTERS = {"2xx", "3xx", "4xx", "5xx"}
 
+# Login throttling: the console is reachable from the internet on some deployments, and
+# the only online defence used to be a flat 0.1s delay. Five failures from one TCP peer
+# lock that peer out for 15 minutes; a successful login clears its counter.
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCK_SECONDS = 15 * 60
+_LOGIN_FAILURES: dict[str, tuple[int, float]] = {}  # peer -> (failures, locked_until)
+_LOGIN_LOCK = threading.Lock()
+# A config save is read-modify-write on a shared file; serialise it and use a unique temp
+# file so two concurrent saves cannot replace each other's half-written document.
+_CONFIG_WRITE_LOCK = asyncio.Lock()
+# Analytics queries scan the whole request table. Cap the window a caller can ask for.
+MAX_STATS_WINDOW_DAYS = 90
+# Each benchmark job owns an OS thread and monopolises the GPU until it finishes.
+MAX_CONCURRENT_BENCH_JOBS = 4
+
 
 # --------------------------------------------------------------------------- #
 # Auth (login/logout are public; everything else requires an admin session)
@@ -76,6 +93,38 @@ class AdminLogin(BaseModel):
     password: str
 
 
+def _login_blocked(peer: str) -> bool:
+    with _LOGIN_LOCK:
+        entry = _LOGIN_FAILURES.get(peer)
+        if not entry:
+            return False
+        _, locked_until = entry
+        if locked_until > time.time():
+            return True
+        if locked_until:
+            _LOGIN_FAILURES.pop(peer, None)
+        return False
+
+
+def _login_failed(peer: str) -> None:
+    with _LOGIN_LOCK:
+        now = time.time()
+        failures, locked_until = _LOGIN_FAILURES.get(peer, (0, 0.0))
+        failures += 1
+        if failures >= LOGIN_MAX_FAILURES:
+            locked_until, failures = now + LOGIN_LOCK_SECONDS, 0
+        _LOGIN_FAILURES[peer] = (failures, locked_until)
+        # Bound the table: forget peers whose lock has long expired.
+        if len(_LOGIN_FAILURES) > 1000:
+            for stale in [k for k, (_, until) in _LOGIN_FAILURES.items() if until < now - 3600]:
+                _LOGIN_FAILURES.pop(stale, None)
+
+
+def _login_succeeded(peer: str) -> None:
+    with _LOGIN_LOCK:
+        _LOGIN_FAILURES.pop(peer, None)
+
+
 async def login(request: Request, body: AdminLogin) -> Response:
     """Validate the admin credentials and mint a signed session cookie."""
     key = get_admin_password()
@@ -84,11 +133,20 @@ async def login(request: Request, body: AdminLogin) -> Response:
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Admin is not configured: set the ADMIN_PASSWORD environment variable.",
         )
+    peer = peer_ip(request) or "unknown"
+    if _login_blocked(peer):
+        raise HTTPException(
+            status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed sign-ins; try again later.",
+            headers={"Retry-After": str(LOGIN_LOCK_SECONDS)},
+        )
     # Constant-time compare; a small delay blunts online brute-force.
     name_ok = hmac.compare_digest(body.username.strip().lower(), ADMIN_USERNAME)
     if not name_ok or not hmac.compare_digest(body.password, key):
+        _login_failed(peer)
         await asyncio.sleep(0.1)
         raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password.")
+    _login_succeeded(peer)
     resp = JSONResponse({"ok": True})
     set_admin_cookie(resp, request, create_admin_token(key))
     return resp
@@ -111,7 +169,7 @@ async def route_logout():
 
 
 @router.get("/auth/ping", summary="Admin session heartbeat", tags=["management"])
-async def route_ping(_=Depends(require_admin)):
+async def route_ping(_=Depends(require_admin_session)):
     return JSONResponse({"ok": True, "admin": True})
 
 
@@ -399,6 +457,17 @@ def _resolve_range(start: str | None, end: str | None, *, default_hours: int = 2
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST, detail="start must not be later than end."
         )
+    # A 100-year window would turn a dashboard refresh into a full-table window-function
+    # scan. All analytics views only ever need the recent history, so cap the span.
+    try:
+        span = datetime.fromisoformat(finish) - datetime.fromisoformat(begin)
+    except ValueError:
+        span = timedelta(0)
+    if span > timedelta(days=MAX_STATS_WINDOW_DAYS):
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"start/end window must not exceed {MAX_STATS_WINDOW_DAYS} days.",
+        )
     return begin, finish
 
 
@@ -466,7 +535,7 @@ async def overview(
     request: Request,
     today_start: str | None = None,
     today_end: str | None = None,
-    _=Depends(require_admin),
+    _=Depends(require_admin_session),
 ):
     cfg = request.app.state.manager.config
     client = request.app.state.client
@@ -521,14 +590,14 @@ async def overview(
 
 
 @router.get("/upstreams", summary="Upstream instance list with health and VRAM", tags=["management"])
-async def list_upstreams(request: Request, _=Depends(require_admin)):
+async def list_upstreams(request: Request, _=Depends(require_admin_session)):
     cfg = request.app.state.manager.config
     infos = await _probe_all(cfg, request.app.state.client)
     return JSONResponse({"upstreams": [_public_upstream(i) for i in infos]})
 
 
 @router.get("/upstreams/{name}", summary="One upstream: health, configured models and running state", tags=["management"])
-async def upstream_detail(name: str, request: Request, _=Depends(require_admin)):
+async def upstream_detail(name: str, request: Request, _=Depends(require_admin_session)):
     """Live probe plus the models this upstream declares in ``config.yaml``.
 
     Plain names are listed as written; only a prefix wildcard is resolved through the
@@ -578,7 +647,7 @@ async def upstream_detail(name: str, request: Request, _=Depends(require_admin))
 # Model configuration projections (read-only)
 # --------------------------------------------------------------------------- #
 @router.get("/models/llm", summary="LLM models declared per upstream, plus aliases", tags=["management"])
-async def models_llm(request: Request, _=Depends(require_admin)):
+async def models_llm(request: Request, _=Depends(require_admin_session)):
     """One row per model name an upstream declares in ``config.yaml``, with runtime state.
 
     Only ``upstreams[].models`` is listed - a model installed on the instance but never
@@ -626,7 +695,7 @@ async def models_llm(request: Request, _=Depends(require_admin)):
 
 
 @router.get("/models/rerank", summary="Rerank configuration projection", tags=["management"])
-async def models_rerank(request: Request, _=Depends(require_admin)):
+async def models_rerank(request: Request, _=Depends(require_admin_session)):
     cfg = request.app.state.manager.config
     rerank = cfg.rerank
     models = []
@@ -677,7 +746,7 @@ async def models_rerank(request: Request, _=Depends(require_admin)):
 
 
 @router.get("/models/systemone", summary="System One configuration projection", tags=["management"])
-async def models_systemone(request: Request, _=Depends(require_admin)):
+async def models_systemone(request: Request, _=Depends(require_admin_session)):
     cfg = request.app.state.manager.config
     so = cfg.systemone
     owner = None if so.model in {"", "local", "auto"} else cfg.find_upstream_for_model(so.model)
@@ -728,7 +797,7 @@ async def models_systemone(request: Request, _=Depends(require_admin)):
 # Tools configuration
 # --------------------------------------------------------------------------- #
 @router.get("/tools/websearch", summary="Web search configuration projection", tags=["management"])
-async def tools_websearch(request: Request, _=Depends(require_admin)):
+async def tools_websearch(request: Request, _=Depends(require_admin_session)):
     cfg = request.app.state.manager.config
     ws = cfg.websearch
     owner = cfg.websearch_upstream_obj()
@@ -765,7 +834,7 @@ async def list_requests(
     path: str | None = None,
     page: int = 1,
     page_size: int = 15,
-    _=Depends(require_admin),
+    _=Depends(require_admin_session),
 ):
     if page < 1:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="page must be >= 1.")
@@ -807,7 +876,7 @@ async def list_requests(
 
 
 @router.get("/requests/{record_id}", summary="One request log entry with bodies", tags=["management"])
-async def request_detail(record_id: int, request: Request, _=Depends(require_admin)):
+async def request_detail(record_id: int, request: Request, _=Depends(require_admin_session)):
     log = _log(request)
     await log.flush()
     entry = await log.get_request(record_id)
@@ -826,7 +895,7 @@ async def stats_timeseries(
     end: str | None = None,
     bucket: str = "hour",
     tz_offset: int = 0,
-    _=Depends(require_admin),
+    _=Depends(require_admin_session),
 ):
     if bucket not in {"hour", "day"}:
         raise HTTPException(
@@ -852,7 +921,7 @@ async def stats_distribution(
     start: str | None = None,
     end: str | None = None,
     group_by: str = "upstream",
-    _=Depends(require_admin),
+    _=Depends(require_admin_session),
 ):
     if group_by not in _DISTRIBUTION_KEYS:
         raise HTTPException(
@@ -866,7 +935,7 @@ async def stats_distribution(
 
 
 @router.get("/stats/failures", summary="Failure breakdown and recent samples", tags=["management"])
-async def stats_failures(request: Request, start: str | None = None, end: str | None = None, _=Depends(require_admin)):
+async def stats_failures(request: Request, start: str | None = None, end: str | None = None, _=Depends(require_admin_session)):
     begin, finish = _resolve_range(start, end)
     log = _log(request)
     await log.flush()
@@ -990,13 +1059,15 @@ async def _run_bench_job(job: BenchJob, upstream, options: BenchOptions, store: 
 class BenchStart(BaseModel):
     upstream: str
     model: str
-    rounds: int | None = None
-    max_tokens: int | None = None
+    # A benchmark drives the GPU; without bounds a single request could monopolise it
+    # for hours (rounds=100000) or request an unbounded generation.
+    rounds: int | None = Field(default=None, ge=1, le=50)
+    max_tokens: int | None = Field(default=None, ge=1, le=8192)
     think: str | None = None
 
 
 @router.post("/bench", summary="Start a model benchmark (speed test)", tags=["management"])
-async def bench_start(body: BenchStart, request: Request, _=Depends(require_admin)):
+async def bench_start(body: BenchStart, request: Request, _=Depends(require_admin_session)):
     cfg = request.app.state.manager.config
     upstream = next((u for u in cfg.upstreams if u.name == body.upstream), None)
     if upstream is None:
@@ -1013,17 +1084,24 @@ async def bench_start(body: BenchStart, request: Request, _=Depends(require_admi
     except BenchError as exc:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
+    _sweep_bench_jobs()
+    active = sum(1 for j in _BENCH_JOBS.values() if j.status in {"pending", "running"})
+    if active >= MAX_CONCURRENT_BENCH_JOBS:
+        raise HTTPException(
+            status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many running benchmarks (limit {MAX_CONCURRENT_BENCH_JOBS}).",
+            headers={"Retry-After": "30"},
+        )
     job_id = uuid.uuid4().hex
     job = BenchJob(job_id=job_id, upstream=upstream.name, model=model)
     _BENCH_JOBS[job_id] = job
-    _sweep_bench_jobs()
     store: BenchStore = request.app.state.bench_store
     _spawn_bench_job(job, upstream, options, store)
     return {"job_id": job_id, "status": "pending"}
 
 
 @router.get("/bench/history", summary="Recent benchmark records for a model", tags=["management"])
-async def bench_history(upstream: str, model: str, request: Request, _=Depends(require_admin)):
+async def bench_history(upstream: str, model: str, request: Request, _=Depends(require_admin_session)):
     # Declared BEFORE "/bench/{job_id}" so the literal "history" segment is not swallowed
     # by the job_id path parameter (which would 404 with "任务不存在或已过期").
     store: BenchStore = request.app.state.bench_store
@@ -1033,7 +1111,7 @@ async def bench_history(upstream: str, model: str, request: Request, _=Depends(r
 
 
 @router.get("/bench/{job_id}", summary="Poll a benchmark job status", tags=["management"])
-async def bench_status(job_id: str, _=Depends(require_admin)):
+async def bench_status(job_id: str, _=Depends(require_admin_session)):
     job = _BENCH_JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="任务不存在或已过期")
@@ -1203,7 +1281,7 @@ class ApiTestRequest(BaseModel):
 
 
 @router.get("/api-test/models", summary="Usable models, defaults and masked keys per API family", tags=["management"])
-async def api_test_models(request: Request, _=Depends(require_admin)):
+async def api_test_models(request: Request, _=Depends(require_admin_session)):
     """What each tester needs before it can send anything: which models answer that kind of
     request, which one to preselect, and whether the call is signed with an extra key.
 
@@ -1273,7 +1351,7 @@ async def api_test_models(request: Request, _=Depends(require_admin)):
 
 
 @router.post("/api-test", summary="Send one live request through the gateway's own endpoint", tags=["management"])
-async def api_test_run(payload: ApiTestRequest, request: Request, _=Depends(require_admin)):
+async def api_test_run(payload: ApiTestRequest, request: Request, _=Depends(require_admin_session)):
     """Execute a tester request server-side, because the admin cookie is not a caller key.
 
     The body goes to the same service the public route uses, so alias injection, `num_ctx`
@@ -1360,14 +1438,51 @@ async def api_keys_delete(key_id: int, _=Depends(require_admin_session)) -> dict
 
 
 def _clean_config_dict(cfg: Config) -> dict[str, Any]:
-    """Serialisable view of the config for the console to edit: generated model_aliases are
-    stripped so the round trip never grows config.yaml with entries that
-    ``_expand_upstream_aliases`` recomputes on every load anyway."""
+    """Serialisable view of the config for the console to edit.
+
+    Generated model_aliases are stripped so the round trip never grows config.yaml;
+    ``upstreams[].headers`` values are masked. Those headers commonly hold provider
+    ``Authorization: Bearer`` keys, and every other config projection in this module
+    already masks them - returning them here is what made a caller key equal to a
+    full credential dump.
+    """
     data = cfg.model_dump(mode="json")
     renamed = cfg._renamed_alias_names
     if renamed:
         data["aliases"] = {k: v for k, v in data.get("aliases", {}).items() if k not in renamed}
+    for upstream in data.get("upstreams") or []:
+        if isinstance(upstream, dict) and isinstance(upstream.get("headers"), dict):
+            upstream["headers"] = {str(k): MASK for k in upstream["headers"]}
     return data
+
+
+def _restore_masked_headers(incoming: dict[str, Any], raw: dict[str, Any]) -> None:
+    """PUT /config: the console sends back the masked projection. Re-attach the real
+    value from disk by (upstream name, header name) before validating/writing, so an
+    innocent Settings save cannot silently replace a provider key with six bullets.
+    A mask with no counterpart on disk is dropped instead of persisted.
+    """
+    def by_name(items: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(items, list):
+            return {}
+        return {
+            str(u.get("name")): (u.get("headers") or {})
+            for u in items
+            if isinstance(u, dict) and isinstance(u.get("headers") or {}, dict)
+        }
+
+    disk = by_name(raw.get("upstreams"))
+    for upstream in incoming.get("upstreams") or []:
+        if not isinstance(upstream, dict) or not isinstance(upstream.get("headers"), dict):
+            continue
+        saved = disk.get(str(upstream.get("name")), {})
+        for name, value in list(upstream["headers"].items()):
+            if str(value).strip() != MASK:
+                continue
+            if str(name) in saved:
+                upstream["headers"][name] = saved[str(name)]
+            else:
+                upstream["headers"].pop(name, None)
 
 
 _SEGMENT_MODELS: dict[str, type[BaseModel]] = {
@@ -1378,7 +1493,7 @@ _SEGMENT_MODELS: dict[str, type[BaseModel]] = {
 
 
 @router.get("/config", summary="Current config.yaml as a structured object", tags=["management"])
-async def get_config(request: Request, _=Depends(require_admin)) -> JSONResponse:
+async def get_config(request: Request, _=Depends(require_admin_session)) -> JSONResponse:
     """The live config the Settings console loads and edits. Generated aliases are removed
     so saving never adds the rename entries the loader recomputes for itself."""
     cfg = request.app.state.manager.config
@@ -1389,18 +1504,16 @@ class ConfigSaveBody(BaseModel):
     config: dict[str, Any]
 
 
-@router.put("/config", summary="Validate and overwrite config.yaml", tags=["management"])
-async def put_config(request: Request, body: ConfigSaveBody, _=Depends(require_admin)) -> JSONResponse:
+async def _save_config(manager, incoming: dict[str, Any]) -> JSONResponse:
     """Validate each edited segment, then overwrite the whole config.yaml atomically.
 
     Only the four UI-editable segments (``upstreams``, ``rerank``, ``systemone``,
     ``websearch``) are taken from the request; every other top-level key is preserved
-    verbatim from the file on disk, so advanced sections the console does not expose are
-    never lost. Each segment is checked on its own first so the error names the exact block
-    that failed; a clean pass then re-validates the merged whole before writing.
+    verbatim from the file on disk. Missing segments are left untouched (an empty PUT
+    must never clear the upstream list). Each segment is checked on its own first so the
+    error names the exact block that failed; a clean pass then re-validates the merged
+    whole before writing.
     """
-    manager = request.app.state.manager
-    incoming = body.config
     segments = ["upstreams", "rerank", "systemone", "websearch"]
     errors: dict[str, str] = {}
 
@@ -1415,18 +1528,22 @@ async def put_config(request: Request, body: ConfigSaveBody, _=Depends(require_a
     if not isinstance(raw, dict):
         raw = {}
 
-    # Validate each editable segment individually and replace it in `raw`.
+    # Re-attach masked provider headers before validation (their real values never
+    # leave the server, so the console can only send the mask back).
+    _restore_masked_headers(incoming, raw)
+
+    # Validate each *present* editable segment individually and replace it in `raw`.
     for seg in segments:
-        value = incoming.get(seg)
+        if seg not in incoming:
+            continue
+        value = incoming[seg]
         try:
             if seg == "upstreams":
-                validated = TypeAdapter(list[UpstreamConfig]).validate_python(
-                    value if value is not None else []
-                )
+                validated = TypeAdapter(list[UpstreamConfig]).validate_python(value)
                 raw[seg] = [u.model_dump(mode="json", exclude_defaults=True) for u in validated]
             else:
                 model_cls = _SEGMENT_MODELS[seg]
-                validated = model_cls.model_validate(value if value is not None else {})
+                validated = model_cls.model_validate(value or {})
                 raw[seg] = validated.model_dump(mode="json", exclude_defaults=True)
         except ValidationError as exc:
             errors[seg] = _format_validation_error(exc)
@@ -1448,24 +1565,34 @@ async def put_config(request: Request, body: ConfigSaveBody, _=Depends(require_a
             detail={"segments": {"config": _format_validation_error(exc)}},
         )
 
-    # Atomic overwrite: write a temp file beside the target, then replace.
+    # Atomic overwrite with a *unique* temp file: a fixed ".tmp" name let two
+    # concurrent saves replace each other's half-written document and delete the
+    # other's temp file. Callers hold _CONFIG_WRITE_LOCK for the whole read+write.
     target = manager.path
-    tmp = target.with_suffix(target.suffix + ".tmp")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     try:
-        tmp.write_text(_dump_yaml(raw), encoding="utf-8")
-        os.replace(tmp, target)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(_dump_yaml(raw))
+        os.replace(tmp_name, target)
     except Exception as exc:
         raise HTTPException(
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to write config.yaml: {exc}",
         )
     finally:
-        if tmp.exists():
+        if os.path.exists(tmp_name):
             try:
-                tmp.unlink()
+                os.unlink(tmp_name)
             except OSError:
                 pass
 
     manager.reload()
     return JSONResponse({"ok": True, "reloaded": True})
+
+
+@router.put("/config", summary="Validate and overwrite config.yaml", tags=["management"])
+async def put_config(request: Request, body: ConfigSaveBody, _=Depends(require_admin_session)) -> JSONResponse:
+    """Console-session only: a caller API key must never be able to rewrite upstreams."""
+    async with _CONFIG_WRITE_LOCK:
+        return await _save_config(request.app.state.manager, body.config)
 

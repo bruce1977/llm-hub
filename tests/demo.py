@@ -16,12 +16,39 @@ import tempfile
 TMP_DIR = tempfile.mkdtemp(prefix="llm-hub-demo-")
 CONFIG_FILE = os.path.join(TMP_DIR, "config.json")
 os.environ["CONFIG_PATH"] = CONFIG_FILE
+# Caller keys live in llmhub.db and are minted in the console; this demo writes its own row
+# below, before the app starts, so the environment never carries a credential.
+os.environ["LLMHUB_DB"] = os.path.join(TMP_DIR, "llmhub.db")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
 
+from key_store import SCHEMA, hash_key, mask_key, now_ts  # noqa: E402
+
+
+def seed_api_keys(*secrets: str) -> None:
+    """Write the demo's caller-key rows before the lifespan starts."""
+    import sqlite3
+
+    db = os.environ["LLMHUB_DB"]
+    with sqlite3.connect(db) as conn:
+        conn.executescript(SCHEMA)
+        for secret in secrets:
+            conn.execute(
+                "INSERT OR IGNORE INTO api_keys (hash, masked, label, source, created_at) "
+                "VALUES (?, ?, 'demo', 'console', ?)",
+                (hash_key(secret), mask_key(secret), now_ts()),
+            )
+        conn.commit()
+
+
+seed_api_keys("sk-demo")
+
 CONFIG = {
     "server": {"host": "127.0.0.1", "port": 8000, "log_level": "warning"},
-    "auth": {"enabled": True, "api_keys": ["sk-demo"], "allow_anonymous_health": True},
+    "security": {
+        "internal": {"allow_anonymous": False, "expose_version": True, "expose_docs": True},
+        "public": {"port": None, "path_allowlist": {}},
+    },
     "upstreams": [
         {
             "name": "local",

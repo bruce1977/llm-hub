@@ -108,8 +108,8 @@
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-  git clone           配置 config.yaml    pip install -r      uvicorn main:app
-                      配置 .env           requirements.txt    --reload
+  git clone           配置 config.yaml    pip install -r      serve.py / uvicorn
+                      配置 .env           requirements.txt    --no-proxy-headers
 ```
 
 **步骤详解：**
@@ -140,8 +140,15 @@
 4. **启动服务**
    ```bash
    cd app
-   python -m uvicorn main:app --reload --port 8000
+   # 生产 / 双区（推荐）：绑定所有监听端口并禁用代理头改写
+   python serve.py
+   # 或单监听开发（带自动重载）：
+   # python -m uvicorn main:app --reload --port 8000 --no-proxy-headers
    ```
+   Windows 可用 `scripts\start-local.ps1`（或 `.bat` 包装）：默认仅内网监听（uvicorn 自动带
+   `--no-proxy-headers`）；端口与分区只来自 `data\config.yaml` 的 `server.port` /
+   `security.public.port`，把 `security.public.port` 设成与 `server.port` 不同的端口，
+   或传 `-NoReload`，则切到 `serve.py`（脚本没有端口 / 绑定 / 分区相关的命令行开关）。
 
 ### 2. 测试流程
 
@@ -266,12 +273,12 @@ curl http://localhost:8888/v1/models
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  1. 启动检查  │────▶│  2. 密钥强度  │────▶│  3. IP 白名单 │────▶│  4. 端点权限  │
+│  1. 启动检查  │────▶│  2. 密钥强度  │────▶│  3. 分区判定  │────▶│  4. 公网策略  │
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-  检查 auth.enabled   检查密钥长度        检查客户端 IP       检查管理端点
-  检查环境密钥        检查弱密钥          CIDR 匹配          deny/readonly
+  检查 config.yaml   检查密钥长度        按监听 socket       method+path 全匹配
+  检查端口/分区       检查弱密钥         XFF 不改分区        管理端点恒 404（外网）
 ```
 
 ## 故障排查流程
@@ -294,7 +301,8 @@ curl http://localhost:8888/v1/models
 
 | 操作 | 命令 |
 |------|------|
-| 启动开发服务器 | `cd app && python -m uvicorn main:app --reload` |
+| 启动（生产/双区） | 在 `data/config.yaml` 设 `security.public.port: 8001`，再 `cd app && python serve.py` |
+| 启动开发服务器 | `cd app && python -m uvicorn main:app --reload --no-proxy-headers` |
 | 运行测试 | `python tests/smoke_test.py` |
 | 运行 E2E 测试 | `E2E=1 python tests/smoke_test.py` |
 | 代码检查 | `python -m ruff check app/ tests/` |

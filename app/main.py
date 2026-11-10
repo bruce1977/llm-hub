@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
+import os
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import uvicorn
 from admin_auth import (
     ADMIN_COOKIE_NAME,
     create_admin_token,
@@ -38,16 +37,18 @@ from auth import (
     client_ip,
     docs_allowed,
     extract_api_key,
-    find_weak_keys,
     ip_allowed,
+    is_public,
     is_weak_key,
     require_api_key,
 )
+from bridge import bridge_denial, public_auth_denial
 from config import CONFIG_PATH, ConfigManager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from key_store import ApiKeyStore, set_store
+from logging_config import DATE_FORMAT, LOG_FORMAT, apply_to_existing_handlers
 from management import AdminLogin
 from management import login as admin_login
 from management import logout as admin_logout
@@ -72,10 +73,16 @@ def setup_logging(level: str) -> None:
     numeric = getattr(logging, str(level).upper(), logging.INFO)
     logging.basicConfig(
         level=numeric,
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format=LOG_FORMAT,
+        datefmt=DATE_FORMAT,
     )
     logging.getLogger("llm_hub").setLevel(numeric)
+    # basicConfig is a no-op once root already owns a handler (uvicorn's dictConfig ran first),
+    # so pin the level explicitly - otherwise `--log-config logging.json` would leave root at INFO.
+    logging.getLogger().setLevel(numeric)
+    # A plain `uvicorn main:app` has already installed uvicorn's stock handlers (no timestamps);
+    # serve.py instead handed uvicorn logging.json, making this a no-op.
+    apply_to_existing_handlers(str(level))
 
 
 # --------------------------------------------------------------------------- #
@@ -99,7 +106,10 @@ async def lifespan(app: FastAPI):
     client = httpx.AsyncClient(
         limits=limits,
         timeout=httpx.Timeout(cfg.server.request_timeout, connect=10.0),
-        follow_redirects=True,
+        # Never follow upstream redirects: an upstream that cleans `api/../api/delete`
+        # into a 307 would otherwise make the gateway replay the original destructive
+        # body against a path the deny list never saw.
+        follow_redirects=False,
         trust_env=False,
     )
 
@@ -119,103 +129,167 @@ async def lifespan(app: FastAPI):
     set_store(app.state.api_keys)
     app.state.started_at = time.time()
 
-    # Caller keys are rows of `api_keys` in llmhub.db, kept as SHA-256 hashes. The environment
-    # (GATEWAY_API_KEYS / GATEWAY_API_KEYS_FILE / data/.keys) only seeds an *empty* table, so an
-    # existing deployment upgrades itself on its first run and, from then on, the file is never
-    # read again: a key revoked in the console stays revoked across restarts.
-    env_keys = [key for key in cfg.auth.api_keys if key]
-    if app.state.api_keys.count() == 0 and env_keys:
-        seeded = await app.state.api_keys.import_plaintext(env_keys)
+    # Zone state comes from config.yaml only. serve.py binds exactly these sockets in
+    # this same process, so the listening socket remains an unforgeable trust anchor.
+    public_ports = sorted(cfg.public_ports())
+    listen_ports = cfg.listen_ports()
+    internal_ports = [p for p in listen_ports if p not in public_ports]
+    public = cfg.security.public
+    app.state.public_ports = cfg.public_ports()
+    app.state.listen_ports = listen_ports
+    app.state.listen_endpoints = f"{cfg.server.host}:{','.join(str(p) for p in listen_ports)}"
+
+    # Zone self-check. The listening socket is the only trust anchor; the public port
+    # comes from security.public.port, never from an environment variable.
+    if public.port is not None:
+        rule_count = sum(len(patterns) for patterns in public.path_allowlist.values())
         logger.info(
-            "Seeded %d API key(s) from the environment into %s; manage them at /admin from now on",
-            seeded,
-            app.state.api_keys.db_path,
+            "Public zone listener %s: %d configured method+path rule(s) (%s). Only these "
+            "paths exist here; every surviving request needs a valid caller key or console "
+            "session. The management API and /admin are always 404.",
+            public.port,
+            rule_count,
+            "; ".join(public.visible_paths()) or "none",
         )
-    elif stale := app.state.api_keys.unserved_env_keys(env_keys):
-        logger.warning(
-            "Ignoring %d environment key(s) (%s): the api_keys table in %s became the source of "
-            "truth at first start, so create or revoke keys in the console",
-            len(stale),
-            ", ".join(stale),
-            app.state.api_keys.db_path,
-        )
-
-    # Security self-check: never serve an authenticated gateway without any key - unless an
-    # IP whitelist is configured, which is an explicit "trusted network" deployment: those
-    # addresses skip the key check anyway (see auth._authorize), so refusing to start would
-    # make a keys-free / docs-only setup impossible.
-    if cfg.auth.enabled and app.state.api_keys.count() == 0:
-        if cfg.auth.allow_access_ip_whitelist:
+        if not public.path_allowlist:
+            logger.warning("security.public.path_allowlist is empty: the public listener serves no route")
+        # `admin_endpoints` is only half of the answer: the mode decides whether an admin
+        # call is refused, `path_allowlist` decides whether the path exists at all. Report
+        # the intersection, because "I set allow and nothing changed" is almost always a
+        # missing POST rule, and a 404 does not say so.
+        reachable_admin = public.reachable_admin_paths()
+        if public.admin_endpoints == "deny":
+            logger.info(
+                "Public admin endpoints: all blocked (security.public.admin_endpoints=deny); "
+                "Ollama model management, /admin and /v1/management/* stay internal-only"
+            )
+        elif public.admin_endpoints == "allow":
             logger.warning(
-                "auth.enabled with no API key: running in trusted-network mode, only "
-                "auth.allow_access_ip_whitelist addresses (%d pattern(s)) may call the API; "
-                "every other client gets 401",
-                len(cfg.auth.allow_access_ip_whitelist),
+                "security.public.admin_endpoints=allow OPENS THE MANAGEMENT PLANE on the public "
+                "listener %s: /admin and /v1/management/* are reachable there and are routed to "
+                "their real handlers (path_allowlist is not consulted for them). They are never "
+                "anonymous - only the console shell and POST /v1/management/auth/login skip the "
+                "credential check, everything else needs the session cookie, and a gateway API "
+                "key is not an admin credential. Ollama admin calls are forwarded untouched: %s. "
+                "Keep ADMIN_PASSWORD at 32+ random characters and leave security.rate_limit on.",
+                public.port,
+                ", ".join(reachable_admin)
+                or "no Ollama admin path is listed, so only the console and the management API are reachable",
+            )
+        elif reachable_admin:
+            logger.info(
+                "Public admin endpoints (admin_endpoints=%s): %s",
+                public.admin_endpoints,
+                ", ".join(reachable_admin),
             )
         else:
-            raise RuntimeError(
-                "Refusing to start: auth.enabled is true but the api_keys table holds no key. "
-                "Seed the empty table with the GATEWAY_API_KEYS environment variable (comma "
-                "separated) or GATEWAY_API_KEYS_FILE (a secret file such as data/.keys) and "
-                "restart, then manage keys at /admin; or turn auth off with auth.enabled=false."
-            )
-
-    # Startup self-check for the unauthenticated mode. Previously `enabled: false`
-    # silently skipped every check above: a gateway bound to 0.0.0.0 could serve
-    # all APIs anonymously while /docs stayed hidden, which reads as "protected"
-    # but is not. trusted_networks turns that into an explicit internal/outside split.
-    if not cfg.auth.enabled:
-        if cfg.auth.trusted_networks:
             logger.warning(
-                "auth.enabled=false with auth.trusted_networks=%s: only those networks are "
-                "anonymous; every other client must present a valid API key (%d key(s) in store)",
-                cfg.auth.trusted_networks,
-                app.state.api_keys.count(),
+                "security.public.admin_endpoints=%s has no effect: no security.public.path_allowlist "
+                "rule admits an Ollama admin endpoint, so POST /api/pull and friends still answer 404 "
+                "(the allowlist is the surface, the mode only lifts the block). Add e.g. "
+                "POST: ['^/api/pull$'] for readonly, or the push/create/delete/copy paths plus "
+                "'^/api/blobs/.*$' for allow",
+                public.admin_endpoints,
             )
-            if app.state.api_keys.count() == 0:
-                logger.warning(
-                    "The api_keys table is empty: all requests from outside "
-                    "auth.trusted_networks will be rejected with 401. Mint a key at "
-                    "/admin -> API keys."
-                )
+        if internal_ports:
+            logger.info(
+                "Internal zone listener(s) %s: normal APIs are %s; /docs is %s, /admin is "
+                "reachable, /health stays anonymous for the container HEALTHCHECK, and the "
+                "management API still requires the console cookie. Publish this port on the LAN only.",
+                internal_ports,
+                "key-free" if cfg.security.internal.allow_anonymous else "key-required",
+                "reachable" if cfg.security.internal.expose_docs else "404",
+            )
         else:
             logger.warning(
-                "auth.enabled=false and no auth.trusted_networks declared: EVERY API endpoint is "
-                "anonymous on %s:%d, while /docs stays hidden by the IP whitelist - that is not "
-                "a security boundary. Declare auth.trusted_networks (CIDR) or set auth.enabled=true.",
+                "Public-only instance: %s is the sole socket, so there is NO anonymous HTTP "
+                "path. Point the container HEALTHCHECK at a TCP port check instead.",
+                public.port,
+            )
+    else:
+        logger.info(
+            "Internal-only instance: %s is the trusted LAN zone (%s). To expose it to the "
+            "internet set security.public.port to the SAME port (public-only) or to a second "
+            "port (internal + public). Two host-port mappings to one container socket do NOT "
+            "create two zones.",
+            listen_ports,
+            "key-free APIs" if cfg.security.internal.allow_anonymous else "key-required APIs",
+        )
+        if cfg.server.host in {"0.0.0.0", "::", "*"} and cfg.security.internal.allow_anonymous:
+            logger.error(
+                "INTERNAL ZONE IS FULLY OPEN: server.host=%s binds every interface and "
+                "security.internal.allow_anonymous=true. Restrict the bind address to the "
+                "LAN, set allow_anonymous=false, or declare security.public.port.",
                 cfg.server.host,
-                cfg.server.port,
             )
+
+    # Outbound signing for the System One proxy: the caller's gateway key authenticates
+    # *into* llm-hub, while the backend key below is what llm-hub sends *out*. Naming the
+    # variable at startup is the only place an operator can see it without reading code.
+    if cfg.systemone.enabled:
+        so = cfg.systemone
+        signed = bool(os.getenv(so.api_key_env or "", "").strip())
+        logger.info(
+            "System One: POST /v1/systemone -> %s%s | model=%s | backend key from $%s (%s)",
+            so.backend.rstrip("/"),
+            "/" + so.path.strip("/"),
+            so.model,
+            so.api_key_env,
+            "set" if signed else "NOT set - forwarding unsigned",
+        )
 
     # ADMIN_PASSWORD doubles as the HMAC key that signs console session cookies:
     # guessing it lets an attacker mint a token with any expiry. Warn (without
     # ever logging the value) instead of refusing, so a local console still works.
     if admin_password := get_admin_password():
         if weak_reason := is_weak_key(admin_password):
+            # A value copied verbatim from .env.example is a *published* password.
+            # Refuse rather than warn: a warning scrolls past, the console stays open
+            # to the internet, and online brute-force is no longer even necessary.
+            if "placeholder" in weak_reason or "example" in weak_reason:
+                raise RuntimeError(
+                    "Refusing to start: ADMIN_PASSWORD is a documented example/placeholder value. "
+                    "Generate a random >=32 character password before exposing the console."
+                )
             logger.warning(
                 "Weak ADMIN_PASSWORD (%s): it signs console session cookies, use >=16 random chars",
                 weak_reason,
             )
-
-    # Security self-check: refuse to start with weak/placeholder keys on a public gateway.
-    # Console-generated keys are 238-bit random, so only the environment ones can be weak.
-    weak = find_weak_keys(env_keys)
-    if weak and cfg.security.fail_on_weak_keys:
-        raise RuntimeError(
-            "Refusing to start: weak/placeholder API keys detected -> "
-            + "; ".join(weak)
-            + ". Use stronger keys (>=16 random chars) or set security.fail_on_weak_keys=false."
+    if public.port is not None and not cfg.security.rate_limit.enabled:
+        logger.warning(
+            "security.rate_limit is disabled while a public listener is open; enable it "
+            "(or rate-limit at the reverse proxy). Console sign-in has its own failure "
+            "lockout, but other endpoints are unthrottled."
         )
-    elif weak:
-        logger.warning("Weak/placeholder API keys detected: %s", "; ".join(weak))
 
+    # Caller keys are rows in llmhub.db and are minted in the console. Nothing seeds them any
+    # more: no environment variable, no key file, no config node. An empty table is therefore a
+    # normal first-run state - every request that needs a key simply answers 401 - and it is a
+    # dead end only when the console cannot mint one either, i.e. without ADMIN_PASSWORD.
+    if app.state.api_keys.count() == 0:
+        if not admin_password:
+            raise RuntimeError(
+                "Refusing to start: the api_keys table at "
+                f"{app.state.api_keys.db_path} is empty and ADMIN_PASSWORD is not set, so no "
+                "credential can ever exist - callers cannot authenticate and the console cannot "
+                "mint a key. Set ADMIN_PASSWORD, start the gateway, then create the first key at "
+                "/admin -> API keys."
+            )
+        logger.warning(
+            "The api_keys table at %s is empty: every request that needs a caller key answers "
+            "401 until the first key exists. Sign in at /admin with ADMIN_PASSWORD and mint one "
+            "at API keys -> Create. Keys come from the console only.",
+            app.state.api_keys.db_path,
+        )
+
+    # serve.py binds exactly cfg.listen_ports(); config.yaml is the single source.
     logger.info(
-        "LLM Hub started | config=%s | upstreams=%d | aliases=%d | listening=%s:%d",
+        "LLM Hub started | config=%s | upstreams=%d | aliases=%d | listening=%s | public=%s",
         CONFIG_PATH,
         len(cfg.upstreams),
         len(cfg.aliases),
-        cfg.server.host,
-        cfg.server.port,
+        app.state.listen_endpoints,
+        ",".join(str(p) for p in public_ports) or "none",
     )
     try:
         yield
@@ -244,6 +318,12 @@ app = FastAPI(
 # The console shows the gateway build in its sidebar; /overview reads it off the state
 # instead of importing main back into management (which would be circular).
 app.state.gateway_version = __version__
+
+# Filled from config.yaml by lifespan() and used by serve.py / the startup log.
+# An empty value at import time keeps module import side-effect free; auth.zone()
+# reads the live Config object from app.state.manager, not this cached set.
+app.state.public_ports = frozenset()
+app.state.listen_ports: list[int] = []
 
 
 # --------------------------------------------------------------------------- #
@@ -362,29 +442,6 @@ ADMIN_CSP = (
     "frame-ancestors 'self'"
 )
 
-# Compiled path-allowlist regexes, cached by the pattern tuple.
-_PATH_ALLOWLIST_CACHE: dict[tuple, list[re.Pattern]] = {}
-
-
-def _allowlist_patterns(patterns: list[str]) -> list[re.Pattern]:
-    key = tuple(patterns)
-    cached = _PATH_ALLOWLIST_CACHE.get(key)
-    if cached is not None:
-        return cached
-    compiled: list[re.Pattern] = []
-    for pat in patterns:
-        try:
-            compiled.append(re.compile(pat))
-        except re.error as exc:  # a bad pattern must not open the gateway
-            logger.error("Invalid path_allowlist regex %r: %s (entry ignored)", pat, exc)
-    _PATH_ALLOWLIST_CACHE[key] = compiled
-    return compiled
-
-
-def _path_allowed(path: str, patterns: list[str]) -> bool:
-    return any(rx.search(path) for rx in _allowlist_patterns(patterns))
-
-
 def _harden_response(resp: Response, path: str = "") -> Response:
     """Attach defensive security headers without clobbering existing ones.
 
@@ -402,8 +459,11 @@ def _harden_response(resp: Response, path: str = "") -> Response:
     return resp
 
 
-def _deny(status_code: int, detail: str) -> JSONResponse:
-    return _harden_response(JSONResponse({"detail": detail}, status_code=status_code))
+def _deny(status_code: int, detail: str, headers: dict[str, str] | None = None) -> JSONResponse:
+    response = JSONResponse({"detail": detail}, status_code=status_code)
+    for name, value in (headers or {}).items():
+        response.headers[name] = value
+    return _harden_response(response)
 
 
 # --------------------------------------------------------------------------- #
@@ -457,51 +517,50 @@ def _renew_admin_session(request: Request, response: Response) -> None:
 
 @app.middleware("http")
 async def gateway_security_middleware(request: Request, call_next):
-    """Per-request hardening of the public surface, evaluated in this order:
+    """Per-request hardening, evaluated in this order:
 
-    1. HTTP method allowlist (security.allowed_http_methods)  -> 405
-    2. path regex allowlist   (security.path_allowlist)       -> 403
-    3. hide /docs /redoc /openapi.json unless allowed         -> 404
-    4. client IP allowlist     (security.allowed_client_ips)  -> 403
-    5. rate limit              (security.rate_limit)           -> 429
-    6. CORS only for explicitly listed origins                -> 204 / header
+    0. public listener -> config-driven method+path allowlist (404 for anything
+       not explicitly listed; management API and /admin are always 404)
+    1. body size cap                                  -> 413
+    2. /docs, /openapi.json, Swagger assets            -> 404 outside internal
+    3. client IP fence (security.allowed_client_ips)  -> 403
+    4. rate limit (security.rate_limit)               -> 429
+    5. CORS only for explicitly listed origins        -> 204 / header
+    6. public listener -> caller key or console session -> 401 / 403
+
+    Steps 0 and 6 are the two halves of the public-zone policy and live in
+    ``bridge.py``: an unlisted path never exists on that socket, and a listed one
+    is never anonymous. Neither waives the other.
+
+    There is no global HTTP-method gate and no global path allowlist any more.
+    On the public listener BOTH are expressed by ``security.public.path_allowlist``;
+    on the internal listener the trusted LAN may use any verb the routes define.
     """
     manager = getattr(request.app.state, "manager", None)
     cfg = manager.config if manager is not None else None
     sec = cfg.security if cfg is not None else None
     path = request.url.path
-
-    # The admin console authenticates with its own password and drives a REST API that
-    # needs PUT (config save) and other verbs. It is therefore exempt from the public
-    # perimeter rules below (the method allowlist and the path allowlist): otherwise a
-    # gateway locked down to GET/POST - the default - would make the console's own Save
-    # return 405 and never write config.yaml. The docs are gated separately on
-    # auth.allow_access_ip_whitelist.
-    management_api = path.startswith("/v1/management")
-    is_console = path.startswith("/admin") or management_api
-
-    # 1. HTTP method allowlist -------------------------------------------------
-    allowed_methods = set(getattr(sec, "allowed_http_methods", None) or ["GET", "POST"])
     method = request.method.upper()
-    # CORS preflight needs OPTIONS; permit it only when CORS is actually configured.
-    if method == "OPTIONS" and sec is not None and sec.cors_origins:
-        allowed_methods = allowed_methods | {"OPTIONS"}
-    if method not in allowed_methods and not is_console:
-        return _deny(status.HTTP_405_METHOD_NOT_ALLOWED, "Method not allowed.")
+    cors_origin = ""
+
+    # 0. Public zone: the config file is the COMPLETE list of reachable routes.
+    #    This runs first so an unlisted path never leaks a different status
+    #    through another rule (and is 404 even when the caller has a valid key).
+    if is_public(request) and cfg is not None:
+        denial = bridge_denial(method, path, cfg)
+        if denial is not None:
+            return _deny(*denial)
 
     if sec is not None:
-        # 2. path regex allowlist (perimeter control) --------------------------
-        if (
-            not is_console
-            and sec.path_allowlist
-            and not _path_allowed(path, sec.path_allowlist)
-        ):
-            logger.warning("Path not in allowlist: %s %s", method, path)
-            return _deny(status.HTTP_403_FORBIDDEN, "Path not allowed.")
+        # 1. Reject oversized bodies by declaration BEFORE the route reads a byte.
+        #    Services without Content-Length are covered by auth.read_limited_body's
+        #    streaming counter, so both transports have a hard cap.
+        if sec.max_body_bytes and sec.max_body_bytes > 0:
+            declared = request.headers.get("content-length")
+            if declared and declared.isdigit() and int(declared) > sec.max_body_bytes:
+                return _deny(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large.")
 
-        # 3. API docs and their vendored Swagger assets go to trusted addresses
-        #    only. The docs gate and the anonymous-key bypass share trusted_peer(),
-        #    so a hidden /docs can never coexist with a key-free API.
+        # 2. API docs and their vendored Swagger assets are internal-only.
         if (
             path.rstrip("/") in DOCS_PATHS or path.startswith("/static/swagger/")
         ) and not docs_allowed(request, cfg):
@@ -512,23 +571,28 @@ async def gateway_security_middleware(request: Request, call_next):
         if path.rstrip("/") == "/redoc":
             return _deny(status.HTTP_404_NOT_FOUND, "Not found.")
 
-        # 4. client IP allowlist -----------------------------------------------
+        # 3. client IP allowlist -----------------------------------------------
         if not ip_allowed(client_ip(request), sec.allowed_client_ips):
             return _deny(status.HTTP_403_FORBIDDEN, "Client address is not permitted to access this gateway.")
 
-        # 5. rate limit -------------------------------------------------------
+        # 4. rate limit -------------------------------------------------------
         if sec.rate_limit.enabled and _rate_limited(sec.rate_limit, request, sec):
-            logger.warning("Rate limit exceeded: %s %s", method, path)
-            return _deny(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests.")
+            logger.warning("Rate limit exceeded: %s %r", method, path)
+            limited = _deny(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests.")
+            limited.headers["Retry-After"] = "1"
+            return limited
 
-        # 6. CORS (only for explicitly allowed origins) -----------------------
+        # 5. CORS (only for explicitly allowed origins) -----------------------
         origin = request.headers.get("origin")
         if origin and sec.cors_origins:
             allowed = "*" in sec.cors_origins or origin in sec.cors_origins
             if method == "OPTIONS" and allowed:
+                # A pre-flight answer must be a bodyless 204: Response omits
+                # content-length for 204/304, so a JSONResponse would still send
+                # its "{}" bytes and uvicorn drops the connection with
+                # "Response content longer than Content-Length".
                 return _harden_response(
-                    JSONResponse(
-                        {},
+                    Response(
                         status_code=204,
                         headers={
                             "Access-Control-Allow-Origin": origin,
@@ -538,13 +602,25 @@ async def gateway_security_middleware(request: Request, call_next):
                     )
                 )
             if allowed:
-                resp = await call_next(request)
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                _renew_admin_session(request, resp)
-                return _harden_response(resp, path)
+                cors_origin = origin
+
+    # 6. Public zone: the credential belongs to the zone policy, not to whichever
+    #    dependencies a route happens to declare. Runs after the rate limiter (a
+    #    throttled caller still sees 429) and after the CORS pre-flight answer (a
+    #    pre-flight carries no credentials by design).
+    if cfg is not None and is_public(request):
+        denial = await public_auth_denial(request, cfg)
+        if denial is not None:
+            status_code, detail, auth_headers = denial
+            headers = dict(auth_headers)
+            if cors_origin:
+                headers["Access-Control-Allow-Origin"] = cors_origin
+            return _deny(status_code, detail, headers)
 
     resp = await call_next(request)
     _renew_admin_session(request, resp)
+    if cors_origin:
+        resp.headers["Access-Control-Allow-Origin"] = cors_origin
     return _harden_response(resp, path)
 
 
@@ -833,8 +909,8 @@ async def rerank_response(request: Request) -> JSONResponse:
 
 # --------------------------------------------------------------------------- #
 # Documented routes (explicit + schema-visible; registered before the catch-all
-# so they take precedence and appear in /docs, which is served to the addresses
-# matched by auth.allow_access_ip_whitelist)
+# so they take precedence and appear in /docs, which is served only on the
+# internal zone when security.internal.expose_docs is true)
 # --------------------------------------------------------------------------- #
 @app.get(
     "/health",
@@ -853,8 +929,14 @@ async def route_health(request: Request, _auth=Depends(require_api_key)):
     tags=["gateway"],
 )
 async def route_root(request: Request, _auth=Depends(require_api_key)):
-    """Return the system name and gateway version."""
-    return JSONResponse({"name": app.title, "version": __version__})
+    """Return the system name; the exact version is opt-in for anonymous probes."""
+    manager = getattr(request.app.state, "manager", None)
+    cfg = getattr(manager, "config", None)
+    expose = cfg.security.internal.expose_version if cfg is not None else True
+    payload = {"name": app.title}
+    if expose:
+        payload["version"] = __version__
+    return JSONResponse(payload)
 
 
 @app.get("/probe", include_in_schema=True, summary="Probe upstreams and model validity", tags=["gateway"])
@@ -1057,6 +1139,379 @@ async def route_generate(request: Request, _auth=Depends(require_api_key)):
     return await proxy.forward(request, "api/generate")
 
 
+# The remaining pass-through families, documented the same way: the handler is a
+# one-liner into ProxyService.forward(), so routing, alias + parameter injection,
+# num_ctx clamping, streaming and request-log capture are unchanged. Registering
+# them explicitly puts them in /openapi.json and makes POST_ONLY_PATHS answer 405
+# for another verb instead of forwarding it.
+@app.post(
+    "/api/chat",
+    include_in_schema=True,
+    summary="Ollama-native chat (routed by model, passed through)",
+    tags=["chat"],
+    openapi_extra={
+        "description": (
+            "Forwarded to the upstream that owns `model`, exactly like the catch-all "
+            "proxy. Unknown fields are preserved; `stream` may be omitted because "
+            "Ollama streams `/api/chat` by default."
+        ),
+        "requestBody": {
+            "required": True,
+            "description": "Ollama chat request; `model` goes through alias resolution first.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["model", "messages"],
+                        "properties": {
+                            "model": {"type": "string", "description": "Model name or gateway alias."},
+                            "messages": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["role", "content"],
+                                    "properties": {
+                                        "role": {"type": "string", "enum": ["system", "user", "assistant", "tool"]},
+                                        "content": {"type": "string"},
+                                        "images": {"type": "array", "items": {"type": "string"}},
+                                        "tool_calls": {"type": "array", "items": {"type": "object"}},
+                                    },
+                                },
+                            },
+                            "tools": {"type": "array", "items": {"type": "object"}},
+                            "format": {
+                                "description": "\"json\" or a JSON schema for structured output.",
+                                "oneOf": [{"type": "string", "enum": ["json"]}, {"type": "object"}],
+                            },
+                            "stream": {"type": "boolean", "description": "Default true (NDJSON); false returns one JSON object."},
+                            "think": {"description": "Thinking mode: true / false, or a budget such as 8000."},
+                            "keep_alive": {"description": "How long the model stays loaded, e.g. \"3m\" or 0."},
+                            "options": {
+                                "type": "object",
+                                "description": "Generation options; `num_ctx` may be clamped by the gateway's num_ctx_overrides.",
+                                "properties": {
+                                    "temperature": {"type": "number"},
+                                    "top_p": {"type": "number"},
+                                    "num_predict": {"type": "integer"},
+                                    "num_ctx": {"type": "integer"},
+                                    "seed": {"type": "integer"},
+                                    "stop": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "additionalProperties": True,
+                            },
+                        },
+                        "additionalProperties": True,
+                    },
+                    "example": {
+                        "model": "qwen3:8b",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": False,
+                    },
+                }
+            },
+        },
+        "responses": {
+            "200": {
+                "description": "Upstream response passed through unchanged (NDJSON when streaming, one JSON object otherwise).",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "model": "qwen3:8b",
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "message": {"role": "assistant", "content": "Hello! What can I help you with?"},
+                            "done": True,
+                            "prompt_eval_count": 5,
+                            "eval_count": 42,
+                        }
+                    },
+                    "application/x-ndjson": {
+                        "example": '{"model":"qwen3:8b","message":{"role":"assistant","content":"Hello"},"done":false}\n'
+                        '{"model":"qwen3:8b","done":true,"done_reason":"stop","eval_count":42}\n'
+                    },
+                },
+            },
+            "404": {"description": "No upstream serves the requested model and routing is strict."},
+            "405": {"description": "`/api/chat` only accepts POST."},
+        },
+    },
+)
+async def route_chat(request: Request, _auth=Depends(require_api_key)):
+    proxy: ProxyService = request.app.state.proxy
+    return await proxy.forward(request, "api/chat")
+
+
+@app.post(
+    "/v1/chat/completions",
+    include_in_schema=True,
+    summary="OpenAI-compatible chat completions (routed by model, passed through)",
+    tags=["chat"],
+    openapi_extra={
+        "description": (
+            "Forwarded to the upstream that owns `model`. Claude SDK / Claude Code clients "
+            "should use `/v1/messages` instead: same routing, different envelope."
+        ),
+        "requestBody": {
+            "required": True,
+            "description": "OpenAI chat request; `model` goes through alias resolution first.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["model", "messages"],
+                        "properties": {
+                            "model": {"type": "string", "description": "Model name or gateway alias."},
+                            "messages": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["role", "content"],
+                                    "properties": {
+                                        "role": {"type": "string", "enum": ["system", "developer", "user", "assistant", "tool"]},
+                                        "content": {"description": "String or a list of content parts."},
+                                    },
+                                },
+                            },
+                            "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+                            "top_p": {"type": "number"},
+                            "max_tokens": {"type": "integer", "description": "Generation budget (OpenAI-compatible backends do not read num_ctx)."},
+                            "n": {"type": "integer"},
+                            "stop": {"description": "Stop sequence or list of them."},
+                            "stream": {"type": "boolean", "description": "Default false here; SSE chunks when true."},
+                            "reasoning_effort": {
+                                "type": "string",
+                                "enum": ["none", "low", "medium", "high"],
+                                "description": "OpenAI-compatible reasoning effort; on Ollama `none` disables thinking.",
+                            },
+                            "tools": {"type": "array", "items": {"type": "object"}},
+                            "response_format": {"type": "object"},
+                            "seed": {"type": "integer"},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "example": {
+                        "model": "qwen3:8b",
+                        "messages": [
+                            {"role": "system", "content": "You are a helpful assistant"},
+                            {"role": "user", "content": "What is machine learning?"},
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 500,
+                        "stream": False,
+                    },
+                }
+            },
+        },
+        "responses": {
+            "200": {
+                "description": "Upstream response passed through unchanged (SSE when streaming, one JSON object otherwise).",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "id": "chatcmpl-abc123",
+                            "object": "chat.completion",
+                            "created": 1694000000,
+                            "model": "qwen3:8b",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "Machine learning is a branch of AI..."},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 25, "completion_tokens": 100, "total_tokens": 125},
+                        }
+                    },
+                    "text/event-stream": {
+                        "example": 'data: {"choices":[{"delta":{"content":"Machine"},"index":0}]}\n\n'
+                        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                        "data: [DONE]\n\n"
+                    },
+                },
+            },
+            "404": {"description": "No upstream serves the requested model and routing is strict."},
+            "405": {"description": "`/v1/chat/completions` only accepts POST."},
+        },
+    },
+)
+async def route_chat_completions(request: Request, _auth=Depends(require_api_key)):
+    proxy: ProxyService = request.app.state.proxy
+    return await proxy.forward(request, "v1/chat/completions")
+
+
+@app.post(
+    "/v1/completions",
+    include_in_schema=True,
+    summary="OpenAI-compatible text completions (routed by model, passed through)",
+    tags=["generation"],
+    openapi_extra={
+        "description": "Forwarded to the upstream that owns `model`, exactly like the catch-all proxy.",
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["model"],
+                        "properties": {
+                            "model": {"type": "string", "description": "Model name or gateway alias."},
+                            "prompt": {"description": "String or list of strings."},
+                            "max_tokens": {"type": "integer"},
+                            "temperature": {"type": "number"},
+                            "top_p": {"type": "number"},
+                            "logprobs": {"type": "integer"},
+                            "echo": {"type": "boolean"},
+                            "suffix": {"type": "string"},
+                            "stop": {"description": "Stop sequence or list of them."},
+                            "stream": {"type": "boolean", "description": "Default false here; SSE chunks when true."},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "example": {"model": "qwen3:8b", "prompt": "写一首关于编程的诗：", "max_tokens": 256, "stream": False},
+                }
+            },
+        },
+        "responses": {
+            "200": {
+                "description": "Upstream response passed through unchanged (SSE when streaming, one JSON object otherwise).",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "id": "cmpl-abc123",
+                            "object": "text_completion",
+                            "model": "qwen3:8b",
+                            "choices": [{"index": 0, "text": "代码如诗行……", "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 12, "completion_tokens": 50, "total_tokens": 62},
+                        }
+                    },
+                    "text/event-stream": {
+                        "example": 'data: {"choices":[{"text":"代码","index":0}]}\n\ndata: [DONE]\n\n'
+                    },
+                },
+            },
+            "404": {"description": "No upstream serves the requested model and routing is strict."},
+            "405": {"description": "`/v1/completions` only accepts POST."},
+        },
+    },
+)
+async def route_completions(request: Request, _auth=Depends(require_api_key)):
+    proxy: ProxyService = request.app.state.proxy
+    return await proxy.forward(request, "v1/completions")
+
+
+@app.post(
+    "/api/embed",
+    include_in_schema=True,
+    summary="Ollama-native embeddings (routed by model, passed through)",
+    tags=["embeddings"],
+    openapi_extra={
+        "description": (
+            "Forwarded to the upstream that owns `model`. This is the embedding dialect "
+            "Ollama answers natively; `/v1/embeddings` is the OpenAI-compatible side of the "
+            "same capability, which is also what LM Studio and OpenCode expose."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["model", "input"],
+                        "properties": {
+                            "model": {"type": "string", "description": "Embedding model name or alias."},
+                            "input": {"description": "A string, or a list of strings.", "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                            "images": {"type": "array", "items": {"type": "string"}, "description": "Base64 images for multimodal embedders."},
+                            "truncate": {"type": "boolean", "description": "Cut an over-long input instead of failing (Ollama default: true)."},
+                            "keep_alive": {"description": "How long the model stays loaded, e.g. \"3m\" or 0."},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "example": {"model": "bge-m3:latest", "input": ["hello world", "intro to machine learning"]},
+                }
+            },
+        },
+        "responses": {
+            "200": {
+                "description": "Upstream response passed through unchanged.",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "model": "bge-m3:latest",
+                            "embeddings": [[0.123, 0.456, 0.789], [0.987, 0.654, 0.321]],
+                        }
+                    }
+                },
+            },
+            "404": {
+                "description": "No upstream serves the requested model (or the target only answers the OpenAI-compatible side)."
+            },
+            "405": {"description": "`/api/embed` only accepts POST."},
+        },
+    },
+)
+async def route_embed(request: Request, _auth=Depends(require_api_key)):
+    proxy: ProxyService = request.app.state.proxy
+    return await proxy.forward(request, "api/embed")
+
+
+@app.post(
+    "/v1/embeddings",
+    include_in_schema=True,
+    summary="OpenAI-compatible embeddings (routed by model, passed through)",
+    tags=["embeddings"],
+    openapi_extra={
+        "description": "Forwarded to the upstream that owns `model`, exactly like the catch-all proxy.",
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["model", "input"],
+                        "properties": {
+                            "model": {"type": "string", "description": "Embedding model name or alias."},
+                            "input": {
+                                "description": "A string, a list of strings, or a list of token ids.",
+                                "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+                            },
+                            "encoding_format": {"type": "string", "enum": ["float", "base64"]},
+                            "dimensions": {"type": "integer"},
+                            "user": {"type": "string"},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "example": {"model": "bge-m3:latest", "input": ["hello world", "intro to machine learning"]},
+                }
+            },
+        },
+        "responses": {
+            "200": {
+                "description": "Upstream response passed through unchanged.",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "object": "list",
+                            "model": "bge-m3:latest",
+                            "data": [
+                                {"object": "embedding", "index": 0, "embedding": [0.123, 0.456, 0.789]},
+                                {"object": "embedding", "index": 1, "embedding": [0.987, 0.654, 0.321]},
+                            ],
+                            "usage": {"prompt_tokens": 8, "total_tokens": 8},
+                        }
+                    }
+                },
+            },
+            "404": {"description": "No upstream serves the requested model and routing is strict."},
+            "405": {"description": "`/v1/embeddings` only accepts POST."},
+        },
+    },
+)
+async def route_openai_embeddings(request: Request, _auth=Depends(require_api_key)):
+    proxy: ProxyService = request.app.state.proxy
+    return await proxy.forward(request, "v1/embeddings")
+
+
 @app.post(
     "/v1/systemone",
     include_in_schema=True,
@@ -1230,9 +1685,9 @@ async def route_websearch(request: Request, _auth=Depends(require_api_key)):
 
 # --------------------------------------------------------------------------- #
 # API docs (explicit, key-free, and registered BEFORE the catch-all so the
-# catch-all never intercepts these paths). Visibility is gated by
-# auth.allow_access_ip_whitelist in the middleware above: an address that does not
-# match one of those regexes gets a 404, a matching one is served the docs.
+# catch-all never intercepts these paths). Visibility is gated by the listener
+# zone in the middleware above: only the internal zone may serve them, and only
+# when security.internal.expose_docs is true. The public zone always returns 404.
 # --------------------------------------------------------------------------- #
 # Local vendored Swagger UI assets (no public CDN dependency -> works offline).
 SWAGGER_STATIC_DIR = Path(__file__).parent / "static" / "swagger"
@@ -1241,8 +1696,13 @@ SWAGGER_STATIC_DIR = Path(__file__).parent / "static" / "swagger"
 @app.get("/static/swagger/{file_path:path}", include_in_schema=False, tags=["docs"])
 async def serve_swagger_static(file_path: str):
     """Serve the vendored Swagger UI assets locally (offline, no CDN)."""
-    candidate = (SWAGGER_STATIC_DIR / file_path).resolve()
-    if candidate.is_file() and str(candidate).startswith(str(SWAGGER_STATIC_DIR.resolve())):
+    root = SWAGGER_STATIC_DIR.resolve()
+    try:
+        candidate = (root / file_path).resolve()
+    except (ValueError, OSError):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    # `str().startswith()` also accepted sibling directories such as `swaggerX/`.
+    if candidate.is_file() and candidate.is_relative_to(root):
         return FileResponse(candidate)
     return JSONResponse({"detail": "Not found"}, status_code=404)
 
@@ -1325,9 +1785,15 @@ async def route_console_root():
 async def route_console(asset_path: str):
     if not (CONSOLE_DIST / "index.html").is_file():
         return JSONResponse({"detail": CONSOLE_MISSING_DETAIL}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
-    candidate = (CONSOLE_DIST / asset_path).resolve()
-    # resolve() + relative check: ../ segments can never escape the built directory
-    if candidate.is_file() and candidate.is_relative_to(CONSOLE_DIST):
+    try:
+        candidate = (CONSOLE_DIST / asset_path).resolve()
+        # resolve() + relative check: ../ segments can never escape the built directory
+        allowed = candidate.is_file() and candidate.is_relative_to(CONSOLE_DIST)
+    except (ValueError, OSError):
+        # A %00 in the path makes Path.resolve() raise; answer a clean 404 instead of
+        # letting the exception escape as a per-request 500.
+        allowed = False
+    if allowed:
         return FileResponse(candidate, headers=_console_headers(asset_path))
     # Unknown path: let the SPA router answer (deep links such as /admin/requests).
     return FileResponse(CONSOLE_DIST / "index.html", headers={"Cache-Control": "no-cache"})
@@ -1342,11 +1808,26 @@ app.include_router(management_router)
 # --------------------------------------------------------------------------- #
 # Unified entrypoint (catch-all proxy for everything not handled above)
 # --------------------------------------------------------------------------- #
-# Paths documented above that only accept POST. The catch-all below accepts every
-# method, so without this guard a GET/PUT/DELETE to e.g. /v1/rerank would be
-# proxied to an upstream instead of being rejected with 405.
+# Paths documented above that only accept POST. Starlette prefers the catch-all's
+# full match over the documented route's partial (wrong-method) match, so without
+# this guard a GET/PUT/DELETE to e.g. /v1/rerank or /api/chat would be proxied to
+# an upstream instead of being rejected with 405.
 POST_ONLY_PATHS = frozenset(
-    {"/v1/rerank", "/rerank", "/api/rerank", "/v1/systemone", "/v1/tools/web-search", "/api/generate"}
+    {
+        "/v1/rerank",
+        "/rerank",
+        "/api/rerank",
+        "/v1/systemone",
+        "/v1/tools/web-search",
+        "/api/generate",
+        "/api/chat",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/api/embed",
+        "/v1/embeddings",
+        "/v1/messages",
+        "/v1/message",
+    }
 )
 
 
@@ -1368,15 +1849,21 @@ async def gateway(request: Request, full_path: str = "", _auth=Depends(require_a
 # Local entrypoint
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    manager = ConfigManager()
-    cfg = manager.config
+    """`python main.py` delegates to the hardened runner (no proxy-header rewrite).
+
+    Pass the already-created `app` object: importing `main` a second time would
+    build a second application instance with a separate ApiKeyStore.
+    """
+    from serve import run as serve_run
+
+    cfg = ConfigManager().config
     setup_logging(cfg.server.log_level)
-    uvicorn.run(
-        "main:app",
+    serve_run(
+        app,
         host=cfg.server.host,
         port=cfg.server.port,
+        public_port=cfg.security.public.port,
         log_level=cfg.server.log_level,
-        reload=False,
     )
 
 

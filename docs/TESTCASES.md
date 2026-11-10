@@ -747,12 +747,27 @@ curl http://localhost:8000/api/chat \
 
 ## 安全测试
 
-### 测试 20: 阻止管理端点 (deny 模式)
+### 测试 20: 外网监听阻止管理端点 (deny 模式)
+
+管理端点黑名单只作用于外网监听（`security.public.admin_endpoints`）。`allow` 除此之外还会在 public 监听上
+打开**管理面**（`/admin*` 与 `/v1/management/*`，前缀规则、不走允许清单，但仍需会话 Cookie），
+`deny` / `readonly` 下这两个前缀恒 404；在内网监听上该字段完全不生效。要验证 Ollama 端点那一半，先让外网监听放行
+`/api/*`，请求才会走到这一层：
+
+```yaml
+security:
+  public:
+    port: 8001
+    path_allowlist:
+      POST:
+      - ^/api/.*$
+    admin_endpoints: deny
+```
 
 **请求:**
 
 ```bash
-curl http://localhost:8000/api/delete \
+curl http://localhost:8001/api/delete \
   -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
   -d '{"name": "some-model"}'
@@ -766,24 +781,22 @@ curl http://localhost:8000/api/delete \
 }
 ```
 
-### 测试 21: 阻止模型拉取
+### 测试 21: 内网监听放行管理端点
+
+同一请求打到内网监听（`server.port`），网关**不做**管理端点拦截，请求被转发到上游 Ollama；
+模型不存在时得到 Ollama 自己的 404，而不是上面那条网关文案。
 
 **请求:**
 
 ```bash
-curl http://localhost:8000/api/pull \
+curl http://localhost:8000/api/delete \
   -H "Authorization: Bearer sk-gateway-example-key" \
   -H "Content-Type: application/json" \
-  -d '{"name": "llama3"}'
+  -d '{"name": "some-model"}'
 ```
 
-**响应 (403 Forbidden):**
-
-```json
-{
-  "detail": "Endpoint '/api/pull' is disabled on this public gateway."
-}
-```
+**响应:** 上游结果（`200` 或 Ollama 的 `404 {"error":"model 'some-model' not found"}`），
+绝不会是 `"disabled on this public gateway"`。
 
 ### 测试 22: 阻止 API 文档 (默认)
 
@@ -846,6 +859,84 @@ curl http://localhost:8000/v1/models \
   "detail": "Client address is not permitted to access this gateway."
 }
 ```
+
+### 测试 24A: IP 信任链与双分区（2026-11-10）
+
+对应 `tests/verify_security.py` 的 `test_zone_uses_kernel_socket_not_headers` /
+`test_internal_anonymous_toggle` / `test_public_allowlist_and_key` /
+`test_public_only_instance` / `test_public_never_exposes_management_or_console`，
+以及 `tests/smoke_test.py` 的 `[2b]` 分组。端口与分区策略只来自 `config.yaml`
+（`server.port` / `security.public.port`），没有端口环境变量。
+
+| 场景 | 期望 |
+|---|---|
+| 直连请求携带伪造 `X-Forwarded-For: 192.168.10.5` | `peer_ip()` 仍是真实 TCP 对端，白名单不命中 → 401 |
+| ASGI `scope["client"]` 端口为 0 且带转发头（uvicorn 改写指纹） | `peer_ip()` 返回 `None`，`client_ip()` 同样拿不到可信对端，IP 围栏失败关闭；`zone()` 仍只看内核监听 socket |
+| `trusted_proxies: [127.0.0.1/32]`，XFF = `192.168.10.5, 167.104.161.192` | `client_ip()` 取最右不可信跳 `167.104.161.192`，不豁免 |
+| 未声明代理、白名单为 `^127\.0\.0\.1$`、请求带转发头 | 不豁免（防止同机反代把公网请求伪装成 loopback） |
+| `security.public.port` 指定的公网监听端口（如 8001，双区） | 只有 `security.public.path_allowlist` 里「方法 + 正则全匹配」的组合才存在，测试配置列出 `GET /health`、`GET /v1/models`、`POST /v1/chat/completions`。列出的路径无 Key 401、无效 Key 403、伪造内网 XFF 仍 401；未列出的 `/`、`/probe`、`/api/tags`、`/api/ps`、`/api/version`、`/docs`、`/openapi.json`、`/healthz` 一律 404（带有效 Key 也是 404）；`/v1/management/*`、`/admin*` 以及含 `..` 段或 NUL 的路径恒 404 |
+| 双区模式的内网监听端口（`server.port: 8000`，`security.public.port: 8001`） | `/` 与 `/health` 始终匿名（探针指向这里）；`security.internal.allow_anonymous: true` 时其它业务 API 免 Key（带无效 Key 也放行）、`/docs`（由 `internal.expose_docs` 控制）与 `/admin` 可达；`false` 时业务 API 需 Key 或会话 Cookie，但 `/`、`/health` 仍匿名；`/v1/management/*` 始终无 Cookie 401 |
+| 公网监听端口上的存活探针 | 公网分区没有任何匿名 HTTP 路径：`/health` 只有显式列入 `security.public.path_allowlist` 且带 Key 才可达。默认模板未列出它（公网 `/health` 为 404）；测试配置显式列出 `GET /health`（带 Key 200、无 Key 401），而 `/healthz` 未列出恒 404。容器 HEALTHCHECK 必须指向内网端口，纯公网实例（`security.public.port == server.port`）改用 TCP 端口探测 |
+| 公网监听端口上的管理台与探查路由 | `/v1/management/*`、`/admin*` 是硬性 404（管理台只属于内网端口）；`/docs`、`/openapi.json`、`/probe`、`/api/ps`、`/api/version` 等未列入 `security.public.path_allowlist` 的探查路径一律 404，带有效 Key 也一样，从公网无法执行管理或探查操作 |
+| `security.internal.allow_anonymous: false` 且 `api_keys` 表无可用 Key | 失败关闭，拒绝启动；运行中的实例 `/v1/models` 无 Key 401。公网分区永远要求 Key，不存在全局匿名模式 |
+| 分区判定只认内核监听 socket | `zone()` 由 `scope["server"]` 的本地端口决定，与客户端 IP、XFF、API Key 无关；`security.trusted_proxies` 只影响 `client_ip()`（IP 围栏 / 限流 / 审计），不改变分区。两个宿主端口映射到一个容器端口不会产生两个分区 |
+
+前置条件：镜像以 `python serve.py` 启动（`proxy_headers=False`）。裸 `python -m uvicorn main:app`
+会因端口 0 指纹被判为不可信，属于预期的失败关闭行为。注意「两个宿主端口映射到一个容器端口」
+不会产生两个分区，双区要求容器内真正存在第二个监听 socket；两个端口都只来自 `config.yaml`。
+
+### 启动脚本的分区检查（Windows）
+
+`scripts\start-local.ps1` / `.bat` 在启动前用应用自己的模块做预检，并按所选入口输出分区布局。
+旧版 `-Port` / `-Bind` / `-LogLevel` / `-PublicPorts` / `-PublicAdmin` 命令行开关均已移除，
+端口与分区完全来自 `data/config.yaml`（`server.port` / `security.public.port`）。用 `-CheckOnly`
+可以只检查、不绑定端口：
+
+| 用例 | 命令 / 配置 | 期望 |
+| --- | --- | --- |
+| 默认仅内网监听 | `start-local.bat -CheckOnly`（`security.public.port: null`） | `public=none`；入口为 `uvicorn --no-proxy-headers`；打印 gateway/docs/console/models |
+| 双区 | 在 `config.yaml` 设 `security.public.port: 18081` 后 `start-local.bat -CheckOnly` | `public=18081`；入口为 `python serve.py`；打印 internal/public 两行分区地址 |
+| 公网上的管理接口 | 双区下访问公网端口的 `/v1/management/*`、`/admin`（`admin_endpoints` 保持默认 `deny`） | 公网这两个路径恒 404；管理操作走内网端口、VPN 或 SSH 隧道（`admin_endpoints: allow` 时二者会被路由到真实处理器，但仍需登录 `/admin` 换会话 Cookie，除静态外壳与登录接口外一律 401） |
+| 端口被占用 | `server.port` 或 `security.public.port` 已被监听 | 报错并指出 pid，退出码 1；提示编辑 `config.yaml` |
+| 无任何凭据 | `api_keys` 表为空、`ADMIN_PASSWORD` 未设置、`security.internal.allow_anonymous: false` | 输出 fail-closed 拒绝启动：没有可用 Key、没有管理台凭据，也没有可匿名的内网分区（公网分区永远不能匿名）；只缺 Key 而 `ADMIN_PASSWORD` 已设置时不拒绝启动，需要 Key 的请求返回 401 |
+| 环境里的旧 Key 变量 | `.env` 残留 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` | 启动脚本主动从环境删除并告警：调用方 Key 只能在 `/admin` 签发进 `api_keys` 表，环境变量里的一律不生效 |
+| `-NoReload` | `start-local.bat -NoReload -CheckOnly` | 入口为 `python serve.py`，无自动重载 |
+
+默认单监听路径下 uvicorn 必须带 `--no-proxy-headers`，否则 `ProxyHeadersMiddleware` 会用
+`X-Forwarded-For` 改写 `scope["client"]`，使 `security.allowed_client_ips` 围栏可被客户端控制。
+当 `security.public.port` 与 `server.port` 不同（或传 `-NoReload`）时脚本自动切到 `serve.py`：
+它在同一进程绑定所有监听端口，因此内存中的 Key 缓存、限流桶、登录锁定在两区共享。
+若 `.env` 里残留旧的端口变量，脚本仅将其当作一次性迁移提示并警告要求删除，显式配置优先。
+
+### 测试 24B: 只转发声明过的 API 路径（2026-11-10）
+
+对应 `tests/smoke_test.py` 的 `[10b]` / `[10c]` 分组、`tests/verify_security.py` 的
+`test_admin_endpoints_never_opens_a_path` /
+`test_public_credential_is_a_zone_rule_not_a_route_rule` /
+`test_cors_preflight_is_bodyless_and_precedes_the_key_check`，以及 `tests/test_gateway_new.py` 的
+`[3]` 分组。可转发集合来自 `proxy.FORWARDABLE_PATHS` + `FORWARDABLE_PREFIXES`（代码常量，不是配置），
+公网暴露面来自 `security.public.path_allowlist`，公网凭据检查在 `app/bridge.py` 里与路径判断分成两步。
+
+| 场景 | 期望 |
+|---|---|
+| 集合内路径 | `api/generate`、`api/chat`、`api/embed`、`api/embeddings`、`api/show`、`api/version`、`v1/chat/completions`、`v1/completions`、`v1/embeddings` 与模型管理 `api/pull`/`api/push`/`api/create`/`api/delete`/`api/copy` 均可转发；`api/blobs/<digest>` 按前缀命中，裸 `api/blobs` 不算路径 |
+| 网关自己回答的路径 | `api/tags`、`api/ps`、`v1/models`、`v1/rerank`、`admin/login` 等永不出现在上游请求里（`is_forwardable()` 为假） |
+| 未声明路径（内网端口） | **404** `Endpoint '/<path>' is not part of this gateway's API…`，不再是「上游碰巧提供就透传」；GET 与 POST 一样 |
+| 未声明路径（公网端口） | 先由 `path_allowlist` 回答 **404** `Not found.`，带着有效 Key 也一样 |
+| 列进白名单但网关不提供的路径 | 公网仍然是 proxy 自己那句 **404**：列出路径不等于发明路径 |
+| `security.blocked_paths` | 只对确实是网关 API 的路径产生 **403**（例：屏蔽 `api/show` → 403）；未知路径先 404，屏蔽它没有变化 |
+| `admin_endpoints` 三种模式 | `deny` 拦 `api/pull`/`api/delete`/`api/blobs/*`；`readonly` 放行 `pull`、仍拦 blobs；`allow` 连 `api/blobs/*` 一起转发（修复前 blobs 在 `allow` 下仍被拦） |
+| `admin_endpoints` 与白名单的关系 | 对 Ollama 端点，模式**不打开路径**：`allow` + 未列出的 `api/pull` → 404；`allow` + 列出 `POST ^/api/pull$` 与 `^/api/blobs/.*$` → 通过管理员过滤（非 403）；内网分区从不应用该模式 |
+| `allow` 打开公网管理面 | 公网端口 `admin_endpoints: allow`：`/admin/` 与 `/v1/management/*` 不再 404，而是路由到真实处理器且**不参考** `path_allowlist`（前缀规则，在 `bridge_denial()` 里先于允许清单判定）；`/admin/` 静态外壳与 `POST /v1/management/auth/login` 免凭据，其余 `/v1/management/*` 无会话 Cookie → 401、登录后 → 200，网关 API Key 仍然是 401；`deny` / `readonly` 下这三个请求全为 404；内网端口上该字段完全不生效 |
+| `routing.strict: true` 与无 `model` 的调用 | 带 `name` 的管理调用（`api/pull`）照常落到 `default_upstream` 并转发，不再死在 `No upstream configured for model ''`；未知**具名**模型仍然 404 |
+| 公网凭据检查归属分区而非路由 | 注册一个**完全没有鉴权依赖**的路由并列入白名单：公网端口无 Key → **401**（带 `WWW-Authenticate: Bearer`）、无效 Key → **403**、有效 Key → 200；同一内网路由在 `allow_anonymous: true` 下仍 200（内网不做分区级凭据检查，控制台静态资源要保持匿名） |
+| CORS 预检 | 列表内 origin 的 `OPTIONS` → **204** 且 **body 长度为 0**（修复前用 `JSONResponse({}, 204)`，Starlette 对 204 不写 `content-length` 却仍然发送 body，uvicorn 抛 `Response content longer than Content-Length` 直接断线）；未列出的 origin 既拿不到 204 也拿不到 CORS 头；公网端口未列出的 `OPTIONS` → **404**（带有效 Key 也一样），列出后无需任何凭据即 204；公网 **401** 仍带 `Access-Control-Allow-Origin`，浏览器读到的是拒绝而不是模糊的 CORS 故障 |
+| 文档可见性 | `/openapi.json` 含 `POST /api/generate`、`/api/chat`、`/v1/chat/completions`、`/v1/completions`、`/api/embed`、`/v1/embeddings` 六个带 schema 的路由：请求 schema 里有 `model`（`api/embed` 另有 `input`+`truncate`，`/api/chat` 有 `messages`），200 分别声明 NDJSON+JSON / JSON+SSE / JSON，并列出 404 与 405 |
+| 只允许 POST 的路由 | 上述 8 条（含 `/v1/messages`、`/v1/message`、`/v1/rerank` 等）在 GET / PUT 上一律 **405** 且响应头 `Allow: POST`，而不是被 catch-all 透传 |
+
+前置条件：公网分区的判定仍只看内核监听 socket（见测试 24A）。分区级的凭据检查排在限流之后、CORS
+预检应答之后，所以被限速的调用者先看到 429，预检请求不带凭据也能拿到 204。但预检对第 1 步来说仍然
+是一条 method+path：公网端口要让浏览器可用，必须在 `path_allowlist` 里为对应路径补上 `OPTIONS:` 条目。
 
 ---
 
@@ -1111,15 +1202,15 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ## 管理 API（Web 管理台）
 
-> 端点统一挂在 `/v1/management` 下（实现在 `app/management.py`），由 `require_admin` 保护，
-> 接受**两种凭据之一**：登录换来的会话 Cookie，或 `api_keys` 表（`llmhub.db`）里的网关 API Key
-> （`Authorization: Bearer` / `X-API-Key`；该表在首次启动时由 `GATEWAY_API_KEYS` /
-> `GATEWAY_API_KEYS_FILE` 导入）。`ADMIN_PASSWORD` 只是登录凭据，当作请求头凭据提交
-> 仍返回 **401**。未设置 `ADMIN_PASSWORD` 时所有接口返回 **503**；凭据缺失或错误返回 **401**。
-> 例外：`/api-keys` 三个接口只认会话 Cookie（`require_admin_session`）——网关 Key 是任何客户端
-> 都持有的凭据，不能拿它再造一把钥匙。
-> `/v1/management` 与 `/admin` 一样豁免 `security.path_allowlist`。管理台前端由网关在 `/admin`
-> 直接提供静态服务（构建产物在 `app/web`）。
+> 端点统一挂在 `/v1/management` 下（实现在 `app/management.py`），由 `require_admin_session` 保护，
+> **只接受登录换来的会话 Cookie**。网关 API Key 会分发给每个调用方，不能等同于管理员凭据：
+> 用它访问管理接口一律 **401**（否则可读取完整配置、导出请求正文、改写上游）。
+> `ADMIN_PASSWORD` 只是登录凭据，当作请求头凭据提交仍返回 **401**。未设置 `ADMIN_PASSWORD`
+> 时所有接口返回 **503**；凭据缺失或错误返回 **401**。`/api-keys` 三个接口同样只认会话 Cookie。
+> 同一来源连续 5 次登录失败锁定 15 分钟，返回 **429** 并带 `Retry-After`。
+> 公网分区上 `/v1/management/*` 与 `/admin*` 是硬性 404，没有「豁免」这一说——全局
+> `security.path_allowlist` 已移除，公网只认 `security.public.path_allowlist`。管理台前端由网关
+> 在内网端口的 `/admin` 直接提供静态服务（构建产物在 `app/web`）。
 
 ### 测试 34: 登录、会话与鉴权方式
 
@@ -1159,9 +1250,9 @@ curl -X POST http://localhost:8000/v1/management/auth/logout
 - 把 `ADMIN_PASSWORD` 放到 `Authorization: Bearer` / `X-API-Key` -> `401`（它只是登录凭据，
   不在网关 Key 列表里）；不在 `api_keys` 表中的随机 Key 同样 `401`
 - 网关 API Key 只接受请求头，放在查询串（`?api_key=...`）-> `401`，避免密钥落进访问日志
-- `auth.enabled: false` 或首次启动时环境变量与密钥文件都没有配置 Key（表里因此一行都没有），
-  Key 这条路径直接关闭，管理接口只认 Cookie
-  （绝不会因此变成匿名可访问）
+- 管理接口在任何配置下都只认会话 Cookie：即使内网 `security.internal.allow_anonymous: true`
+  让业务 API 免 Key，或首次启动时 `api_keys` 表里一行都没有（还没在 `/admin` 签发过任何 Key），
+  管理接口也绝不会变成匿名可访问，网关 Key 打不开它
 - 修改 `ADMIN_PASSWORD` 后旧会话立即失效（签名密钥即密码本身）
 - Cookie 为 HttpOnly + SameSite=Lax，仅在 HTTPS 下加 `Secure`
 - 未配置 `ADMIN_PASSWORD` -> 登录与所有受保护接口均为 `503`
@@ -1410,10 +1501,11 @@ curl -b cookie.txt http://localhost:8000/v1/management/overview
 - 改回 `true` 后，越过约 1 秒的热加载窗口，下一条请求即入库（无需重启容器）
 - 自动化用例里直接调用 `ConfigManager.reload()` 跳过该窗口；对真实服务需等待或先发一次探测请求
 - 旧版本留下的 `llmhub.db` 在启动时自动 `ALTER TABLE ADD COLUMN` 补上新列，历史行不受影响
-- **`HEAD` 只转发不记录**：把 `HEAD` 加进 `security.allowed_http_methods` 后
-  `curl -I -H "X-API-Key: ..." http://localhost:8000/api/version` 正常返回 `200`，但
-  `/requests` 里没有这一行（同样的 `GET` 会有一行）。默认白名单只有 `GET` / `POST` 时
-  HEAD 直接 `405`，根本到不了代理
+- **`HEAD` 只转发不记录**：`HEAD` 由 catch-all 的 `HTTP_METHODS` 接受（已无全局方法白名单），
+  `curl -I -H "X-API-Key: ..." http://localhost:8000/api/version` 在内网端口正常返回 `200`，但
+  `/requests` 里没有这一行（同样的 `GET` 会有一行）；公网分区只有 `security.public.path_allowlist`
+  显式列出 `HEAD <路径>` 时才会存在，否则 404。只有 `POST_ONLY_PATHS` 里的业务路径对非 POST
+  方法仍返回 `405`（带 `Allow: POST`），这与旧的方法白名单无关
 
 ### 测试 40: Web Search 配置投影
 
@@ -1498,9 +1590,10 @@ curl -i http://localhost:8000/v1/management/overview
   保证 `..` 无法跳出 `app/web`，绝不会把同包里的 `app/main.py` 之类的源码发出去
 - `app/web` 缺失时是 **503** + 构建提示，而不是 404 或空白页——前端把 503 与「未配置
   `ADMIN_PASSWORD`」区分处理
-- 静态壳层故意不鉴权（否则打不开登录页），`/v1/management/*` 每一次调用仍受 `require_admin` 保护
-- `/admin` 与 `/v1/management` 一样豁免 `security.path_allowlist`，但仍受方法白名单约束
-  （`DELETE /admin/` -> `405`）
+- 静态壳层故意不鉴权（否则打不开登录页），`/v1/management/*` 每一次调用仍受 `require_admin_session` 保护
+- `/admin` 静态壳层只在内网端口提供，公网分区 `/admin*`、`/v1/management/*` 一律 404；
+  它不受 `security.public.path_allowlist` 约束（那是公网分区的清单），`DELETE /admin/` 返回
+  `405` 只因为静态路由只注册了 GET
 - 前端只在 **401** 时登出并跳回登录页；`503` 视为业务答复（上游不可达 / 密码未配置 / 未构建）
 
 ### 测试 42: 接口测试窗口（`api-test`）与 `api_models`
@@ -1655,9 +1748,9 @@ curl -H "Authorization: Bearer sk-hub-7Kp2…" http://localhost:8000/api/tags
 - 三条路由都只认会话 Cookie（`require_admin_session`）：先 `logout` 再拿网关 API Key 分别请求
   `GET` / `POST` / `DELETE /api-keys` -> **全部 401**，登录回来才 `200`。理由写死在
   `admin_auth.py` 的注释里：网关 Key 是任何客户端都已持有的东西，接受它就等于让客户端给自己发权限
-- 首次启动将 `GATEWAY_API_KEYS` / 密钥文件里的 Key 导入一次：列表里有一行 `source: "file"`、
-  `label` 为空串，`masked` 是旧式 Key 的头 8 尾 4 形式（结尾 4 位与明文相同，便于比对）；
-  此后环境变量再变也不写表，只在启动日志里给掩码警告
+- 环境变量不再提供 Key：`GATEWAY_API_KEYS` 已移除，空表是正常的首次启动状态（需要 Key 的请求 401），
+  第一把 Key 由 `POST /api-keys` 签出，列表里 `source` 为 `console`、`label` 必填（旧库中
+  `source: "file"` 的行只是历史标记，不会再新增）
 - 任何接口都取不到明文：`GET /api-keys` 与新建响应的 `item` 里只有掩码，随后所有列表都不含那串明文
   （`secret not in json.dumps(...)`），表里连 `hash` 列都不出现在响应字段中——
   `listing` 每行只有 `id` / `masked` / `label` / `source` / `created_at` 五列

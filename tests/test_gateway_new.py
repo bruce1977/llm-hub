@@ -7,8 +7,8 @@ Covers:
   - /v1/models and /api/ps aggregation with no upstreams (graceful empty result)
   - POST /v1/systemone: gateway API-key auth + correct forwarding to the backend,
     including the "local" model sentinel (no injection) vs a concrete model (injected)
-  - /docs gate (auth.allow_access_ip_whitelist): 404 for an address outside the whitelist,
-    200 + schema for a matching one
+  - /docs gate (security.internal.expose_docs): 200 + schema when enabled, 404 when off
+  - public listener: config-driven path_allowlist (method->regex) + mandatory key
 
 Run:
     python tests/test_gateway_new.py
@@ -20,13 +20,13 @@ import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 # Configure before importing the app so ConfigManager picks up our temp config.
 _CFG = {
     "server": {"host": "127.0.0.1", "port": 8000},
-    "auth": {"enabled": True, "api_keys": [], "allow_anonymous_health": True},
     "routing": {"strict": False},
     "upstreams": [],  # no live upstreams -> aggregation must return empty, never crash
     "default_upstream": None,
@@ -48,9 +48,8 @@ _CFG = {
         "timeout": 30.0,
     },
     "security": {
-        "admin_endpoints": "deny",
-        "allowed_http_methods": ["GET", "POST"],
-        "path_allowlist": [],
+        "internal": {"allow_anonymous": False, "expose_version": True, "expose_docs": False},
+        "public": {"port": None, "path_allowlist": {}, "admin_endpoints": "deny"},
         "rate_limit": {"enabled": False},
     },
 }
@@ -59,10 +58,8 @@ with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="ut
     _tmp.write(json.dumps(_CFG, ensure_ascii=False))
     _cfg_path = _tmp.name
 os.environ["CONFIG_PATH"] = _cfg_path
-os.environ["GATEWAY_API_KEYS"] = "sk-test-fixture-key"
-# One data file per run: `llmhub.db` also holds the api_keys table, and a key is imported into
-# an *empty* table only, so sharing the system temp directory with another suite would leave
-# this suite's key unimported.
+# One data file per run: `llmhub.db` holds the api_keys table, and this suite writes its own
+# key row there (keys are minted in the console, never seeded from the environment).
 os.environ["LLMHUB_DB"] = f"{_cfg_path}.db"
 os.environ["SYSTEMONE_SERVER_API_KEY"] = "systemone-secret-env-key"
 os.environ["OPENCODE_GATEWAY_API_KEY"] = "opencode-secret-env-key"
@@ -75,6 +72,28 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 API_KEY = "sk-test-fixture-key"
 HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+
+
+def seed_api_keys(*secrets: str) -> None:
+    """Create caller-key rows in llmhub.db before the app starts (console-only in production)."""
+    import sqlite3
+
+    from key_store import SCHEMA, hash_key, mask_key, now_ts
+
+    db = Path(os.environ["LLMHUB_DB"])
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db) as conn:
+        conn.executescript(SCHEMA)
+        for secret in secrets:
+            conn.execute(
+                "INSERT OR IGNORE INTO api_keys (hash, masked, label, source, created_at) "
+                "VALUES (?, ?, '', 'console', ?)",
+                (hash_key(secret), mask_key(secret), now_ts()),
+            )
+        conn.commit()
+
+
+seed_api_keys(API_KEY)
 
 PASSED = 0
 FAILED = 0
@@ -165,14 +184,14 @@ def run() -> int:
             main._UPSTREAM_MODELS_CACHE.pop("opencode-auth", None)
 
         # --------------------------------------------- /docs gate ---
-        print("[3] /docs gated on auth.allow_access_ip_whitelist")
+        print("[3] /docs gated on the internal zone + security.internal.expose_docs")
         r = client.get("/docs")
-        check("GET /docs -> 404 with an empty whitelist", r.status_code == 404, f"got {r.status_code}")
+        check("GET /docs -> 404 when expose_docs=false", r.status_code == 404, f"got {r.status_code}")
 
-        # whitelisting the caller's address serves the docs
-        app.state.manager._config.auth.allow_access_ip_whitelist = [r"^testclient$"]
+        # The internal listener serves the docs when opted in.
+        app.state.manager._config.security.internal.expose_docs = True
         r = client.get("/docs")
-        check("GET /docs -> 200 for a whitelisted address", r.status_code == 200, f"got {r.status_code}")
+        check("GET /docs -> 200 on the internal listener", r.status_code == 200, f"got {r.status_code}")
         r = client.get("/openapi.json")
         spec = r.json()
         paths = set(spec.get("paths", {}).keys())
@@ -206,6 +225,37 @@ def run() -> int:
             {"application/x-ndjson", "application/json"} <= set(gen_ok),
             str(sorted(gen_ok)),
         )
+
+        # The other pass-through forwards are documented too, so nothing the gateway
+        # actually serves is invisible in /docs.
+        documented = {
+            "/api/chat": {"application/x-ndjson", "application/json"},
+            "/v1/chat/completions": {"application/json", "text/event-stream"},
+            "/v1/completions": {"application/json", "text/event-stream"},
+            "/api/embed": {"application/json"},
+            "/v1/embeddings": {"application/json"},
+        }
+        for doc_path, media in documented.items():
+            op = ((spec.get("paths", {}).get(doc_path, {}) or {}).get("post", {}) or {})
+            check(f"/openapi.json includes POST {doc_path}", bool(op), str(sorted(paths)))
+            props = (((op.get("requestBody") or {}).get("content") or {})
+                     .get("application/json", {}).get("schema", {}).get("properties", {}))
+            check(f"{doc_path}: request schema documents model", "model" in props, str(sorted(props))[:160])
+            responses = ((op.get("responses") or {}).get("200", {}) or {}).get("content", {})
+            check(f"{doc_path}: 200 documents {sorted(media)}", media <= set(responses), str(sorted(responses)))
+            check(f"{doc_path}: documents 404 and 405",
+                  {"404", "405"} <= set(op.get("responses") or {}), str(sorted(op.get("responses") or {})))
+        chat_props = (((spec["paths"]["/api/chat"]["post"].get("requestBody") or {}).get("content") or {})
+                      .get("application/json", {}).get("schema", {}).get("properties", {}))
+        check("/api/chat: request schema requires messages",
+              "messages" in chat_props, str(sorted(chat_props))[:160])
+        emb_props = (((spec["paths"]["/api/embed"]["post"].get("requestBody") or {}).get("content") or {})
+                     .get("application/json", {}).get("schema", {}).get("properties", {}))
+        check("/api/embed: request schema documents input + truncate",
+              {"input", "truncate"} <= set(emb_props), str(sorted(emb_props))[:160])
+        oai_props = (((spec["paths"]["/v1/embeddings"]["post"].get("requestBody") or {}).get("content") or {})
+                     .get("application/json", {}).get("schema", {}).get("properties", {}))
+        check("/v1/embeddings: OpenAI input field", "input" in oai_props, str(sorted(oai_props))[:160])
 
         # Swagger auth: shared Authorize schemes + an inline X-API-Key input
         # box inside every endpoint's request section (Parameters -> Try it out).
@@ -242,7 +292,7 @@ def run() -> int:
             bool(models_key) and models_key[0].get("schema", {}).get("type") == "string",
             str(models_key),
         )
-        app.state.manager._config.auth.allow_access_ip_whitelist = []
+        app.state.manager._config.security.internal.expose_docs = False
 
         # --------------------------------------------- /v1/systemone: auth ---
         print("[4] POST /v1/systemone authentication")
@@ -391,14 +441,35 @@ def run() -> int:
         check("websearch without a key -> 401", r.status_code == 401, f"got {r.status_code}")
 
         # the endpoint is documented with a real request schema (query required)
-        app.state.manager._config.auth.allow_access_ip_whitelist = [r"^testclient$"]
+        app.state.manager._config.security.internal.expose_docs = True
         spec = client.get("/openapi.json").json()
         op = spec["paths"]["/v1/tools/web-search"]["post"]
         schema = op["requestBody"]["content"]["application/json"]["schema"]
         check("docs: websearch documents the request schema", schema.get("required") == ["query"], str(schema)[:160])
         check("docs: websearch request has top_k/recency fields", {"top_k", "recency"} <= set(schema["properties"]), str(sorted(schema["properties"])))
         check("docs: websearch response schema declares text/sources", set(op["responses"]["200"]["content"]["application/json"]["schema"]["required"]) >= {"text", "sources"})
-        app.state.manager._config.auth.allow_access_ip_whitelist = []
+        app.state.manager._config.security.internal.expose_docs = False
+
+        # --------------------------------------------- public zone envelope ---
+        print("[10] public listener: config-driven path allowlist + mandatory key")
+        pub = app.state.manager._config.security.public
+        pub.port = 80  # TestClient's scope["server"] port; makes this socket the public zone
+        pub.path_allowlist = {"GET": [r"^/v1/models$"], "POST": [r"^/v1/chat/completions$"]}
+        app.state.public_ports = frozenset({80})
+        try:
+            for probe in ("/health", "/docs", "/openapi.json", "/probe", "/v1/management/config", "/admin/"):
+                r = client.get(probe, headers=HEADERS)
+                check(f"public GET {probe} -> 404", r.status_code == 404, f"got {r.status_code}")
+            r = client.get("/v1/models", headers=HEADERS)
+            check("public GET /v1/models with key -> 200", r.status_code == 200, f"got {r.status_code}")
+            r = client.get("/v1/models")
+            check("public GET /v1/models without key -> 401", r.status_code == 401, f"got {r.status_code}")
+            r = client.get("/v1/chat/completions", headers=HEADERS)
+            check("public wrong method on an allowed path -> 404", r.status_code == 404, f"got {r.status_code}")
+        finally:
+            pub.port = None
+            pub.path_allowlist = {}
+            app.state.public_ports = frozenset()
 
         # cleanup: leave the fixture config as the other sections expect
         app.state.manager._config.upstreams = []

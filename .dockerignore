@@ -1,5 +1,5 @@
-# Build context hygiene: the Dockerfile only copies app/*.py, app/static and app/web,
-# so everything else is dead weight in the context (web/node_modules alone is ~230 MB).
+# Build context hygiene: the Dockerfile only copies app/*.py, app/logging.json, app/static and
+# app/web, so everything else is dead weight in the context (web/node_modules alone is ~230 MB).
 # Run `npm run build` in web/ first - app/web is what the image actually ships.
 
 __pycache__/

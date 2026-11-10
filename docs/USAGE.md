@@ -3,7 +3,8 @@
 The complete documentation: configuration reference, API endpoints, web console, deployment and
 security. The short version — what the project is, screenshots and a 60-second start — lives in
 [README.md](../README.md). Chinese version: [USAGE_CN.md](USAGE_CN.md).
-Endpoint reference: [API.md](API.md). Deployment: [DEPLOY.md](DEPLOY.md).
+Endpoint reference: [API.md](API.md). Config reference, node by node: [CONFIG.md](CONFIG.md).
+Deployment: [DEPLOY.md](DEPLOY.md).
 
 **Contents** ·
 [Features](#features) ·
@@ -26,15 +27,16 @@ Endpoint reference: [API.md](API.md). Deployment: [DEPLOY.md](DEPLOY.md).
 |------|------|
 | **Multi-upstream routing** | Route by the `model` field in the request body to the matching backend instance |
 | **API key auth** | Multiple keys, `Bearer` / `X-API-Key` compatible; every call is checked against the SHA-256 hashes held in memory (`api_keys` in SQLite), so no plaintext is ever stored or compared |
-| **Rerank API** | `/v1/rerank` with generative (`logprobs`) and vector (`embedding`) scoring |
+| **Rerank API** | `/v1/rerank` with generative (`logprobs`) yes/no scoring |
 | **Web search** | `POST /v1/tools/web-search` proxies keyword search to an OpenCode API Gateway upstream and returns the retrieved passages |
 | **Anthropic Messages** | `POST /v1/messages` (plus the singular alias `/v1/message`): the Anthropic request is mapped onto the upstream chat format (Ollama NDJSON or OpenAI SSE) and the answer is wrapped back into an Anthropic envelope (`content` blocks, `stop_reason`, `usage`); streaming is re-sequenced as `message_start → content_block_delta → message_stop`, not passed through |
 | **Unified model list** | `/v1/models` aggregates models & aliases from all upstreams instead of proxying to one instance |
 | **Alias + param injection** | `qwen3.5:4b-nothink` → forwards `qwen3.5:4b` and force-injects `think: false`. Every entry under `aliases:` is a model of its own (the console lists it as a separate row); `upstreams[].model_aliases` only renames |
 | **Streaming pass-through** | NDJSON (`/api/chat`, `/api/generate`) and SSE (`/v1/chat/completions`) forwarded as-is |
-| **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview with today's request and token totals, the models `config.yaml` declares per upstream (`model_aliases` renames applied, a root `aliases:` entry listed as its own model, prefix wildcards expanded through the upstream's model list) plus runtime device/memory, config projections (Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite), the per-model speed test (start / poll / history) and the per-endpoint API tester (usable models per family + live execution); authenticated with the console session cookie or a gateway API key |
+| **Closed API surface** | Only the paths this gateway declares are forwarded, in **both** zones; anything else is **404**, so the internal listener is not an open proxy onto the upstream's whole API (see [Which paths the gateway forwards](#which-paths-the-gateway-forwards)) |
+| **Management API** | Read-only `/v1/management/*`: upstream & VRAM overview with today's request and token totals, the models `config.yaml` declares per upstream (`model_aliases` renames applied, a root `aliases:` entry listed as its own model, prefix wildcards expanded through the upstream's model list) plus runtime device/memory, config projections (Rerank / System One / Web Search), request log, timeseries and distribution stats (SQLite), the per-model speed test (start / poll / history) and the per-endpoint API tester (usable models per family + live execution); authenticated with the console session cookie **only** — a gateway API key is not an admin credential |
 | **Web console** | Vue 3 + TypeScript + Element Plus + ECharts single-page app served by the gateway itself at `/admin` (no node in the image): overview, upstreams, the configured model inventory (display renames, derived models, wildcards expanded, running device/memory), request details and charts, a per-model speed test, an API tester popup behind a **Test** button on every documented endpoint, and API key management (mint / revoke, masked list). Apart from the Settings page (the one editor that saves `config.yaml`), the views offer no other configuration writes |
-| **API key management** | Caller keys are rows of the `api_keys` table in `llmhub.db`, stored as `sha256(<plaintext>)` plus a display mask — the database never holds a secret. The console mints (`sk-hub-…`, 47 characters) and revokes them, showing a new plaintext exactly once. `GATEWAY_API_KEYS` / `data/.keys` only seed an empty table on first start |
+| **API key management** | Caller keys are rows of the `api_keys` table in `llmhub.db`, stored as `sha256(<plaintext>)` plus a display mask — the database never holds a secret. The console mints (`sk-hub-…`, 47 characters) and revokes them, showing a new plaintext exactly once. The console is the **only** source: there is no seed variable, key file or config node |
 | **Model speed test** | `测速` on **Models · LLM** runs the same prompt N times through the gateway and reports TTFT, decode tok/s and prefill tok/s — taken from the server's own timings (`eval_duration` / `prompt_eval_duration` / `predicted_ms`) when the upstream provides them, falling back to client-side measurement (flagged `timing_source`) otherwise. The latest 3 runs per upstream + model stay in SQLite and show up on hover |
 | **API tester** | Every `API usage` tab carries a **`Test` button** at the right end of each endpoint's *Request parameters* header, opening the tester in a popup (`/api/generate`, `/v1/chat/completions`, `/v1/messages`, `/api/embed`, `/v1/embeddings`, `/v1/rerank`, `/v1/systemone`, `/v1/tools/web-search`): a model picker narrowed by `api_models` (the two native `/api` testers list models of `type: ollama` upstreams only) that lists **names/aliases only**, one input per documented parameter **pre-filled with its default**, a request-body preview, then the status, timings, the model the gateway really routed to with the parameters an alias injected, and the answer pulled out of JSON / NDJSON / SSE. The call runs server-side through the gateway's own service, so alias injection and the request log behave exactly as for an external client, and any extra API key appears only as a read-only `••••••` |
 | **Trilingual console** | Simplified Chinese (source), Traditional Chinese and English, switched from the account menu and remembered per browser via `localStorage`; a first visit guesses from `navigator.language` (`zh-TW` / `zh-HK` / `zh-MO` / `zh-Hant` → Traditional, `en*` → English, else Simplified), and Element Plus' own widgets (date panels, pagination) follow the choice. Missing keys fail the build (`MessageSchema`) instead of rendering raw ids |
@@ -52,6 +54,8 @@ llm-hub/
 │   ├── main.py       # FastAPI entrypoint & special endpoints (the /v1/messages routes live here)
 │   ├── config.py     # Config model, loading, hot reload, alias resolution
 │   ├── auth.py       # API key authentication
+│   ├── serve.py      # Hardened entrypoint: binds every listener in ONE process (proxy_headers=False)
+│   ├── bridge.py     # Public-zone path policy (allowlist + hard 404s) - not a second proxy service
 │   ├── admin_auth.py # Console login sessions (admin password, 12-hour cookie, login throttling)
 │   ├── key_store.py  # Caller API keys in SQLite: sha256 hashes, masks, mint/revoke
 │   ├── proxy.py      # Reverse proxy & streaming pass-through
@@ -71,7 +75,7 @@ llm-hub/
 ├── docs/
 │   ├── images/       # Images the README embeds: architecture, screenshots, WeChat QR
 │   ├── screenshots/  # Full per-page console captures (en/ and zh/, shot by capture-live.js)
-│   └── ...           # API.md / API_CN.md, DEPLOY.md / DEPLOY_CN.md, console implementation notes
+│   └── ...           # API.md / API_CN.md, CONFIG.md / CONFIG_CN.md, DEPLOY.md / DEPLOY_CN.md, console implementation notes
 ├── tests/            # Standalone test scripts (smoke / gateway / management / security / live E2E)
 └── data/
     └── config.yaml   # Config file (mounted into the container at /data)
@@ -134,9 +138,10 @@ set in `.env`. Without that variable the page reports the console as disabled an
 (the output of `npm run build`, next to the modules), so step 3 above - which mounts the host
 `app` directory over `/app` - needs that copy to be built too, otherwise `/admin` answers 503.
 
-> **Secrets come from `.env`**: `--env-file` reads `GATEWAY_API_KEYS` and injects it into the
-> container, so `config.yaml` never needs to hold any key. Keep `.env` private and out of version
-> control; change keys in this one place only.
+> **Secrets come from `.env`**: `--env-file` reads `ADMIN_PASSWORD` (and, if the backend needs it,
+> `SYSTEMONE_SERVER_API_KEY`) and injects it into the container, so `config.yaml` never holds a
+> credential. Caller API keys are minted in the console afterwards. Keep `.env` private and out of
+> version control.
 > On Windows, `--env-file` / `-v` paths must use a drive-letter form (`${target folder}`), not
 > `/d/...` (Docker cannot find the file).
 
@@ -152,7 +157,7 @@ The repo ships two templates with **no real information**; copy and fill them in
 | Template | Copy to | Description |
 |------|--------|------|
 | `data/config.example.yaml` | `data/config.yaml` | Sample config with full `upstreams` / `aliases` / `rerank` / `security` fields, including a `priority` example |
-| `.env.example` | `.env` | Sample secrets; just replace `GATEWAY_API_KEYS` with your own random strings (≥16 chars). These values seed the empty `api_keys` table on the first start — afterwards mint keys at `/admin` instead of editing this file |
+| `.env.example` | `.env` | Template with the three variables this service reads: `CONFIG_PATH` (commented, shows the default), `ADMIN_PASSWORD` (set this — ≥32 random chars) and `SYSTEMONE_SERVER_API_KEY` (commented, optional). Everything else lives in `config.yaml`; caller keys are minted at `/admin` and have no variable at all |
 
 ```bash
 cp data/config.example.yaml data/config.yaml
@@ -217,6 +222,12 @@ An existing `data/config.json` is still read (with a warning) when there is no `
 it, so an older deployment keeps working; rename it to `config.yaml` when convenient, since JSON is
 valid YAML and needs no conversion.
 
+This chapter covers the nodes you actually edit and what they do to a call. The **node-by-node
+reference for every key** — default, who reads it, when a change lands, and the traps (an unknown
+YAML key is silently ignored, `rerank.endpoint` is a label only, a `- ''` placeholder in
+`api_models` is dropped, `default_upstream` resolves by `upstreams[].name`) — lives in
+[CONFIG.md](CONFIG.md).
+
 ### `server` — the gateway itself
 
 | Field | Default | Description |
@@ -226,76 +237,110 @@ valid YAML and needs no conversion.
 | `request_timeout` | `600` | Default upstream timeout (seconds) |
 | `max_concurrency` | `64` | HTTP connection-pool cap |
 
-### `auth` — authentication
+### `security` — zones, authentication & hardening
+
+The gateway has **two trust zones**, decided by the **kernel-assigned local listening port**
+(`scope["server"]`) — never by a client IP, an `X-Forwarded-For` header, or an API key. One socket
+cannot be both trusted and untrusted, and `app/serve.py` starts uvicorn with
+`proxy_headers=False` so a header cannot rewrite that anchor. Ports and zone policy live **only in
+this file**: `server.port` is the internal listener, `security.public.port` opens the public one.
+There are no port environment variables (see `.env.example`).
 
 ```yaml
-auth:
-  enabled: true
-  allow_anonymous_health: true
-  allow_access_ip_whitelist: []
-  trusted_networks: []            # CIDR, e.g. 192.168.10.0/24, 127.0.0.1/32
+server:
+  port: 8000                 # internal (trusted LAN) listener
+security:
+  internal:                  # policy for the `server.port` socket
+    allow_anonymous: true    # true = business APIs key-free on this port
+    expose_version: true     # whether `/` reveals the build version
+    expose_docs: true        # /docs, /openapi.json, /static/swagger/*
+  public:                    # policy for the internet-facing socket
+    port: null               # null = none; 8001 = two listeners; 8000 (= server.port) = public-only
+    path_allowlist:          # method -> list of re.fullmatch regexes; the COMPLETE public surface
+      GET:  ["^/v1/models$"]
+      POST: ["^/v1/chat/completions$", "^/v1/messages$", "^/api/generate$", "^/api/chat$"]
 ```
 
-- **Keys are no longer configurable in `config.yaml`**: the `api_keys` field is gone, so the file
-  carries no credential at all (the live store is the `api_keys` table described below). A leftover
-  `api_keys` block logs a warning and is ignored
-- Key sources: the `GATEWAY_API_KEYS` env var and the file named by `GATEWAY_API_KEYS_FILE`
-  (e.g. `data/.keys`); both merge and de-duplicate
-- `GATEWAY_API_KEYS`: `GATEWAY_API_KEYS=key1,key2` (comma / newline separated)
-- `GATEWAY_API_KEYS_FILE`: path to a file holding the keys, ideal for Docker / K8s secrets (won't
-  leak via `docker inspect`)
-- **Those two only seed an empty `api_keys` table.** The live source of truth is that table, inside
-  `llmhub.db`, where every row keeps `sha256(<plaintext>)` plus a display mask and **never the
-  secret**. The first start imports the environment keys as `source: "file"`; from then on the file
-  is not read again, so revoking a key in the console survives restarts and editing the file adds
-  nothing. A startup warning lists, masked, any environment key the table does not serve. Mint and
-  revoke at `/admin` → account menu → **API keys**, where the plaintext is shown exactly once
-  (see [Web console](#web-console))
+- **Internal zone** — any request that arrives on `server.port` when that port is *not* also the
+  public port:
+  - `/` and `/health` are **always anonymous** (liveness probes); `allow_anonymous` does not gate
+    them. `/healthz` is not a probe alias and needs a key when `allow_anonymous` is `false`.
+  - `allow_anonymous: true` → all other business APIs (`/v1/models`, `/api/tags`,
+    `/v1/chat/completions`, ...) are key-free on this port. `false` → they need a valid key or a
+    console session cookie (`401` without, `403` with an invalid key).
+  - `expose_docs` controls `/docs` / `/openapi.json` / Swagger assets; `expose_version` controls
+    whether the anonymous `/` response carries the build version.
+  - The management API (`/v1/management/*`) and `/admin` are reachable here; the management API
+    always requires the console session cookie (a gateway key is never an admin credential).
+- **Public zone** — requests arriving on `security.public.port`:
+  - **Every request needs a valid key or console session cookie. This is mandatory and cannot be
+    switched off** — there is no `require_api_key` toggle.
+  - Only the `method + path` pairs in `public.path_allowlist` exist. Each value is a **full-match**
+    regex (`re.fullmatch`, not a prefix), keyed by an uppercase HTTP method. A trailing slash is a
+    different path; an unlisted pair returns **404 whether or not a key is supplied**. An invalid
+    regex is dropped with a warning (fail-closed); an invalid method name fails config validation.
+  - Red lines that config **cannot** open: `/v1/management/*`, `/admin*` (404), and any path with a
+    `..` segment or NUL byte. `/`, `/health`, `/docs`, `/openapi.json`, `/probe`, `/api/tags`,
+    `/api/ps`, `/api/version` are therefore absent unless you explicitly list them, but management
+    and console remain 404 regardless.
+  - `security.public.port: null` = no public listener. `= server.port` (e.g. both `8000`) makes a
+    **public-only** single socket with **no anonymous HTTP path** — the container HEALTHCHECK must
+    then use a TCP port probe, not `GET /health`. Otherwise (e.g. internal `8000`, public `8001`)
+    `serve.py` binds both listeners in one process, sharing the key cache and rate-limit buckets.
+- **API keys** live in the SQLite `api_keys` table in `llmhub.db`, not in `config.yaml` — the file
+  carries no credential. Each row stores `sha256(<plaintext>)` plus a display mask, **never the
+  secret**. The console is the **only** way a key comes into existence: sign in at `/admin` →
+  **API keys** and the plaintext is shown exactly once (see [Web console](#web-console)). Earlier
+  releases read `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` / a `.keys` file; all three are gone,
+  so nothing in the environment, in a file or in `config.yaml` can seed or revive a key. An empty
+  table is a normal first run — every keyed request answers 401 until the first key exists.
 - **Key format**: `sk-hub-` + 40 base62 characters = **47 characters**, ~238 random bits. The prefix
   is not a secret; it is what makes a key recognisable as one in a log or a client config. The mask
   keeps the first and last 4 body characters (`sk-hub-FNdc…SVvw`); an imported key of another shape
   shows head 8 + tail 4. SHA-256 (not bcrypt) because a 238-bit random key has no passphrase to
-  brute-force and every client request would otherwise pay a slow KDF
-- `allow_access_ip_whitelist`: list of regexes matched with **fullmatch** against the ASGI client
-  address (the **TCP peer** on a direct connection; the gateway code itself never reads
-  `X-Forwarded-For`, which a caller can forge). Matching addresses may open `/docs` and
-  `/openapi.json` and call the API without a key. Default `[]` (nobody exempt); a malformed pattern
-  logs a warning and is skipped. Note that uvicorn's `ProxyHeadersMiddleware` rewrites the client
-  address from forwarded headers when the peer is a **trusted proxy** (`--forwarded-allow-ips`,
-  default `127.0.0.1`), so behind a local reverse proxy the real source is what matches — make sure
-  that proxy sets and sanitises `X-Forwarded-For`
-- **`trusted_networks`: the explicit internal/outside switch** (a list of CIDR blocks such as
-  `192.168.10.0/24`, `10.0.0.0/8`, `127.0.0.1/32`; a bare IP is accepted too). Once declared:
-  - Trusted peers reach **every path** without a key, even if they send an invalid one;
-    `/docs`, `/openapi.json` and `/static/swagger/*` are visible to the same peers. The docs gate
-    and the key bypass share `trusted_peer()`, so a hidden `/docs` can no longer coexist with a
-    key-free API
-  - Every other caller needs a valid key on **all business APIs** (`/v1/models`, `/api/tags`,
-    `/v1/chat/completions`, ...): `401` without one, `403` with an invalid one. Only `/` and
-    `/health` stay anonymous under `allow_anonymous_health` (container / load-balancer probes);
-    set it to `false` to close those too
-  - `enabled: false` is **no longer globally anonymous**: only the trusted networks are exempt,
-    external callers still need a key. With an empty `api_keys` table those external requests all
-    answer `401`, and startup tells you to mint a key at `/admin`
-  - Leaving it `[]` keeps the legacy behaviour (`enabled: false` = everyone anonymous), but
-    startup now warns loudly that a hidden `/docs` is **not** a security boundary
-  - Matching again uses only the TCP peer (`request.client.host`), never `X-Forwarded-For`.
-    Uvicorn rewrites it from forwarding headers behind a trusted proxy, so the proxy must
-    **overwrite** with `proxy_set_header X-Forwarded-For $remote_addr;` (not append with
-    `$proxy_add_x_forwarded_for`), or an outsider can forge an internal IP
-- **A console session cookie is also a credential on business API routes**: after sign-in the
-  signed cookie can call `/v1/models` and friends directly, so the browser need not hold a caller
-  key. Its lifetime is `ADMIN_SESSION_TTL` seconds (default `43200` = 12h, clamped 5 min .. 7d)
-  and successful requests past half the TTL renew it, so an active session never hard-expires.
-  Logout only clears the browser cookie - there is no server-side session table, so a copied
-  cookie stays valid until it expires or `ADMIN_PASSWORD` changes
-- ⚠️ With auth enabled (`enabled: true`) and **no row in `api_keys`** (after seeding), the gateway
-  **refuses to start** and names the fix: seed the empty table with `GATEWAY_API_KEYS` /
-  `GATEWAY_API_KEYS_FILE` and restart, or set `auth.enabled: false`. This avoids an accidentally
-  unauthenticated service
-- `allow_anonymous_health`: let `/health` skip auth (keep `true` or the container health check
-  fails)
-- `enabled: false` temporarily disables auth
+  brute-force and every client request would otherwise pay a slow KDF.
+- **A console session cookie is also a credential on business API routes in both zones**: after
+  sign-in the signed `llmhub_admin` cookie can call `/v1/models` and friends directly, so the
+  browser need not hold a caller key. Its lifetime is `ADMIN_SESSION_TTL` seconds (default
+  `43200` = 12h, clamped 5 min .. 7d) and successful requests past half the TTL renew it.
+  Logout only clears the browser cookie — there is no server-side session table, so a copied cookie
+  stays valid until it expires or `ADMIN_PASSWORD` changes.
+- **Key guard**: an empty `api_keys` table is a normal first run, because keys are minted only in
+  the console. The gateway refuses to start in exactly one case: the table is empty **and**
+  `ADMIN_PASSWORD` is unset (so the console cannot mint anything) **and** there is no anonymous
+  internal zone — i.e. no credential could ever exist. Set `ADMIN_PASSWORD`, start, then create the
+  first key at `/admin`.
+
+The remaining `security.*` keys (`blocked_paths`, `cors_origins`, `max_body_bytes`,
+`allow_query_api_key`, `allowed_client_ips`, `trusted_proxies`, `rate_limit`)
+are shared hardening applied to **both** zones; the table is in
+[Security](#security-must-read-for-public-exposure) and every field with its default is in
+[CONFIG.md](CONFIG.md#security).
+
+`admin_endpoints` is **not** shared — it sits in `security.public` and is enforced only on the
+public listener:
+
+| Mode | Effect on the public listener |
+|------|------|
+| `deny` (default) | Blocks `api/delete`, `api/copy`, `api/create`, `api/push`, `api/blobs/*` **and** `api/pull`; `/admin*` and `/v1/management/*` stay **404** |
+| `readonly` | Allows `api/pull` only; the destructive calls, `api/blobs/*` and the management plane stay blocked (404) |
+| `allow` | Forwards every model-management call, **including `api/blobs/*`**, **and opens the management plane**: `/admin*` and `/v1/management/*` are routed to their real handlers |
+
+`api/show` and `api/version` are never admin-blocked, and on `server.port` (the trusted LAN
+listener) the mode is never applied at all — changing it there is a guaranteed no-op, because
+pulling a model or opening the console on the LAN is normal.
+
+The two halves behave differently on purpose:
+
+- **Ollama's endpoints** are ordinary paths, so the mode only lifts the filter — the request still
+  has to survive `security.public.path_allowlist`. Exposing `pull` publicly needs **both** the mode
+  and a `POST` entry (the FAQ entry [`admin_endpoints: allow` changed nothing](#faq) walks through
+  all three causes).
+- **The management plane is a prefix**, decided in `bridge_denial()` *before* the allowlist, so
+  `allow` opens it as a unit — no rule can sensibly enumerate `/admin/assets/*`. It is never
+  anonymous: the static shell and `POST /v1/management/auth/login` are the only credential-free
+  paths, every other management route needs the session cookie, and a gateway key is never an
+  admin credential.
 
 ### `upstreams` — backend instances (Ollama / LM Studio / OpenCode)
 
@@ -355,7 +400,24 @@ The final upstream is decided in this order:
 ### `routing` — routing policy
 
 - `strict: false` (default): when a model matches no instance, forward to `default_upstream`
-- `strict: true`: undeclared models return 404, avoiding accidentally hitting the default instance
+- `strict: true`: a **named** model that no upstream declares and no alias resolves returns 404,
+  avoiding accidentally hitting the default instance
+- **A request with no `model` always falls back to `default_upstream`, even with `strict: true`.**
+  Ollama's model-management calls (`api/pull`, `api/create`, `api/delete`, `api/copy`,
+  `api/blobs/*`) carry `name`, not `model`, and a `GET` carries neither. Strict mode refuses to
+  guess a *named* model; an empty name is not a guess, it is the "this body has no model" case
+- `default_upstream` is matched **by `upstreams[].name`**. A dangling name (or `null`) resolves to
+  nothing, so the fallback silently becomes a **404** and a model-less admin call has nowhere to
+  go — re-check it after renaming an upstream. Field details: [CONFIG.md](CONFIG.md#default_upstream)
+
+```bash
+# Works under routing.strict: true as well - the body has no `model`, so it lands
+# on default_upstream (which must name a real upstream)
+curl http://localhost:8000/api/pull \
+  -H "Authorization: Bearer sk-gateway-example-key" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"qwen3:4b"}'
+```
 
 ### `aliases` — aliases & parameter injection
 
@@ -527,20 +589,27 @@ rerank:
   normalize: false
   max_concurrency: 8
   return_documents: true
-  model_modes:
-    bge-m3:latest: embedding
+  upstream_api: auto
+  options:
+    num_ctx: 8192
+  keep_alive: 3m
 ```
 
-Two scoring modes:
+One scoring mode is supported: **`logprobs`** — a yes/no prompt whose first answer token is turned
+into a probability by a two-class softmax, which is what a generative reranker such as
+`qwen3-reranker:4b` answers. `model_modes` still overrides per model, and every accepted spelling of
+the scoring mode (`generation`, `cross-encoder`, `yes_no`, …) resolves to `logprobs`.
 
-| Mode | For | How it works |
-|------|----------|------|
-| `logprobs` | Generative rerankers like Qwen3-Reranker | Build a yes/no binary prompt, softmax over the first token's logprobs |
-| `embedding` | Vector models like bge-m3 | Compute cosine similarity of the query and document vectors |
+A second mode used to exist and is gone: **`embedding`** (cosine similarity between the query and
+each document, scored by the retrieval vector model). Re-scoring candidates with the very model that
+produced their embeddings adds no signal, so selecting it now returns **400** with that explanation
+instead of silently degrading to a meaningless score. Use a generative reranker, or drop the rerank
+step.
 
-`mode` is the global default. When mixing reranker types (e.g. generative `qwen3-reranker:4b` +
-vector `bge-m3:latest`), use `model_modes` to set a per-model mode, e.g.
-`{"bge-m3:latest": "embedding"}`.
+Keep `options.num_ctx` tight. Ollama pre-allocates the whole KV cache, so the context length, not the
+parameter count, dominates the VRAM a reranker occupies: `qwen3-reranker:4b` at its native 40960
+context costs about 9.3 GB, at 8192 about 4.0 GB with the same scores. `keep_alive` then unloads it
+between bursts, because reranking is bursty and a resident 4B model steals VRAM from the chat models.
 
 ### `websearch` — web search proxy
 
@@ -566,11 +635,44 @@ response as-is (`query`, `results[]`, concatenated `text`, `sources`, and `answe
   `Authorization: Bearer <key>`. Empty (default) = the call is unsigned. Keys stay in the
   environment, never in `config.yaml`
 - `model` is **never rewritten**: it is not resolved against the gateway's `aliases`
-- Callers authenticate with the gateway's own key (`GATEWAY_API_KEYS`); the endpoint is
+- Callers authenticate with a gateway key minted at `/admin`; the endpoint is
   POST-only (**405** otherwise) and returns **502** / **504** when the provider is unreachable
   or slow
 
 Full request/response contract and curl examples: [API.md → Web Search](API.md#web-search-opencode-gateway-proxy).
+
+### `systemone` — System One decision proxy
+
+`POST /v1/systemone` puts a structured-decision backend behind the same gateway key. Two backends
+answer that path: a `1panel/laya-server` deployment, or **Ollama 0.40+**, which serves it natively.
+
+```yaml
+systemone:
+  enabled: true
+  backend: http://llm.home:11435
+  model: tev1
+  api_key_env: SYSTEMONE_SERVER_API_KEY
+  path: v1/systemone
+  timeout: 60.0
+```
+
+- Callers authenticate with the gateway's own key; the gateway then signs the backend call with the
+  value of the environment variable named by `api_key_env` (default `SYSTEMONE_SERVER_API_KEY`).
+  The key stays in the environment, never in `config.yaml`, and an Ollama backend simply ignores
+  that `Authorization` header
+- Request and response bodies are passed through unchanged, apart from `model`: it is injected into
+  the forwarded body only when it is a concrete value and the caller sent none. `"local"` is the
+  sentinel meaning "do not inject"
+- The two backends disagree about `model`: laya-server accepts only `auto` / `english` /
+  `multilingual` / `typed-decisions` (anything else **422**), while Ollama wants an installed model
+  name (`auto` → **404**, missing → **400**). Point `model` at a real model (e.g. `tev1`) when the
+  backend is Ollama
+- `enabled: false` → **404**; a connect / HTTP failure → **502**; a read timeout → **504**. The
+  backend's own status and body reach the caller unchanged, and a non-POST method is **405** with
+  `Allow: POST`
+
+Every field with its default: [CONFIG.md](CONFIG.md#systemone). Request/response contract and curl
+examples: [API.md → System One](API.md#system-one-decision-api-laya-server-and-ollama-proxy).
 
 ### `request_log` — request detail switch
 
@@ -591,9 +693,9 @@ Feeds the console's "Requests" view: every call through the gateway becomes one 
 - Database path and retention stay deployment-level environment variables: `REQUEST_LOG_DB`,
   `REQUEST_LOG_RETENTION_DAYS`
 - **`HEAD` is forwarded but never recorded**: it carries no body and no answer, and liveness
-  monitors send it continuously, so logging it would drown the real calls. Under the default
-  `allowed_http_methods: [GET, POST]` a HEAD never reaches the proxy at all (it answers `405`);
-  allow `HEAD` there and the request is forwarded normally, just without a row
+  monitors send it continuously, so logging it would drown the real calls. The catch-all accepts
+  `HEAD` through its `HTTP_METHODS` (there is no global method allowlist any more), so it is
+  forwarded normally, just without a row
 - **Statistics count API calls only**: the list, the charts, the KPIs and the failure view all add
   `path LIKE '/v1/%' OR path LIKE '/api/%'` (`request_log.API_PATH_SCOPE`), so `/health`, `/metrics`,
   `/openapi.json` and the `/admin/*` asset requests cannot dilute the numbers. Rows for those paths
@@ -637,9 +739,9 @@ for scripts; the table gives it no column.
 shows the generated 47-character key once, in a box with a copy button and a confirmation that it
 was saved; closing that dialog reloads the list, and from then on the value can only be revoked,
 never recovered. Revoking is deliberately two steps on the row itself (*Revoke* → *Confirm revoke* /
-*Cancel*), because one stray click must not kill a credential some client is using right now. Those
-three routes accept the console session cookie **only** — a gateway API key is what any client
-already holds, so it cannot be used to mint more access.
+*Cancel*), because one stray click must not kill a credential some client is using right now. Like
+every other `/v1/management/*` route, those three accept the console session cookie **only** —
+a gateway API key is what any client already holds, so it is never an admin credential.
 Models · LLM and the Upstreams row-expander list the models each upstream declares in
 `config.yaml` (`upstreams[].models`, shown under its `model_aliases` short name when one is
 configured, while every entry of the root `aliases:` node becomes a row of its own; a prefix
@@ -712,10 +814,12 @@ npm run dev      # dev server at http://localhost:5173/admin/, /v1/management pr
 npm run build    # type-checks, then writes app/web - commit it, the image copies it with the modules
 ```
 
-All data comes from `/v1/management/*`, which accepts **two credentials**: the console session
-cookie, or a gateway API key via `Bearer` / `X-API-Key` so scripts can reuse the key they already
-have. `ADMIN_PASSWORD` itself is a login credential only — sending it as a request header answers
-401, and a key in the query string is rejected. Without `ADMIN_PASSWORD` every route answers 503.
+All data comes from `/v1/management/*`, which accepts **only the console session cookie**. A
+gateway API key is intentionally not an admin credential: it is handed to every client, and
+granting it management access would expose the full config, all request bodies and the config
+writer. `ADMIN_PASSWORD` itself is a login credential only — sending it as a request header
+answers 401, and a key in the query string is rejected. Without `ADMIN_PASSWORD` every route
+answers 503. Five failed sign-ins lock the source IP out for 15 minutes.
 
 ```bash
 # Set the administrator password (without it every management call returns 503)
@@ -725,11 +829,8 @@ ADMIN_PASSWORD=<16+ random chars>
 curl -c cookie.txt http://localhost:8888/v1/management/auth/login \
   -H "Content-Type: application/json" -d '{"password": "'"$ADMIN_PASSWORD"'"}'
 
-# Later calls authenticate either with that cookie ...
+# Later calls authenticate with that cookie (a gateway API key answers 401 here)
 curl -b cookie.txt http://localhost:8888/v1/management/overview
-
-# ... or with a gateway API key
-curl -H "X-API-Key: $GATEWAY_API_KEYS" http://localhost:8888/v1/management/overview
 ```
 
 | Path | Purpose |
@@ -801,9 +902,9 @@ All error responses follow a consistent format:
 |-------------|-------|-------------|
 | `400` | Bad Request | Invalid JSON, missing required fields, or malformed request |
 | `401` | Unauthorized | Missing API key (when auth is enabled) |
-| `403` | Forbidden | Invalid API key, IP not allowed, or endpoint blocked |
-| `404` | Not Found | Unknown endpoint or model not found on any upstream |
-| `405` | Method Not Allowed | HTTP method not supported (e.g., GET on `/v1/rerank`) |
+| `403` | Forbidden | Invalid API key, IP outside `allowed_client_ips`, or a gateway API path blocked by `security.blocked_paths` / the public `admin_endpoints` filter |
+| `404` | Not Found | A path outside the gateway's API (both zones), an unlisted public method+path, or a model no upstream serves |
+| `405` | Method Not Allowed | Non-POST on a POST-only route (`/v1/rerank`, `/api/generate`, `/api/chat`, `/v1/chat/completions`, ...); the response carries `Allow: POST` |
 | `413` | Request Entity Too Large | Request body exceeds `security.max_body_bytes` (default 32MB) |
 | `422` | Unprocessable Entity | Request body is valid JSON but fails validation |
 | `502` | Bad Gateway | Upstream unreachable or returned an error |
@@ -826,12 +927,82 @@ curl http://localhost:8000/api/chat \
   -d '{"model":"unknown-model","messages":[{"role":"user","content":"hi"}]}'
 # 404 {"detail":"No upstream configured for model 'unknown-model'."}
 
-# Blocked admin endpoint
-curl http://localhost:8000/api/delete \
+# Blocked admin endpoint - public listener only (security.public.admin_endpoints: deny).
+# The internal listener (8000) forwards this call untouched.
+curl http://localhost:8001/api/delete \
   -H "Authorization: Bearer sk-key" \
   -d '{"name":"model"}'
 # 403 {"detail":"Endpoint '/api/delete' is disabled on this public gateway."}
+# That 403 needs POST ^/api/delete$ in security.public.path_allowlist first;
+# without the entry the public zone answers 404 before the admin filter runs.
 ```
+
+### Which paths the gateway forwards
+
+The gateway is not a blind reverse proxy: only the paths it declares are put on an upstream's wire,
+in **both** zones. Anything else is a gateway **404**, whatever the backend happens to implement,
+so the internal listener is not an open proxy onto the whole upstream API.
+
+**Forwarded to the upstream that owns `model`:**
+
+| Family | Paths |
+|------|------|
+| Ollama native | `api/generate`, `api/chat`, `api/embed`, `api/embeddings`, `api/show`, `api/version` |
+| OpenAI-compatible | `v1/chat/completions`, `v1/completions`, `v1/embeddings` |
+| Ollama model management | `api/pull`, `api/push`, `api/create`, `api/delete`, `api/copy`, `api/blobs/*` |
+
+The model-management paths are forwardable on purpose: on the internal listener they are normal
+operations, and on the public listener `security.public.admin_endpoints` decides whether they pass
+— a **403** from that filter is a clearer answer than a 404 claiming the endpoint does not exist.
+They still need an entry in `security.public.path_allowlist` to exist on the public socket at all.
+
+**Answered locally, never forwarded:** `/`, `/health`, `/probe`, `/v1/models`, `/models`,
+`/api/tags`, `/api/ps` (aggregated across upstreams), `/v1/rerank` (plus `/rerank` and `/api/rerank`),
+`/v1/messages` (plus `/v1/message`), `/v1/systemone`, `/v1/tools/web-search`, `/v1/management/*`,
+`/admin/*`, `/docs` and `/openapi.json`.
+
+```bash
+# A path the gateway does not declare: 404 in both zones, with or without a key
+curl http://localhost:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer sk-gateway-example-key"
+# 404 {"detail":"Endpoint '/v1/audio/transcriptions' is not part of this gateway's API. See /docs (internal zone) or docs/API.md for the callable paths."}
+```
+
+Two consequences worth knowing:
+
+- A `security.blocked_paths` entry only produces **403** for a path that really is a gateway API.
+  An unknown path is refused with **404** first, so blocking it changes nothing.
+- Listing a path in `security.public.path_allowlist` does not invent it either: a method+path that
+  is not forwardable still gets the proxy's own **404**.
+
+**Two decisions, not one.** On the public socket "does this path exist" and "may this caller use it"
+are separate steps, both answered by `app/bridge.py` from the request middleware, in this order:
+
+| Step | Question | Answer |
+|---|---|---|
+| 1 | does this method+path exist on this socket? | unlisted → **404**, even with a valid key |
+| 2 | does this caller have a credential? | no key and no console session → **401**, an invalid key → **403** |
+
+Step 2 belongs to the **zone**, not to whichever dependencies a route declares, so it is evaluated
+before routing: a `path_allowlist` entry can never make an endpoint anonymous, and a handler that
+ever forgot `Depends(require_api_key)` would still be authenticated from the internet. It runs after
+the rate limiter (a throttled caller still sees **429**) and after the CORS pre-flight answer (a
+pre-flight carries no credentials by design). The internal listener is deliberately not
+credential-checked there — its anonymous paths (`/admin` static, `/`, `/health`, and every API when
+`security.internal.allow_anonymous: true`) are answered by routes that are not business endpoints.
+
+The pre-flight is the one request that reaches the browser without a key, and step 1 still treats it
+as a method+path: on the public socket a browser client needs an `OPTIONS:` entry beside the `GET:`
+and `POST:` ones it uses, or the pre-flight is a **404** and the real call never leaves the page. The
+answer is a `204` with **no body bytes** — a body there desynchronises the connection.
+
+**What Swagger shows.** Six forwarded paths are documented routes with a request schema, examples
+and 404/405 responses: `POST /api/generate`, `POST /api/chat`, `POST /v1/chat/completions`,
+`POST /v1/completions`, `POST /api/embed` and `POST /v1/embeddings`. Every POST-only route — those
+six plus `/v1/rerank`, `/rerank`, `/api/rerank`, `/v1/systemone`, `/v1/tools/web-search`,
+`/v1/messages` and `/v1/message` — answers a gateway **405** with `Allow: POST` for any other method
+instead of forwarding it. `/docs` itself stays internal-only, gated by
+`security.internal.expose_docs`.
 
 ### Forward requests (fully Ollama-compatible)
 
@@ -998,7 +1169,8 @@ Response (passed through from the provider):
 
 Request fields: `query` (required), `top_k`, `max_chars_per_page`, `locale`, `recency`
 (`day`/`week`/`month`/`year`), `synthesize`, `include_sources`, `model` (forwarded verbatim).
-`text` is every retrieved paragraph concatenated — ready to drop into a prompt.
+`text` is every retrieved paragraph concatenated — ready to drop into a prompt; `answer` is non-null
+only when `synthesize: true`.
 
 ### Health check
 
@@ -1007,7 +1179,10 @@ curl http://localhost:8000/health
 ```
 
 Returns each upstream's connectivity, model count and Ollama version. Returns 503 if any upstream
-is unreachable. **No API key required** (when `auth.allow_anonymous_health` is `true`, which is the default).
+is unreachable. `/` and `/health` are **always anonymous on the internal zone** (`server.port`),
+regardless of `security.internal.allow_anonymous`. On the **public zone** the same path answers
+**404** — even with a valid key — unless you explicitly list `GET ^/health$` in
+`security.public.path_allowlist`. Keep this probe on the internal port (8000).
 
 ## Running a second Ollama instance
 
@@ -1037,8 +1212,47 @@ Then point `base_url` at `http://host.docker.internal:11435` in `config.yaml`.
 
 **Health check keeps failing?**
 
-If you set `allow_anonymous_health` to `false`, `/health` requires auth and the container's built-in
-HEALTHCHECK fails with 401. Keep it `true`.
+Point the probe at the **internal** port (`server.port`) — `/health` is always anonymous there, so
+`security.internal.allow_anonymous` does not matter. Two things break the container HEALTHCHECK:
+probing a port declared as `security.public.port` (→ 404 by design, even with a key), or running a
+**public-only** instance (`security.public.port == server.port`), which has no anonymous HTTP path
+at all — use a TCP connect check on that port instead.
+
+**A path answers 404 `is not part of this gateway's API`?**
+
+That is the closed forwardable set, and it applies to the internal listener too: a path you did not
+declare is a **404**, not a pass-through to whatever the upstream happens to serve. The callable
+paths are listed in [Which paths the gateway forwards](#which-paths-the-gateway-forwards) and in
+[API.md](API.md). For an endpoint outside that set, talk to the instance directly.
+`security.blocked_paths` cannot be the cause: it answers **403**, and only for a path that is a
+gateway API in the first place.
+
+**`admin_endpoints: allow` (or `readonly`) changed nothing?**
+
+Three separate causes, in the order worth checking:
+
+1. **You are calling the internal port.** The mode is enforced on the public listener only; on
+   `server.port` it is never applied, so editing it there is a guaranteed no-op.
+2. **The path is not in the public allowlist.** `security.public.path_allowlist` is the complete
+   public surface and answers **404** for an unlisted method+path *before* the admin filter runs —
+   the mode never opens a path. Exposing `pull` publicly needs both halves:
+
+   ```yaml
+   security:
+     public:
+       port: 8001
+       admin_endpoints: readonly        # pull allowed; delete/copy/create/push/blobs still 403
+       path_allowlist:                  # the COMPLETE public surface - keep what callers need
+         GET:  ["^/v1/models$"]
+         POST: ["^/v1/chat/completions$", "^/api/pull$"]
+   ```
+
+3. **`default_upstream` is unset or names no upstream.** An admin body carries `name`, not `model`,
+   so the call resolves an empty model name and lands on `default_upstream` — even with
+   `routing.strict: true`. A dangling name leaves it nowhere to go and the call **404**s.
+
+Mode recap: `deny` (default) blocks the destructive calls, `api/blobs/*` and `api/pull`; `readonly`
+allows `pull` only; `allow` forwards everything, **including `api/blobs/*`**.
 
 **`think: false` has no effect?**
 
@@ -1047,13 +1261,27 @@ Confirm your Ollama version supports the `think` parameter (0.9+). On older vers
 
 **Rerank scores are all 0?**
 
-The logprobs couldn't be extracted from the upstream response. Set `log_level` to `debug` to inspect
-the raw response, or switch to `embedding` mode (requires a vector model).
+The upstream returned no usable logprobs for the yes/no token, so the text fallback scored the answer
+as unknown (`rerank.fallback_unknown`, `0.0` on purpose). Set `log_level` to `debug` to inspect the raw
+response, and check the model actually is a generative reranker answering `yes` / `no` — with a
+different vocabulary set `rerank.yes_token` / `no_token` (or `yes_aliases` / `no_aliases`) to match it.
 
 **Config changes not taking effect?**
 
 Hot reload depends on the file's mtime. Some editors or network mounts (NFS / SMB) may not update
 mtime; run `docker restart llm-hub` in that case.
+
+**A config key seems to do nothing?**
+
+The config models do not forbid extra attributes, so an unknown or misspelled YAML key parses, is
+dropped and logs nothing. Check the key against [CONFIG.md](CONFIG.md) — node by node, with the
+default and the code that reads it — then test the effect rather than the parse: `log_level: debug`
+shows the routing decision, `GET /v1/management/config` shows the masked projection the console
+reads, and a public-port change either changes a **404** or does not, because listeners are bound at
+startup and need a restart. Three traps worth naming: `rerank.endpoint` is a label only (the routes
+are fixed), a `- ''` placeholder inside an `api_models` list is dropped instead of becoming an empty
+option, and `default_upstream` resolves by `upstreams[].name`, so a rename silently disables the
+fallback.
 
 **Tool calls return 400 / `cannot unmarshal object into ... arguments of type string`?**
 
@@ -1066,73 +1294,159 @@ always sends `arguments` as a string.
 
 ## Security (must-read for public exposure)
 
-The gateway is designed as "untrusted public network" by default. The `security` section consolidates
-the hardening options:
+There are **two trust zones**, decided by the kernel-assigned listening socket — never by a client
+IP, an `X-Forwarded-For` header, or a key. Ports and zone policy live **only in `config.yaml`**
+(`server.port`, `security.public.port`); there are no port environment variables (see
+`.env.example`). The hardening options below the two zone nodes
+apply to both zones:
 
 | Field | Default | Description |
 |------|------|------|
-| `admin_endpoints` | `deny` | `deny` blocks pull/push/create/delete/copy/blobs; `readonly` also allows `pull`; `allow` forwards everything (internal only) |
-| `blocked_paths` | `[]` | Extra path prefixes to block, e.g. `["api/show"]` or `["api/*"]` |
-| `cors_origins` | `[]` | Explicitly allowed cross-origin sources; empty means no CORS headers at all (no more `*`) |
-| `max_body_bytes` | `33554432` | Request-body cap (32MB); returns 413 above it, preventing oversized bodies |
-| `allow_query_api_key` | `false` | Whether to accept `?api_key=` query param (off by default, avoids keys in logs / browser history) |
-| `expose_health_details` | `false` | Accepted for compatibility and currently unused: `/health` always answers only `{"ok": true}`, no path or upstream address is echoed |
-| `fail_on_weak_keys` | `true` | Refuse to start when weak / placeholder keys are detected |
-| `allowed_client_ips` | `[]` | Client IP allowlist (CIDR supported, e.g. `10.0.0.0/8`); empty = unrestricted |
-| `allowed_http_methods` | `["GET","POST"]` | Only these HTTP verbs are served; anything else (PUT / PATCH / DELETE / HEAD / OPTIONS) is rejected with **405**. An LLM gateway only needs GET (models / health / tags) and POST (chat / rerank), so this is the safe default |
-| `path_allowlist` | `[]` | Regex perimeter control: when non-empty, a request path must match at least one pattern or it is rejected with **403**. Empty = allow all paths. Invalid regexes are logged and ignored (a bad pattern never opens the gateway), e.g. `["^/health$", "^/v1/(models\|chat/completions\|rerank)$", "^/api/tags$"]` |
-| `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | In-memory token-bucket limiter (single process): `by` selects the bucket key (`ip` or `key`), `burst` = bucket capacity (max immediate requests), `per_minute` = sustained refill rate; over-budget requests get **429**. Enable behind a reverse proxy or as a cheap first line of defence |
+| `blocked_paths` | `[]` | Extra path prefixes to block, e.g. `["api/show"]` or `["api/*"]` — applies in both zones, and answers **403** only for a path that is part of the gateway API; an undeclared path is already **404** |
+| `cors_origins` | `[]` | Explicitly allowed cross-origin sources; empty means no CORS headers at all. A pre-flight is answered with a bodyless `204`, and on the public socket only when `OPTIONS` is listed for that path in `security.public.path_allowlist` |
+| `max_body_bytes` | `33554432` | Request-body cap (32 MiB); `Content-Length` is rejected before any byte is read, chunked bodies counted while streaming, so an oversized POST returns 413 without landing in memory |
+| `allow_query_api_key` | `false` | Whether to accept `?api_key=` (off by default, avoids keys in logs / browser history) |
+| `allowed_client_ips` | `[]` | Client-IP fence (CIDR, e.g. `10.0.0.0/8`); empty = unrestricted. Judged from the real TCP peer / `client_ip()`, never a forged `X-Forwarded-For` |
+| `trusted_proxies` | `[]` | CIDRs whose `X-Forwarded-For` may set `client_ip()` for the IP fence, rate-limit buckets and audit rows. `client_ip()` takes the **rightmost hop that is not a trusted proxy**, so a forged leftmost value cannot pick an internal address. **NOT a zone anchor** — it cannot move a request between internal and public |
+| `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | In-memory token-bucket limiter (single process): `by` = `ip` / `key`, `burst` = capacity, `per_minute` = refill rate; over-budget → **429** with `Retry-After`. **Enable it on any internet-facing instance** (or rate-limit at the proxy) |
 
-> `/docs` and `/openapi.json` visibility is **not** a `security` switch: only sources matching
-> `auth.allow_access_ip_whitelist` can open them (everyone else gets **404**), and those same
-> sources may call the API without an API key. The docs page carries the scoped CSP, every
-> endpoint's **Parameters** section carries an `X-API-Key` input, and the **Authorize** dialog
-> covers `Authorization: Bearer` / `X-API-Key`.
+`security.public.admin_endpoints` (`deny` / `readonly` / `allow`) is the one exception to
+"shared": it is enforced on the **public listener only**, and it drives both the Ollama
+model-management filter and the management plane (see the zone section above). `deny`
+(default) blocks `api/delete`, `api/copy`, `api/create`, `api/push`, `api/blobs/*` and `api/pull`;
+`readonly` allows `pull` but still blocks the rest; `allow` forwards everything, **including
+`api/blobs/*`**. `api/show` and `api/version` are never admin-blocked. The internal LAN listener
+never applies the mode, because pulling a model there is a normal operation — changing it while
+testing against `server.port` is a guaranteed no-op.
+
+The filter also **never opens a path**: it sits *behind* `security.public.path_allowlist`, which has
+already answered **404** for an unlisted method+path. Exposing `pull` publicly therefore needs both
+`admin_endpoints: readonly` (or `allow`) and an allowlist entry such as `POST: ["^/api/pull$"]`; the
+FAQ entry [`admin_endpoints: allow` changed nothing](#faq) shows the minimal YAML and the third
+cause, a `default_upstream` that names no upstream.
+
+Both listeners forward **only the gateway's declared API paths**. A path outside that set is a
+**404** in either zone, with or without a key, so neither socket is an open proxy onto the rest of
+the upstream's API; the public allowlist narrows that surface further but cannot widen it. The full
+list of forwarded and locally answered paths is in
+[Which paths the gateway forwards](#which-paths-the-gateway-forwards).
+
+`security.internal.expose_docs` controls `/docs` / `/openapi.json` / Swagger assets **on the internal
+zone only**; the public zone never serves them, and there is no `auth.allow_access_ip_whitelist`.
+`/docs` documents the six inference pass-throughs (`POST /api/generate`, `/api/chat`,
+`/v1/chat/completions`, `/v1/completions`, `/api/embed`, `/v1/embeddings`) with request schemas and
+404/405 responses, alongside the gateway's own endpoints. The docs page carries a scoped CSP, every
+endpoint's **Parameters** section has an `X-API-Key` input, and the **Authorize** dialog covers
+`Authorization: Bearer` / `X-API-Key`.
 
 Every response also gets defensive headers by default: `X-Content-Type-Options: nosniff`,
 `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`,
 `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, and a restrictive
-`Permissions-Policy`. These cannot be turned off (they only harden the response, never leak data).
-The one relaxation is `/docs` / `/openapi.json`: they carry a scoped CSP
-(`script-src`/`style-src 'self' 'unsafe-inline'`) so the vendored Swagger UI can boot — without it
-the page would render as a blank white screen; every other response keeps `default-src 'none'`.
+`Permissions-Policy`. These cannot be turned off. The one relaxation is `/docs` / `/openapi.json`
+(scoped CSP `script-src`/`style-src 'self' 'unsafe-inline'`) so the vendored Swagger UI can boot.
 
-> **Container health check:** the Docker `HEALTHCHECK` now probes `/health` once per hour
-> (`--interval=1h`) instead of every 30s. The gateway itself performs no periodic polling; it only
-> answers `/health` on demand, so the interval is purely a Docker-side liveness cadence.
+> **Container health check:** the Docker `HEALTHCHECK` probes `/health` once per hour
+> (`--interval=1h`). Keep it pointed at the internal port (`server.port`), where `/health` is always
+> anonymous. A public-only instance has no anonymous HTTP path — switch to a TCP port probe.
+
+### Trust zones and where the client IP comes from
+
+The image starts through `python serve.py`, which sets uvicorn's `proxy_headers=False`. Plain
+`uvicorn main:app` lets `ProxyHeadersMiddleware` rewrite `scope["client"]` from a caller-supplied
+`X-Forwarded-For`, which used to defeat IP-based controls. Zone trust no longer depends on that
+address at all: it is the kernel-assigned **local listening port**, which a caller cannot forge.
+
+Ports and zones are configured in `config.yaml` only:
+
+```yaml
+server:
+  port: 8000        # internal (trusted LAN) listener
+security:
+  public:
+    port: 8001      # null = none; = server.port (8000) = public-only; otherwise = two listeners
+    path_allowlist: # the COMPLETE public surface (method -> re.fullmatch regexes)
+      GET:  ["^/v1/models$"]
+      POST: ["^/v1/chat/completions$", "^/v1/messages$", "^/api/generate$", "^/api/chat$"]
+  internal:
+    allow_anonymous: true
+```
+
+| Zone | When | Normal APIs | Management / docs / `/admin` |
+|---|---|---|---|
+| `internal` | `server.port`, unless it is also the public port | Key-free when `security.internal.allow_anonymous: true` (else key/session required); `/` + `/health` always anonymous | Management cookie-only; `/docs`, `/openapi.json`, `/admin` reachable (`expose_docs` gates docs) — publish on the LAN only |
+| `public` | `security.public.port` (e.g. 8001), **or the sole port when `= server.port`** | **Always key/session required** (no toggle): a listed pair without a key → **401**, with a valid key → forwarded. That check is a property of the zone (`bridge.public_auth_denial()` in the middleware), not of the route, so listing a path can never make it anonymous. Only `public.path_allowlist` method+`re.fullmatch` paths exist; an unlisted pair is **404** `Not found.` with or without a key | `/v1/management/*`, `/admin*`, and `..`/NUL paths are hard **404**; `/docs`, `/openapi.json`, `/`, `/probe`, `/health` and introspection paths 404 unless explicitly listed (management/console always 404) |
+
+`security.public.port: null` = no public listener. `= server.port` = a **public-only** single socket
+with **no anonymous HTTP path** — point the container HEALTHCHECK and any balancer at a TCP connect
+check, or add a separate internal listener. Otherwise `serve.py` binds both listeners in one
+process (shared key cache and rate-limit buckets). Mapping two **host** ports to one **container**
+port does not create two zones — the container sees one socket.
+
+**One process, two sockets — not two services.** `app/serve.py` binds both listeners in the same
+process; `app/bridge.py` is the public-zone *policy* module (the allowlist and the hard 404s), not a
+second proxy. The zone is read from the kernel-assigned local listening port (`scope["server"]`),
+so no header, client IP or IP allowlist can move a request from one zone to the other. Verified
+against a live two-port instance:
+
+| Request | Answer |
+|---|---|
+| Public port, allowlisted method+path, **no key** | **401** |
+| Public port, allowlisted method+path, valid key | forwarded to the upstream |
+| Public port, **unlisted** path, valid key | **404** `Not found.` |
+| Internal port with `security.internal.allow_anonymous: true` | no key needed |
+
+There is **no toggle** that makes the public zone anonymous.
+
+The legacy env vars `LLMHUB_HOST`, `LLMHUB_PORT`, `LLMHUB_LOG_LEVEL`, `LLMHUB_PUBLIC_PORTS`,
+`LLMHUB_PUBLIC_PORT`, `LLMHUB_PUBLIC_ADMIN` and `GATEWAY_AUTH_DISABLED` are read only as one-time
+migration hints (explicit config wins) and log a warning — remove them from `.env` / compose. In
+particular `LLMHUB_PUBLIC_PORTS` no longer opens listeners; set `security.public.port` instead.
 
 ### Keep secrets out of the config file (the only way)
 
-`config.yaml` no longer accepts `api_keys`; keys are injected at runtime:
+There is no key variable any more. `config.yaml` does not accept `api_keys`, `GATEWAY_API_KEYS`
+is ignored (and the Windows launcher strips it from the environment), and `GATEWAY_API_KEYS_FILE`
+plus a `.keys` file are gone. A key exists only as a hash row in `llmhub.db`, created in the
+console:
 
 ```bash
-# Container / process environment; comma or newline separated
-export GATEWAY_API_KEYS="sk-gateway-example-key,sk-gateway-example-two"
-# Or point at a key file (Docker / K8s secret), e.g. data/.keys
-export GATEWAY_API_KEYS_FILE=/data/.keys
+# 1. set a console password, start the gateway
+export ADMIN_PASSWORD="$(openssl rand -hex 24)"
+
+# 2. sign in and mint the first key (the plaintext is returned exactly once)
+curl -s -c jar.txt http://127.0.0.1:8000/v1/management/auth/login \
+  -H 'content-type: application/json' -d '{"password":"<your ADMIN_PASSWORD>"}'
+curl -s -b jar.txt http://127.0.0.1:8000/v1/management/api-keys \
+  -H 'content-type: application/json' -d '{"label":"first"}'
 ```
 
-When `GATEWAY_API_KEYS_FILE` is unset, a `.keys` file **next to `config.yaml`** is read
-automatically — so mounting `/config/.keys` (or `/data/.keys`, the default layout) is enough,
-with no extra env var. An explicit `GATEWAY_API_KEYS_FILE` always wins.
-
-The gateway reads all of them at startup and de-duplicates them; a leftover `api_keys` block only
-logs an "ignored" warning. `auth.allow_access_ip_whitelist` (regexes, matched against the TCP peer,
-never `X-Forwarded-For`) opens `/docs` + `/openapi.json` and skips the key check for those
-addresses; with a non-empty whitelist the gateway also starts **without any key** (trusted-network
-mode, warned at startup). The common misspelling `allow_access_ip_whilelist` is accepted and
-normalised with a warning.
+A leftover `api_keys` block in `config.yaml` only logs an "ignored" warning. There is no IP
+whitelist that grants key-free access: trust is decided by the listening zone — the internal zone
+may be key-free via `security.internal.allow_anonymous`, while the public zone always requires a
+key or a console session. Startup refuses only when no credential could ever exist (empty table,
+no `ADMIN_PASSWORD`, no anonymous internal zone).
 
 ### Public-deployment checklist
 
-- [ ] Keep `admin_endpoints` at `deny` (or at least `readonly`); never `allow`
-- [ ] Every key is random — 47-char `sk-hub-…` keys minted in the console (≥ 16 random chars for a
-      legacy key imported from `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE`, e.g. `data/.keys`); the
-      store keeps hashes only, so protect `llmhub.db` as you would protect the file
+- [ ] Think before setting `security.public.admin_endpoints: allow`. It does two things: it stops
+      filtering Ollama's admin calls (`api/pull`/`push`/`create`/`delete`/`copy`/`blobs/*` all pass,
+      and each still needs its own `path_allowlist` entry) **and** it opens the management plane on
+      the public listener — `/admin` and `/v1/management/*` stop being 404 there. The plane is never
+      anonymous (only the shell and the login handshake are exempt, everything else needs the
+      session cookie), but a console reachable from the internet must have a 32+ char
+      `ADMIN_PASSWORD` and `security.rate_limit` enabled
+- [ ] Leave `security.public.admin_endpoints` at `deny` when the console is only ever used on the LAN
+- [ ] Every key is random — 47-char `sk-hub-…` minted in the console, ~238 bits, no weak or
+      imported keys exist any more; the store keeps hashes only, so protect `llmhub.db` as you
+      would protect a secret file
 - [ ] A reverse proxy (Nginx / Caddy) in front terminates TLS
-- [ ] To restrict origins, set `security.allowed_client_ips` to trusted ranges
-- [ ] Keep `auth.allow_access_ip_whitelist` at `[]`; if `/docs` must be reachable, list only trusted sources — the check uses the ASGI client address (the TCP peer on a direct connection), which uvicorn rewrites from forwarded headers when a trusted proxy is in front, so make sure that proxy sanitises `X-Forwarded-For`
-- [ ] Don't expose upstream ports like 11434 / 11435 — only expose the gateway's 8000
+- [ ] To restrict client IPs, set `security.allowed_client_ips` to trusted CIDRs (applies to both zones)
+- [ ] Keep `security.internal.allow_anonymous: false` unless the internal port is on a trusted LAN; keep `security.internal.expose_docs: false` for a public-facing internal port. There is no IP allowlist that grants key-free access — trust is the listening socket
+- [ ] Set `security.public.port: 8001` (or `= server.port` for a public-only instance) in `config.yaml`, and keep `security.public.path_allowlist` to the minimum method+regex pairs. Start the image with `python serve.py`, never plain `uvicorn main:app`
+- [ ] Remove all legacy `LLMHUB_*` port vars from `.env` / compose; manage from the internal port / VPN (`/v1/management/*` and `/admin` are hard 404 on the public zone)
+- [ ] Check from outside: only allowlisted pairs answer (401 without a key, 200 with one); everything else → 404 `Not found.`; `/v1/management/*` and `/admin` → 404
+- [ ] Remember that both zones forward only the gateway's declared API paths: an allowlist entry for a path the gateway does not serve still answers its own 404, and an upstream's extra endpoints are not reachable through the gateway
+- [ ] Don't expose upstream ports like 11434 / 11435 — only the gateway's internal 8000 (LAN) and public 8001 (through the TLS proxy)
 
 ## Local development (no Docker)
 
@@ -1140,31 +1454,41 @@ normalised with a warning.
 
 `scripts\start-local.bat` (or `scripts\start-local.ps1`) is the shortest path: it locates
 python, reads `.env`, finds `data\config.yaml`, then runs the app's **own** checks before
-launching — missing dependencies, a config rejected by the Pydantic models, auth enabled with
-no API key, weak/placeholder keys, a port already in use, an unbuilt console — and prints the
-URLs once the gateway is up.
+launching — missing dependencies, a config rejected by the Pydantic models, an empty `api_keys`
+table with no anonymous internal zone (fail-closed), weak/placeholder keys, a busy internal **or
+public** port, and an unbuilt console — then prints the resolved zone layout and URLs. **Ports and
+zones come only from `config.yaml`** (`server.port`, `security.public.port`); the launcher warns
+about legacy `LLMHUB_*` port vars in `.env` but does not use them. It picks the entrypoint:
+
+- Single internal listener (default): uvicorn with `--no-proxy-headers` and auto-reload.
+- A distinct public listener configured, or `-NoReload`: `python serve.py`, which binds every
+  listener in one process and applies the public path policy. No auto-reload.
 
 ```powershell
-scripts\start-local.bat                      # preflight, then uvicorn with auto-reload
-scripts\start-local.bat -CheckOnly           # only run the checks, start nothing
-scripts\start-local.bat -Install -Port 8888  # pip install -r requirements.txt first
-scripts\start-local.bat -NoReload            # do not restart on every saved .py
+scripts\start-local.bat                               # single listener, uvicorn + auto-reload
+scripts\start-local.bat -CheckOnly                    # only run the checks, start nothing
+scripts\start-local.bat -Install                      # pip install -r requirements.txt first
+scripts\start-local.bat -NoReload                     # hardened serve.py, no auto-reload
+# To open a public listener, set security.public.port: 8001 in data\config.yaml, then:
+scripts\start-local.bat -NoReload                     # serve.py binds 8000 + 8001
 ```
 
 | Flag | Meaning |
 | --- | --- |
-| `-Port` / `-Bind` | Override `server.port` / `server.host` from the config |
 | `-Config` | Alternate `config.yaml` (default: `CONFIG_PATH` from `.env`, resolved from `app/` like in the image, else `data\config.yaml`) |
 | `-EnvFile` | Alternate env file (default `<repo>\.env`; variables already set in the shell win) |
 | `-Python` | Alternate interpreter (default `python`, then the `py -3` launcher) |
-| `-LogLevel` | Override `server.log_level` |
-| `-NoReload` | Serve without `--reload` |
+| `-NoReload` | Use hardened `serve.py` instead of uvicorn; no auto-reload (also required for a public listener) |
 | `-Install` | `pip install -r requirements.txt` first |
-| `-CheckOnly` | Print the verdict and exit |
+| `-CheckOnly` | Print the resolved zone layout and verdict, exit without binding |
 
-The gateway is started with `--app-dir app` from `app/`, i.e. the same working directory as the
-image's `WORKDIR /app`, so the relative paths in `.env` (`../data/config.yaml`,
-`../data/.keys`) resolve exactly as they do in the container.
+> Removed launcher flags: `-Port`, `-Bind`, `-LogLevel`, `-PublicPorts`, `-PublicAdmin`. Set the
+> bind address, port and zones in `config.yaml` instead.
+
+Both entrypoints run from `app/`, i.e. the same working directory as the image's `WORKDIR /app`,
+so the relative path in `.env` (`../data/config.yaml`) resolves exactly as it does in the
+container. When starting uvicorn by hand (not via the launcher), always pass
+`--no-proxy-headers` so a caller-supplied `X-Forwarded-For` cannot rewrite the client IP.
 
 ### Quick start
 
@@ -1178,12 +1502,19 @@ cp data/config.example.yaml data/config.yaml
 
 # 3. Prepare secrets (.env) — uvicorn loads these via --env-file below
 cp .env.example .env
-# Edit .env: set GATEWAY_API_KEYS, SYSTEMONE_SERVER_API_KEY, etc.
+# Edit .env: set ADMIN_PASSWORD (and SYSTEMONE_SERVER_API_KEY if the backend needs one)
 
-# 4. Run the server (loads ../.env automatically)
+# 4. Run the single-listener dev server (loads ../.env automatically)
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
+# Production / two-zone: set security.public.port: 8001 in data/config.yaml, then
+#   cd app && python serve.py
 ```
+
+For anything reachable off-host, prefer `python serve.py` (or the Windows launcher with
+`-NoReload`): it binds every listener in one process and disables uvicorn's proxy-header rewrite.
+The `--no-proxy-headers` flag above gives single-listener uvicorn the same protection. A public
+listener is opened **only** by `security.public.port` in `config.yaml` — there is no port env var.
 
 ### Windows PowerShell
 
@@ -1193,34 +1524,38 @@ pip install -r requirements.txt
 
 # 2. Prepare secrets (.env)
 Copy-Item .env.example .env
-# Edit .env: set GATEWAY_API_KEYS, SYSTEMONE_SERVER_API_KEY, etc.
+# Edit .env: set ADMIN_PASSWORD (and SYSTEMONE_SERVER_API_KEY if the backend needs one)
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 
-# 3. Run the server (loads ../.env automatically)
+# 3. Run the single-listener dev server (loads ../.env automatically)
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 ### Run with specific config
 
 ```bash
 cd app
-CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
+CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 ```powershell
 # Windows PowerShell
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 cd app
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
 ```
 
 ### Run in background (Linux/macOS)
 
 ```bash
 cd app
-nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env > ../llm-hub.log 2>&1 &
+nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers > ../llm-hub.log 2>&1 &
 ```
+
+For a bound host/port other than loopback, or to open a public listener, use `python serve.py`
+instead of uvicorn so the proxy-header rewrite is disabled in code and the
+`security.public.port` listener (from `config.yaml`) works.
 
 ### Run as Windows service (using NSSM)
 
@@ -1232,10 +1567,13 @@ nssm set LLMHub AppEnvironmentExtra "CONFIG_PATH=D:\workspace\github\llm-hub\dat
 nssm start LLMHub
 ```
 
-> **Note:** `uvicorn --env-file` reads `.env` once at startup and injects its variables as environment variables (e.g. `GATEWAY_API_KEYS`, `SYSTEMONE_SERVER_API_KEY`). It does **not** hot-reload — after editing `.env`, restart uvicorn. `config.yaml` changes still hot-reload without restart.
+> **Note:** `uvicorn --env-file` reads `.env` once at startup and injects its variables as environment variables (e.g. `ADMIN_PASSWORD`, `SYSTEMONE_SERVER_API_KEY`). It does **not** hot-reload — after editing `.env`, restart uvicorn. `config.yaml` changes still hot-reload without restart. Caller keys are not in `.env` at all: they live in `llmhub.db` and are managed at `/admin`.
 
-Interactive docs: <http://localhost:8000/docs> (open only to sources matching
-`auth.allow_access_ip_whitelist`; everyone else gets **404**, and matching sources may also call the
-API without a key; each endpoint has an `X-API-Key` input box in its own **Parameters** section —
+Interactive docs: <http://localhost:8000/docs> (internal zone only, and only when
+`security.internal.expose_docs: true`; the public zone always returns **404** for docs). The six
+inference pass-throughs are documented routes there — `POST /api/generate`, `/api/chat`,
+`/v1/chat/completions`, `/v1/completions`, `/api/embed`, `/v1/embeddings` — each with a request
+schema, examples and 404/405 responses; any other method on a POST-only route is a gateway **405**
+with `Allow: POST`. Each endpoint has an `X-API-Key` input box in its own **Parameters** section —
 "Try it out" → "Execute" sends it with that request — and the header **Authorize** dialog accepts
-`Authorization: Bearer` or `X-API-Key` for all requests)
+`Authorization: Bearer` or `X-API-Key` for all requests.

@@ -3,7 +3,7 @@
 > 版本：v1.1（已落地：后端 API + `web/` 前端，挂在 `/admin`）
 > 日期：2026-11-04
 > 范围：本文档覆盖 Web 管理台的**页面功能点分析**、**API 设计（统一前缀 `/v1/management`）**、**数据模型**与**UI 截图索引**。
-> 实现状态：只读阶段全部完成——`app/management.py` + `app/request_log.py` 提供接口与明细库，`web/src` 构建为 `app/web` 后由网关在 `/admin` 提供服务；模型清单以 `config.yaml` 的 `upstreams[].models` 为准（`model_aliases` 短名优先显示，前缀通配按上游模型列表展开，根 `aliases:` 的派生模型单独成行，`api_models` 按 API 家族收窄测试窗口的可选模型且只列名字/别名，`/api/...` 原生窗口只列 Ollama 上游的模型），每个「API 用法」标签页里「请求参数」标题右侧的**测试**按钮会打开浮层测试窗口，经 `app/api_test.py` 在**服务端**真实发出这一笔请求（表单打开即带初始值，布尔参数为复选框）；调用方 API Key 已改为**数据库管理**：`app/key_store.py` 把 Key 存进 `llmhub.db` 的 `api_keys` 表（只存 `sha256` 摘要与掩码），管理台新增 **API Key 管理**页（账户菜单进入）负责生成与撤销，环境变量只负责首次启动喂一次空表；请求明细的列表与统计只计 `/v1/*`、`/api/*` 的调用。回归测试见 `tests/test_management.py`（366 项）与 `docs/TESTCASES.md` 测试 34-43，落地细节与设计差异见第 5 节。
+> 实现状态：只读阶段全部完成——`app/management.py` + `app/request_log.py` 提供接口与明细库，`web/src` 构建为 `app/web` 后由网关在 `/admin` 提供服务；模型清单以 `config.yaml` 的 `upstreams[].models` 为准（`model_aliases` 短名优先显示，前缀通配按上游模型列表展开，根 `aliases:` 的派生模型单独成行，`api_models` 按 API 家族收窄测试窗口的可选模型且只列名字/别名，`/api/...` 原生窗口只列 Ollama 上游的模型），每个「API 用法」标签页里「请求参数」标题右侧的**测试**按钮会打开浮层测试窗口，经 `app/api_test.py` 在**服务端**真实发出这一笔请求（表单打开即带初始值，布尔参数为复选框）；调用方 API Key 已改为**数据库管理**：`app/key_store.py` 把 Key 存进 `llmhub.db` 的 `api_keys` 表（只存 `sha256` 摘要与掩码），管理台新增 **API Key 管理**页（账户菜单进入）负责生成与撤销，环境变量不再喂任何 Key（`GATEWAY_API_KEYS` 已移除）；请求明细的列表与统计只计 `/v1/*`、`/api/*` 的调用。回归测试见 `tests/test_management.py`（366 项）与 `docs/TESTCASES.md` 测试 34-43，落地细节与设计差异见第 5 节。
 > 关联文件：`dashboard-mockup.html`（全页面风格稿）、`dashboard-login-mockup.html`（登录门禁页风格稿）、`images/*.png`（各页面 UI 截图，风格稿阶段的存档）。**当前版本的实拍截图**在 `docs/screenshots/{en,zh}/`，由 `capture-live.js` 连真实网关抓取；README 的「管理网站」一节用的是其中两张的副本（`docs/images/dashboard-*.jpg`、`models-llm-*.jpg`）。
 
 ---
@@ -24,25 +24,35 @@
 - **埋点**：请求明细写入 SQLite（`data/llmhub.db`，WAL 模式），异步批量落盘，不阻塞转发主链路。同一个库里还有 `bench_results`（测速历史）与 `api_keys`（调用方 Key 的摘要与掩码）。
 
 ### 1.3 鉴权
-所有 `/v1/management/*` 接口均受保护（实现在 `app/admin_auth.py`），接受**两种凭据之一**：
+
+> **2026-11-09 安全审计后修订**：原设计允许「会话 Cookie **或**网关 API Key」两种凭据，
+> 现已改为**只认会话 Cookie**。网关 Key 会分发给每个调用方，接受它等于让任一调用方读取完整配置、
+> 导出所有请求正文并改写上游；这是本次审计的 Critical 结论。
+
+所有 `/v1/management/*` 接口均受 `require_admin_session` 保护（实现在 `app/admin_auth.py`）：
 - 通过 `POST /v1/management/auth/login` 提交 `ADMIN_PASSWORD`（用户名固定 `admin`）换取 12h HttpOnly Session Cookie；
-- 或网关 API Key——即 `llmhub.db` 的 `api_keys` 表里的任一 Key（首次启动由 `GATEWAY_API_KEYS` /
-  `GATEWAY_API_KEYS_FILE` 喂一次空表，此后在管理台生成与撤销），经 `Authorization: Bearer` / `X-API-Key`
-  提交，便于脚本与 curl 复用已有凭据；
+- 网关 API Key（`Authorization: Bearer` / `X-API-Key`）访问管理接口一律返回 `401`；脚本需先登录并保存 Cookie jar；
 - `ADMIN_PASSWORD` 本身**不是**请求凭据：把它放进 `Bearer` / `X-API-Key` 仍然返回 `401`；
   查询串里的 key 一律不接受（避免密钥进入访问日志与浏览器历史）；
-- **API Key 管理那三条路由（`GET` / `POST` / `DELETE /v1/management/api-keys`）是唯一的例外**，它们用
-  `require_admin_session`——只认会话 Cookie。理由写在函数注释里：网关 Key 是任何客户端都已经持有的东西，
-  接受它就等于让客户端给自己发权限；
-- 网关鉴权关闭（`auth.enabled: false`）或首次启动时环境变量与密钥文件都没有配置 Key（表因此一行都没有）时
-  没有可接受的 API Key，管理接口退回 Cookie-only，绝不会变成匿名访问；
+- API Key 管理三条路由（`GET` / `POST` / `DELETE /v1/management/api-keys`）同样只认会话 Cookie，
+  客户端 Key 不能给自己签发新权限；
+- 同一 TCP 对端连续 5 次登录失败锁定 15 分钟（429 + `Retry-After`）；
+- 未配置 `ADMIN_PASSWORD` 时所有管理接口返回 `503`，Cookie 缺失或无效返回 `401`，绝不会变成匿名访问；
 - 未配置 `ADMIN_PASSWORD` 时接口返回 `503 Service Unavailable`。
 - `/admin` 的静态壳层（`index.html` / `assets/*`）**故意不鉴权**，否则登录页打不开；页面内每一次
   数据请求仍受上述保护。SPA 深链与编码后的 `../` 都回退到壳层，路径经 `resolve()` +
   `is_relative_to()` 校验，无法跳出构建目录。
-- `/admin` 的静态壳层（`index.html` / `assets/*`）**故意不鉴权**，否则登录页打不开；页面内每一次
-  数据请求仍受上述保护。SPA 深链与编码后的 `../` 都回退到壳层，路径经 `resolve()` +
-  `is_relative_to()` 校验，无法跳出构建目录。
+
+> **2026-11-10 双分区**：管理台只属于内网监听端口（`server.port`，默认 8000）。端口与分区完全由
+> `data/config.yaml` 决定：`server.port` 是内网（可信 LAN）监听，`security.public.port` 是公网
+> （互联网）监听——为 `null` 时无公网监听，与 `server.port` 相等时是只有一个 socket 的纯公网实例。
+> 公网分区上 `app/bridge.py` 在路由前就把 `/v1/management/*` 与 `/admin*` 隐藏为 **404**：默认（`deny` /
+> `readonly`）永远如此，`security.public.admin_endpoints: allow` 是唯一能打开它们的开关——此时这两个前缀
+> 会被路由到真实处理器（前缀规则，不走 allowlist），但仍需 `/admin` 登录换来的会话 Cookie，不会变成匿名；
+> 因此推荐仍从内网执行管理操作。`/docs`、模型清单、`/api/ps`
+> 等探查类路由默认也不在 `security.public.path_allowlist` 中，同样是 404；公网普通 API 强制要求
+> 调用方 Key 或会话 Cookie，而且只接受该 allowlist 里「方法 + 正则全匹配」的路径。管理操作请走
+> 内网端口、VPN 或 SSH 隧道。分区由内核监听 socket 判定，IP 白名单 / `X-Forwarded-For` 都不能改变它。
 
 ---
 
@@ -129,7 +139,7 @@
 |---|---|---|
 | Tab · 模型清单 · 配置信息 | Endpoint、Enabled、Models（可多值）、打分方式 `mode=logprobs`、`keep_alive`（空闲卸载）、`top_logprobs`、上游协议 `upstream_api`、失败策略 `on_error`、并发上限 `max_concurrency` | `/v1/management/models/rerank` |
 | Tab · 模型清单 · 可用模型 | 独立卡片，五列「模型 / 上游 / 类型 / Base URL / 凭据」；行为 `config.yaml` 声明的 `rerank.models[]`，凭据只显示脱敏值或「未配置」。网关按 `mode` 选择打分实现，`model_modes` 可为单个模型覆盖 | `/v1/management/models/rerank` |
-| Tab · 模型清单 · 功能介绍 | 模型清单 Tab 的**第一张卡片**，约 200 字说明（样式类 `feature-intro`）：重排的作用（召回后精排）、两种打分方式（logprobs / embedding）、结果归一化与 `top_n` / `return_documents` | 静态文案 |
+| Tab · 模型清单 · 功能介绍 | 模型清单 Tab 的**第一张卡片**，约 200 字说明（样式类 `feature-intro`）：重排的作用（召回后精排）、生成式 logprobs 打分、结果归一化与 `top_n` / `return_documents` | 静态文案 |
 | Tab · API 用法 | 展示 `POST /v1/rerank` 的参数表（model / query / documents / top_n / return_documents / options）与请求、响应示例 | 静态文档 + 配置 |
 | Tab · API 用法 · 测试窗口 | `ApiTester`（`kind = rerank`）：模型框给 `api_models.rerank`（未配置时回落 `rerank.models`），`endpoint` 用**配置里的** `rerank.endpoint` 而不是常量；查询串与文档列表必填，空着时前端直接拦住并给出原因，运行后展示 `results[]` 的分数与顺序 | `GET /api-test/models` + `POST /api-test` |
 | 只读 | 本期不开放编辑，仅展示（不展示运行态驻留信息） | — |
@@ -227,12 +237,12 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 | 功能点 | 说明 | 数据来源 |
 |---|---|---|
 | 功能介绍卡 | `.feature-intro` 一段说明：Key 存在哪里、为什么只显示掩码、签发后该做什么 | 静态文案 |
-| 密钥清单 | 表头 密钥 / 描述 / 创建时间 / 操作。密钥列是等宽字体的**掩码**（`sk-hub-7Kp2…Q9df`），永远不是明文；描述为空显示淡色「（无描述）」；创建时间按本地时区格式化。接口响应里的 `source`（`console` 本页签发 / `file` 首次启动从环境变量或密钥文件导入）**只留在 API 里，不再占一列** | `GET /v1/management/api-keys` |
+| 密钥清单 | 表头 密钥 / 描述 / 创建时间 / 操作。密钥列是等宽字体的**掩码**（`sk-hub-7Kp2…Q9df`），永远不是明文；描述为空显示淡色「（无描述）」；创建时间按本地时区格式化。接口响应里的 `source`（`console` 本页签发 / `file` 更早版本从环境变量播种时留下的历史标记）**只留在 API 里，不再占一列** | `GET /v1/management/api-keys` |
 | 新建立密钥 | 卡片标题右侧主按钮，打开浮层弹窗：填**描述**（必填，最长 100 字，回车即提交）→ 生成。空描述时按钮禁用 | `POST /v1/management/api-keys` |
 | 明文只显示一次 | 生成成功后弹窗切到第二段：警示条 + 只读 `textarea` 里的完整 Key + 复制按钮 + 描述与掩码。关闭后再进来，列表里只剩掩码——这是设计上唯一的查看窗口 | 同上（`secret` 字段） |
 | 复制 | 优先 `navigator.clipboard`，被拒绝（非安全上下文 / 无权限）时回落 `execCommand('copy')`，再失败就聚焦并选中那个只读框，让操作者用 Ctrl+C 自己完成；三条路都没走通才提示复制失败 | 前端 |
 | 撤销 | 两步式：第一下把该行按钮换成红色「确认撤销」+「取消」，第二下才真正删除（`confirming` 只存一个 id，`load()` 结束即复位）。删除后列表立刻重取；弹窗关闭时若刚生成过 Key 也会重取一次，新行才会出现 | `DELETE /v1/management/api-keys/{id}` |
-| 密钥格式与存储卡 | 四条 kv：格式（`sk-hub-` + 40 位 base62，共 47 字符）、库里存什么（`sha256(明文)` 摘要 + 掩码，不存明文）、怎么校验（请求路径比对内存里的摘要集合，不碰 sqlite）、怎么来的（首次启动导入空表一次，此后只认数据库） | 静态文案 |
+| 密钥格式与存储卡 | 四条 kv：格式（`sk-hub-` + 40 位 base62，共 47 字符）、库里存什么（`sha256(明文)` 摘要 + 掩码，不存明文）、怎么校验（请求路径比对内存里的摘要集合，不碰 sqlite）、怎么来的（只在管理台 `/admin` 登录后签发，明文只显示一次，此后只认数据库） | 静态文案 |
 | 错误与空态 | 列表取不到显示告警条；一行都没有时表格给出空态文案；签发/撤销的失败单独显示在页面顶部，不会打断已加载的内容 | 前端 |
 
 > 这一页只有三条管理接口，全部 **Cookie-only**（见 1.3）；未登录访问 `/admin/api-keys` 会被路由挡到登录页，
@@ -242,9 +252,9 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 
 ## 3. API 设计（`/v1/management`）
 
-> 统一前缀 `/v1/management`；除登录/登出与 API Key 的签发/撤销外全部 `GET`；除 `/api-keys`（只认会话
-> Cookie）以外均接受**两种凭据之一**（会话 Cookie **或** `api_keys` 表里的网关 API Key）；错误码沿用 HTTP
-> 标准（`400` 参数错误、`401` 未认证、`403` 禁止、`404` 资源不存在、`503` 未配置密码 / 上游不可达 / 前端未构建）。
+> 统一前缀 `/v1/management`；除登录/登出与 API Key 的签发/撤销外全部 `GET`；**所有路由只认会话 Cookie**
+> （2026-11-09 审计后收紧，网关 API Key 一律 `401`；详见 1.3）；错误码沿用 HTTP 标准
+> （`400` 参数错误、`401` 未认证、`403` 禁止、`404` 资源不存在、`429` 登录锁定、`503` 未配置密码 / 上游不可达 / 前端未构建）。
 
 ### 3.1 鉴权
 | 方法 | 路径 | 说明 |
@@ -447,8 +457,10 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 }
 ```
 
-> 为什么必须服务端执行：管理台会话 Cookie 只满足 `require_admin`，它**不是**调用方的网关 API Key，
-> 浏览器直接 `fetch /api/generate` 会被网关鉴权拒掉。`app/api_test.py` 构造一个最小 ASGI `Request`
+> 为什么放在服务端执行：测试器统一由管理会话鉴权，并复用网关内部的路由 / 参数注入 / 请求日志链路，
+> 响应体按同一上限截断，调用方也不必持有 Key。（2026-11-09 起会话 Cookie 本身也可作为业务 API 凭据，
+> 见 `auth.has_admin_session`，但 `api-test` 仍合成服务端请求以保证口径一致。）
+> `app/api_test.py` 构造一个最小 ASGI `Request`
 > 交给 `app.state.proxy` / `rerank` / `systemone` / `websearch`，所以别名注入、`num_ctx_overrides`
 > 裁剪、路径屏蔽、请求明细落库与真实客户端完全一致；`KINDS` 是封闭白名单，不能借它打任意地址。
 > 网关自身拒绝的调用（405 / 400 / 404）作为**结果数据**回到信封里，测试窗口展示的就是外部客户端
@@ -526,7 +538,7 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 ### 4.3 SQLite 表 `api_keys`（调用方 Key）
 
 与 `requests`、`bench_results` 同一个 `llmhub.db`（`LLMHUB_DB` 可单独指定，默认仍是
-`CONFIG_PATH` 同目录）；建表即建索引，`hash` 上带 `UNIQUE`，重复导入直接跳过。
+`CONFIG_PATH` 同目录）；建表即建索引，`hash` 上带 `UNIQUE`，重复写入直接跳过。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -534,26 +546,30 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 | `hash` | TEXT UNIQUE | `sha256(明文)` 的小写十六进制——库里唯一的比对依据，**明文永不落盘** |
 | `masked` | TEXT | 展示用掩码（`sk-hub-` + 头 4 `…` 尾 4；旧式 Key 头 8 尾 4；过短则整体 `••••••`） |
 | `label` | TEXT | 描述，默认空串；导入的行为空，管理台签发时必填（上限 100 字） |
-| `source` | TEXT | `console`（管理台签发）/ `file`（首次启动从 `GATEWAY_API_KEYS` 或密钥文件导入） |
+| `source` | TEXT | `console`（管理台签发）/ `file`（更早版本从环境变量播种时留下的历史标记，现在不再写入） |
 | `created_at` | TEXT | ISO8601 UTC，列表按它倒序 |
 
 - **为什么是 SHA-256 而不是 bcrypt/argon2**：Key 是 47 字符、约 238 bit 的随机串（`sk-hub-` + 40 位
   base62，`secrets.choice` 生成），不在任何字典里，离线爆破不可行；慢哈希只会把每次请求的校验变成
   几十毫秒的开销。要防的是「数据库被整包拷走还能直接用」，那正是摘要比对解决的事。
-- 校验走内存：`ApiKeyStore` 维护一份摘要 `frozenset`，`create` / `delete` / `import_plaintext` 之后
-  整体重载，转发路径不查 sqlite；因此签发与撤销**不需要重启**就生效。
-- 首次启动 `count() == 0` 且环境变量里有 Key 时才导入（`import_plaintext`，日志写明「Seeded N API
-  key(s) … manage them at /admin from now on」）；之后环境变量再改只产生一条掩码警告
-  （`unserved_env_keys()`），既不会把管理台撤销的 Key 复活，也不会让明文重新进表。
-- `auth.enabled: true` 且喂完种子后表仍然为空时，网关按原有规则拒绝启动，除非
-  `auth.allow_access_ip_whitelist` 非空（可信网络模式，白名单内的来源本来就跳过 Key 校验）。
+- 校验走内存：`ApiKeyStore` 维护一份摘要 `frozenset`，`create` / `delete` 之后整体重载，
+  转发路径不查 sqlite；因此签发与撤销**不需要重启**就生效。
+- Key 只有一个来源：在 `/admin` 登录（`ADMIN_PASSWORD` 换 12 小时会话 Cookie）后在「API Key 管理」页
+  签发，明文只显示一次、库里只存 `sha256` 与掩码。环境变量不再提供任何 Key（`GATEWAY_API_KEYS` 已移除），
+  空表就是正常的首次启动状态——需要 Key 的请求返回 401。
+- 网关按 fail-closed 规则拒绝启动：只有「`api_keys` 表为空 **且** `ADMIN_PASSWORD` 未设置 **且** 没有可
+  匿名的内网分区（`security.internal.allow_anonymous: false`）」时才拒绝（`main.lifespan` 抛
+  `RuntimeError`），因为此时系统不可能存在任何凭据。表为空但 `ADMIN_PASSWORD` 已设置是合法状态：登录
+  `/admin` 签一把 Key 即可。公网分区永远要求 Key，`security.allowed_client_ips` 围栏与任何转发头都不能
+  免除这一要求；存在允许匿名的内网分区（`security.internal.allow_anonymous: true`，适合仅 LAN 部署）时
+  也不必启动即拒绝。
 
 ---
 
 ## 5. 实施记录（已落地）
 1. `app/request_log.py`：SQLite 建表 + 异步批量写入队列 + 统计查询接口（timeseries/distribution/分页）。
 2. `app/proxy.py`：在转发出口埋点（覆盖流式/非流式/异常），`config.py` 给 `UpstreamConfig` 增加 `vram_total_gb`。
-3. `app/management.py`：`/v1/management/*` 只读接口，复用 `require_admin`（会话 Cookie 或网关 API Key）。
+3. `app/management.py`：`/v1/management/*` 只读接口，复用 `require_admin_session`（2026-11-09 起仅会话 Cookie；原设计为 Cookie 或网关 API Key）。
 4. `app/main.py`：先注册 management 路由，再注册 `/admin` 静态路由，最后才是 catch-all 代理。
 5. `app/bench.py`：测速引擎（Python 重写 `bench_llm.mjs`，无 Node 依赖）——预热 + N 轮流式请求，
    Decode/Prefill 优先采信服务端计时（`eval_duration` / `predicted_ms`），缺失回落墙钟，口径记在
@@ -602,7 +618,10 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
   代价是宿主机以 `-v ./app:/app` 覆盖模块目录时必须先构建，否则 `/admin` 返回 503。
 - **挂载点**：静态资源挂在 `/admin`（`vite.config.ts` 里 `base: '/admin/'`、路由
   `createWebHistory('/admin/')`），与既有的 `/admin/login|logout|ping`、CSP 作用域和
-  `path_allowlist` 豁免共用同一前缀；开发时 `npm run dev` 走 `http://localhost:5173/admin/`，
+  内网端口的 `/admin` 与 `/v1/management` 共用同一前缀（公网分区上二者默认是硬性 404，不受公网
+  `path_allowlist` 约束；`security.public.admin_endpoints: allow` 时这两个前缀会在公网监听上被路由，
+  前缀规则在 `bridge_denial()` 里先于允许清单判定，但仍只认会话 Cookie）；开发时 `npm run dev` 走
+  `http://localhost:5173/admin/`，
   `/v1/management` 代理到本地 8000 网关，保证 Cookie 同源。
 - **刷新方式**：Dashboard 与 Upstreams 每 **60 秒**自动刷新一次（`POLL_MS = 60000`；`onMounted` 起定时器、
   `onBeforeUnmount` 清理，离开页面即停止探测——一次刷新会并发探测所有上游，5 秒一轮会把网关的上游探测打满）；
@@ -614,10 +633,10 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 - **静态资源**：`web/public/` 里的文件（目前是 `favicon.svg`）由 Vite 原样复制进 `app/web/`，
   与哈希产物同居一层，因此同一套 `/admin/{asset_path}` 路由即可服务；`index.html` 里的
   `/favicon.svg` 会按 `base` 改写成 `/admin/favicon.svg`。
-- **凭据来源**：设计稿里调用方 API Key 一直住在环境变量 / `.keys` 文件；现在 `llmhub.db` 的
-  `api_keys` 表是唯一真源（只存摘要与掩码），环境变量与 `.keys` 只在表为空的首次启动喂一次数据，
-  签发与撤销都在管理台完成。因此「网关 Key 也能进管理接口」这条便利规则保留，但
-  `/api-keys` 自身反过来只认会话 Cookie，否则任何一个可用 Key 都能自我扩权。
+- **凭据来源**：设计稿里调用方 API Key 住在环境变量 / `.keys` 文件；现在 `llmhub.db` 的
+  `api_keys` 表是唯一真源（只存摘要与掩码），环境变量不再喂任何数据（`GATEWAY_API_KEYS` 与文件式 seed
+  都已移除），签发与撤销都在管理台完成。相应地，「网关 Key 也能进管理接口」这条便利规则也已撤销：
+  `/v1/management/*` 与管理台的 `/api-keys` 一样只认会话 Cookie，否则任何一个可用 Key 都能自我扩权。
 - **统计范围**：设计稿的统计是「所有请求」；实现里列表与统计只计 `/v1/*`、`/api/*` 的 API 调用
   （`request_log.API_PATH_SCOPE`），健康检查与监控探针照常入库但不进图表——否则 QPS、P95 与错误率
   会被每秒一次的 HEAD/GET 淹没。

@@ -1,1 +1,0 @@
-import{W as e}from"./index-CB8tKe_2.js";var t=e({version:null});export{t};

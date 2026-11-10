@@ -3,13 +3,12 @@
 Tests for the web-console management API (``/v1/management``) and the request log.
 
 Runs entirely against a local mock Ollama upstream: no live models, no external
-services. Covers admin auth (session cookie or gateway API key; the admin password
-sent as a header is rejected; 503 when
-ADMIN_PASSWORD is unset), the static console served at ``/admin`` (SPA fallback,
-immutable asset caching, traversal guard, 503 before a build), upstream probing and
-device classification, read-only config projections (credentials masked), request-log
-capture (stream + non-stream + upstream failure), stats, filters, pagination and the
-path-allowlist exemption.
+services. Covers admin auth (session cookie only; a caller API key or the password
+as a header is rejected; 503 when ADMIN_PASSWORD is unset), the static console served
+at ``/admin`` (SPA fallback, immutable asset caching, traversal guard, 503 before a
+build), upstream probing and device classification, read-only config projections
+(credentials masked), request-log capture (stream + non-stream + upstream failure),
+stats, filters, pagination and the public-zone perimeter.
 
 Run:
     python tests/test_management.py
@@ -223,7 +222,6 @@ _TMP_DIR = tempfile.mkdtemp(prefix="llm-hub-management-")
 _CONFIG_PATH = os.path.join(_TMP_DIR, "config.json")
 _CONFIG = {
     "server": {"host": "127.0.0.1", "port": 8000},
-    "auth": {"enabled": True, "api_keys": [], "allow_anonymous_health": True},
     "routing": {"strict": False},
     "upstreams": [
         {
@@ -269,9 +267,8 @@ _CONFIG = {
     },
     "websearch": {"enabled": False},
     "security": {
-        "admin_endpoints": "deny",
-        "allowed_http_methods": ["GET", "POST"],
-        "path_allowlist": [],
+        "internal": {"allow_anonymous": False, "expose_version": True, "expose_docs": True},
+        "public": {"port": None, "path_allowlist": {}, "admin_endpoints": "deny"},
         "rate_limit": {"enabled": False},
     },
 }
@@ -279,7 +276,6 @@ with open(_CONFIG_PATH, "w", encoding="utf-8") as _fh:
     json.dump(_CONFIG, _fh, ensure_ascii=False)
 
 os.environ["CONFIG_PATH"] = _CONFIG_PATH
-os.environ["GATEWAY_API_KEYS"] = "sk-management-test-key"
 os.environ["ADMIN_PASSWORD"] = "admin-secret-pw"
 os.environ["SYSTEMONE_SERVER_API_KEY"] = "systemone-secret-env-key"
 os.environ["REQUEST_LOG_DB"] = os.path.join(_TMP_DIR, "llmhub-test.db")
@@ -292,6 +288,33 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 API_KEY = "sk-management-test-key"
 GW = {"Authorization": f"Bearer {API_KEY}"}
+
+
+def seed_api_keys(*secrets: str) -> None:
+    """Create caller-key rows in llmhub.db before the app starts.
+
+    Keys are minted in the console only - no environment variable or key file can seed them -
+    so the fixture writes the rows itself. It runs before the first lifespan: an empty table
+    with no key would leave every keyed route at 401 and the suite meaningless.
+    """
+    import sqlite3
+
+    from key_store import SCHEMA, hash_key, mask_key, now_ts
+
+    db = Path(os.getenv("LLMHUB_DB") or Path(_CONFIG_PATH).parent / "llmhub.db")
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db) as conn:
+        conn.executescript(SCHEMA)
+        for secret in secrets:
+            conn.execute(
+                "INSERT OR IGNORE INTO api_keys (hash, masked, label, source, created_at) "
+                "VALUES (?, ?, '', 'console', ?)",
+                (hash_key(secret), mask_key(secret), now_ts()),
+            )
+        conn.commit()
+
+
+seed_api_keys(API_KEY)
 MASK = "••••••"
 
 PASSED = 0
@@ -336,9 +359,9 @@ def run() -> int:
         r = client.get("/v1/management/auth/ping", headers={"Authorization": "Bearer admin-secret-pw"})
         check("ping with the password as Bearer -> 401", r.status_code == 401, f"got {r.status_code}")
         r = client.get("/v1/management/auth/ping", headers=GW)
-        check("ping with a gateway API key -> 200", r.status_code == 200, f"got {r.status_code}")
+        check("ping with a caller API key -> 401 (no privilege escalation)", r.status_code == 401, f"got {r.status_code}")
         r = client.get("/v1/management/overview", headers={"X-API-Key": API_KEY})
-        check("overview with X-API-Key -> 200", r.status_code == 200, f"got {r.status_code}")
+        check("overview with X-API-Key -> 401 (caller key is not an admin)", r.status_code == 401, f"got {r.status_code}")
         r = client.get("/v1/management/overview", headers={"Authorization": "Bearer sk-not-a-real-key"})
         check("overview with an unknown key -> 401", r.status_code == 401, f"got {r.status_code}")
         r = client.get("/v1/management/overview", params={"api_key": API_KEY})
@@ -770,13 +793,12 @@ def run() -> int:
         )
         check("upstream failure -> 502", r.status_code == 502, f"got {r.status_code}")
 
-        # Liveness probes are forwarded but never recorded; HEAD has to be allowed for this one.
-        try:
-            patch_config(security={**_CONFIG["security"], "allowed_http_methods": ["GET", "POST", "HEAD"]})
-            r = client.head("/api/chat", headers=GW)
-            check("an allowed HEAD is still forwarded", r.status_code == 200, f"got {r.status_code}")
-        finally:
-            patch_config(security=_CONFIG["security"])
+        # Liveness probes are forwarded but never recorded. The catch-all accepts HEAD
+        # through HTTP_METHODS (no global method allowlist exists any more). `/api/chat`
+        # is now a documented POST-only route, so the probe uses a model-less path that
+        # the catch-all still serves for every method.
+        r = client.head("/api/version", headers=GW)
+        check("a HEAD probe is forwarded by the catch-all", r.status_code == 200, f"got {r.status_code}")
 
         # The log writer is asynchronous; /requests flushes before querying.
         r = client.get("/v1/management/requests")
@@ -851,9 +873,19 @@ def run() -> int:
         check("failure by_upstream has dead-ollama", fail.get("by_upstream", {}).get("dead-ollama", 0) >= 1, str(fail.get("by_upstream")))
         check("failure samples include the model", any(s.get("model") == "dead:7b" for s in fail.get("samples", [])), str(fail.get("samples"))[:200])
 
-        # A blocked admin call gives the distribution a row that never reached an upstream.
-        blocked = client.post("/api/pull", headers=GW, json={"model": "qwen3:8b"})
-        check("blocked admin path -> 403", blocked.status_code == 403, f"got {blocked.status_code}")
+        # A blocked call gives the distribution a row that never reached an upstream.
+        # `security.blocked_paths` applies in both zones (unlike public.admin_endpoints),
+        # so this probe does not depend on which listener the test client uses. It has to
+        # name a *real* gateway API path: an unknown path is refused with 404 by
+        # `proxy.is_forwardable()` before the deny list is ever consulted.
+        _sec = client.app.state.manager.config.security
+        _saved_blocked = list(_sec.blocked_paths)
+        _sec.blocked_paths = ["api/show"]
+        try:
+            blocked = client.post("/api/show", headers=GW, json={"model": "qwen3:8b"})
+            check("blocked path -> 403", blocked.status_code == 403, f"got {blocked.status_code}")
+        finally:
+            _sec.blocked_paths = _saved_blocked
 
         r = client.get("/v1/management/stats/distribution")
         check("distribution -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
@@ -867,7 +899,18 @@ def run() -> int:
         check("distribution items sum to the log", sum(counts.values()) == total, f"{sum(counts.values())} vs {total}")
         check("distribution is ordered by count", list(counts) == [k for k, _ in sorted(counts.items(), key=lambda kv: -kv[1])], str(list(counts)))
 
-        wide = {"start": "2020-01-01T00:00:00", "end": "2030-01-01T00:00:00"}
+        # Analytics now cap the window at MAX_STATS_WINDOW_DAYS; a 10-year range used to
+        # be a convenient "everything" filter but is a full-table scan on a real DB.
+        wide = {
+            "start": (datetime.now(UTC).replace(tzinfo=None) - timedelta(days=30)).isoformat(timespec="seconds"),
+            "end": (datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1)).isoformat(timespec="seconds"),
+        }
+        too_wide = {"start": "2020-01-01T00:00:00", "end": "2030-01-01T00:00:00"}
+        check(
+            "distribution rejects a window wider than 90 days",
+            client.get("/v1/management/stats/distribution", params=too_wide).status_code == 400,
+            "wide window was not rejected",
+        )
         status_items = client.get(
             "/v1/management/stats/distribution", params={"group_by": "status", **wide}
         ).json()["items"]
@@ -1025,15 +1068,38 @@ def run() -> int:
         )
         check("an API call still counts", counted() == scoped_total + 1, f"{scoped_total} -> {counted()}")
 
-        # ------------------------------------------- allowlist exemption ---
-        print("[7] perimeter exemptions")
+        # ------------------------------- public-zone perimeter and allowlist ---
+        print("[7] public-zone perimeter")
         sec = client.app.state.manager.config.security
-        sec.path_allowlist = ["^/no-such-path$"]
-        r = client.get("/v1/management/auth/ping")
-        check("management API exempt from path_allowlist", r.status_code == 200, f"got {r.status_code}")
-        r = client.get("/v1/models", headers=GW)
-        check("gateway path still enforced by path_allowlist", r.status_code == 403, f"got {r.status_code}")
-        sec.path_allowlist = []
+        saved_port = sec.public.port
+        saved_allowlist = dict(sec.public.path_allowlist)
+        try:
+            # Internal zone (the single TestClient socket): management works, and the
+            # public allowlist is irrelevant here.
+            check("internal: management API reachable",
+                  client.get("/v1/management/auth/ping").status_code == 200)
+            check("internal: business API reachable with a key",
+                  client.get("/v1/models", headers=GW).status_code == 200)
+
+            # Declare TestClient's port (80) public: every request now hits the bridge.
+            sec.public.port = 80
+            sec.public.path_allowlist = {"GET": [r"^/v1/models$"]}
+            check("public: management API is a red line -> 404 even with a key",
+                  client.get("/v1/management/config", headers=GW).status_code == 404)
+            check("public: an unlisted business path -> 404 even with a key",
+                  client.get("/api/tags", headers=GW).status_code == 404)
+            # A bare caller (no key, no session cookie) is rejected. The console session
+            # this client carries is itself a valid credential on the public zone too.
+            anon = TestClient(main.app)
+            check("public: a listed business path needs a credential -> 401",
+                  anon.get("/v1/models").status_code == 401)
+            check("public: a listed business path with a key -> 200",
+                  client.get("/v1/models", headers=GW).status_code == 200)
+            check("public: a console session is also a valid credential -> 200",
+                  client.get("/v1/models").status_code == 200)
+        finally:
+            sec.public.port = saved_port
+            sec.public.path_allowlist = saved_allowlist
 
         # ------------------------------------------- admin disabled (503) ---
         print("[8] admin not configured")
@@ -1186,7 +1252,9 @@ def run() -> int:
         r = anon.get("/v1/management/api-test/models", headers={"Authorization": "Bearer admin-secret-pw"})
         check("the admin password is not a request credential here either", r.status_code == 401, f"got {r.status_code}")
         r = anon.get("/v1/management/api-test/models", headers=GW)
-        check("context with a gateway API key -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
+        check("context with a caller API key -> 401", r.status_code == 401, f"got {r.status_code}: {r.text[:160]}")
+        r = client.get("/v1/management/api-test/models")
+        check("context with the console session -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
         ctx = r.json()
         kinds = ctx["kinds"]
         check(
@@ -1540,14 +1608,13 @@ def run() -> int:
         r = client.get("/v1/management/api-keys")
         listing = r.json()
         check("key list with the session cookie -> 200", r.status_code == 200, f"got {r.status_code}")
-        imported = [item for item in listing["items"] if item["source"] == "file"]
-        check("the environment key was imported on first start", len(imported) >= 1, str(listing)[:200])
-        check("an imported key reports the file as its source", all(i["source"] == "file" for i in imported))
-        check("an imported key carries no label", all(i["label"] == "" for i in imported))
+        seeded = [item for item in listing["items"] if item["label"] == ""]
+        check("the fixture key is listed", len(seeded) >= 1, str(listing)[:200])
+        check("a key row reports the console as its source", all(i["source"] == "console" for i in seeded))
         check(
             "the list shows a mask, never the plaintext",
-            API_KEY not in json.dumps(listing) and imported and imported[0]["masked"].endswith(API_KEY[-4:]),
-            str(imported),
+            API_KEY not in json.dumps(listing) and seeded and seeded[0]["masked"].endswith(API_KEY[-4:]),
+            str(seeded),
         )
 
         r = client.post("/v1/management/api-keys", json={"label": "  console issued  "})
@@ -1581,7 +1648,11 @@ def run() -> int:
             "a fresh key authenticates a gateway call at once",
             client.get("/api/tags", headers=bearer).status_code == 200,
         )
-        check("a fresh key opens the management API too", client.get("/v1/management/auth/ping", headers=bearer).status_code == 200)
+        # A caller key is never an admin credential: even a brand-new valid key
+        # cannot open the management API without the console session cookie.
+        anon_probe = TestClient(main.app)
+        check("a fresh key cannot open the management API (cookie-only)",
+              anon_probe.get("/v1/management/auth/ping", headers=bearer).status_code == 401)
         check(
             "the store verifies by hash, not by plaintext",
             main.app.state.api_keys.verify(secret) and hash_key(secret) != secret,
@@ -1597,7 +1668,8 @@ def run() -> int:
         # Signed out, so the remaining checks test the key itself rather than the session cookie.
         client.post("/v1/management/auth/logout")
         check("a revoked key stops authenticating", client.get("/api/tags", headers=bearer).status_code == 403)
-        check("a revoked key stops opening the management API", client.get("/v1/management/auth/ping", headers=bearer).status_code == 401)
+        check("a revoked key still cannot open the cookie-only management API",
+              client.get("/v1/management/auth/ping", headers=bearer).status_code == 401)
         check("without any credential the key list is closed", client.get("/v1/management/api-keys").status_code == 401)
         check("the original environment key still works", client.get("/api/tags", headers=GW).status_code == 200)
         # Later sections read the management API through the session cookie, so put it back.
@@ -1613,14 +1685,14 @@ def run() -> int:
     check("websearch without a provider", ws["provider_configured"] is False and ws["base_url"] is None, str(ws))
     check("websearch hides an unset provider key", ws["api_key"] is None, str(ws.get("api_key")))
 
-    os.environ["WEBSEARCH_TEST_KEY"] = "provider-secret"
+    os.environ["WEBSEARCH_TEST_API_KEY"] = "provider-secret"
     try:
         patch_config(
             websearch={
                 "enabled": True,
                 "upstream": "mock-ollama",
                 "path": "v1/web-search",
-                "api_key_env": "WEBSEARCH_TEST_KEY",
+                "api_key_env": "WEBSEARCH_TEST_API_KEY",
                 "timeout": 42.0,
             }
         )
@@ -1632,7 +1704,7 @@ def run() -> int:
         )
         check("websearch names the provider upstream", ws["upstream"] == "mock-ollama", str(ws.get("upstream")))
         check("websearch echoes the upstream type", ws["upstream_type"] == "ollama", str(ws.get("upstream_type")))
-        check("websearch keeps the env var name", ws["api_key_env"] == "WEBSEARCH_TEST_KEY", str(ws.get("api_key_env")))
+        check("websearch keeps the env var name", ws["api_key_env"] == "WEBSEARCH_TEST_API_KEY", str(ws.get("api_key_env")))
         check("websearch masks the provider key value", ws["api_key"] == MASK, str(ws.get("api_key")))
         check("websearch projects the timeout", ws["timeout"] == 42.0, str(ws.get("timeout")))
         check("websearch flags a configured provider", ws["provider_configured"] is True, str(ws.get("provider_configured")))
@@ -1642,7 +1714,7 @@ def run() -> int:
             "provider-secret" not in client.get("/v1/management/tools/websearch").text,
         )
     finally:
-        del os.environ["WEBSEARCH_TEST_KEY"]
+        del os.environ["WEBSEARCH_TEST_API_KEY"]
         patch_config(websearch={"enabled": False})
 
     # -------------------------------------------- legacy database upgrade ---
@@ -1778,16 +1850,17 @@ def run() -> int:
         check("listing exposes only the safe columns", set(listed[0]) == {"id", "masked", "label", "source", "created_at"}, str(set(listed[0])))
         check("the newest row is not the plaintext", all("hash" not in item for item in listed))
 
-        imported = await unit_store.import_plaintext(["sk-from-file-a", "sk-from-file-b", "sk-from-file-a"])
-        check("importing skips a duplicate", imported == 2, str(imported))
-        again = await unit_store.import_plaintext(["sk-from-file-a", "sk-from-file-b"])
-        check("importing what is already stored adds nothing", again == 0, str(again))
-        file_rows = [item for item in await unit_store.list_keys() if item["source"] == "file"]
-        check("imported rows say so and carry no label", len(file_rows) == 2 and all(i["label"] == "" for i in file_rows))
-        check("an imported key verifies", unit_store.verify("sk-from-file-a") is True)
-        unserved = unit_store.unserved_env_keys(["sk-from-file-a", "sk-gone", ""])
-        check("the startup warning names only unserved keys", len(unserved) == 1, str(unserved))
-        check("the warning is a mask, never the key", unserved and "sk-gone" not in unserved[0], str(unserved))
+        imported = await unit_store.add_plaintext(
+            ["sk-migrated-a", "sk-migrated-b", "sk-migrated-a"], label="migrated"
+        )
+        check("add_plaintext skips a duplicate", imported == 2, str(imported))
+        again = await unit_store.add_plaintext(["sk-migrated-a", "sk-migrated-b"])
+        check("adding what is already stored adds nothing", again == 0, str(again))
+        migrated_rows = [item for item in await unit_store.list_keys() if item["label"] == "migrated"]
+        check("added rows keep their label and source",
+              len(migrated_rows) == 2 and all(i["source"] == "console" for i in migrated_rows),
+              str(migrated_rows))
+        check("an added key verifies", unit_store.verify("sk-migrated-a") is True)
 
         removed = await unit_store.delete(row["id"])
         check("delete answers True for a real id", removed is True)
@@ -1796,6 +1869,19 @@ def run() -> int:
         check("the count follows the table", unit_store.count() == len(await unit_store.list_keys()))
 
     asyncio.run(_unit())
+
+    # ------------------------------------------------- audit V3: login lockout ---
+    print("[15] admin sign-in throttling")
+    from management import _LOGIN_FAILURES
+
+    _LOGIN_FAILURES.clear()
+    probe = TestClient(main.app)
+    codes = [probe.post("/v1/management/auth/login", json={"password": "wrong"}).status_code for _ in range(5)]
+    check("five failed sign-ins all answer 401", codes == [401] * 5, str(codes))
+    locked = probe.post("/v1/management/auth/login", json={"password": "admin-secret-pw"})
+    check("the sixth attempt is locked out even with the right password", locked.status_code == 429, f"got {locked.status_code}")
+    check("the lockout advertises Retry-After", "retry-after" in {k.lower() for k in locked.headers}, str(dict(locked.headers)))
+    _LOGIN_FAILURES.clear()
 
     print(f"\n{'=' * 60}\nPASSED: {PASSED}  FAILED: {FAILED}\n{'=' * 60}")
     return 0 if FAILED == 0 else 1

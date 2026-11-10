@@ -6,16 +6,16 @@ A single admin password is supplied via the ``ADMIN_PASSWORD`` environment varia
 endpoint: a successful login mints a short-lived, HMAC-signed session cookie, and
 protected admin routes depend on ``require_admin``.
 
-``require_admin`` accepts two credentials:
-  * the signed session cookie (what the console uses -- it never sees the password);
-  * a gateway API key from the ``api_keys`` table, presented as ``Authorization: Bearer`` or
-    ``X-API-Key`` (what scripts and headless calls use).
-The admin password itself is never a request credential: sending it in those headers is
-a 401, because it would defeat the point of a login page.
+``require_admin`` accepts exactly one credential: the signed session cookie minted by
+the login endpoint. It deliberately does **not** accept a gateway API key. Those keys
+are handed to every caller of the gateway; accepting one on the management API would
+give each caller the ability to read the full config (including upstream credentials),
+export everybody's request bodies, rewrite upstreams and run the server-side testers.
+The admin password itself is not a request credential either.
 
-``require_admin_session`` is the cookie-only variant, used by the routes that mint or revoke
-those keys: a client key is what an already-issued caller holds, so accepting one there would
-let any client hand out more of itself.
+``require_admin_session`` is the equivalent cookie-only dependency used by the key
+mint/revoke routes; both now resolve to the same rule, kept as two names so the
+intent stays visible at each call site.
 
 Design notes:
   * No external dependencies. The session token is ``<expiry>.<signature>`` where the
@@ -25,8 +25,9 @@ Design notes:
     for a single-password management console.
   * The cookie is HttpOnly + SameSite=Lax and only marked Secure on HTTPS, so it works
     over plain HTTP during local development but is locked down in production.
-  * The API-key path is skipped when gateway auth is disabled or no key is configured,
-    so ``auth.enabled: false`` cannot silently open the management API.
+  * The compatibility helper ``_gateway_key_authorized`` only checks the SQLite key
+    store and is NEVER an admin credential: management routes require the signed
+    console cookie, so an anonymous internal zone cannot open the management API.
   * Session lifetime is ``ADMIN_SESSION_TTL`` seconds (default 12h, clamped to
     5 min .. 7 days). A successful request past half the TTL re-issues the cookie
     (sliding renewal), so an active session does not hard-expire. Logout only clears
@@ -118,21 +119,24 @@ def set_admin_cookie(response: Response, request: Request, token: str) -> None:
         httponly=True,
         samesite="lax",
         max_age=session_ttl(),
-        secure=request.url.scheme == "https",
+        # A TLS-terminating reverse proxy speaks plain HTTP to uvicorn, so the URL
+        # scheme alone would leave the cookie without Secure. X-Forwarded-Proto is
+        # safe to trust *for this direction only*: forging it can only make the
+        # browser stricter, never looser.
+        secure=request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https",
     )
 
 
 def _gateway_key_authorized(request: Request) -> bool:
-    """True when the request carries a valid gateway API key.
+    """Retained for compatibility with callers that imported it; NOT an admin credential.
 
-    The query-string transport is deliberately excluded: a key in a URL ends up in
-    access logs and browser history. With gateway auth disabled there are no keys to
-    accept, so the management API stays cookie-only rather than becoming anonymous.
+    A valid caller key is still a valid *caller* credential on business APIs (handled by
+    ``auth.require_api_key``), but the management API must never treat it as an admin
+    session: every caller would otherwise be an administrator.
     """
-    manager = getattr(request.app.state, "manager", None)
-    cfg = getattr(manager, "config", None)
     store = get_store()
-    if cfg is None or not cfg.auth.enabled or store is None or store.count() == 0:
+    if store is None or store.count() == 0:
         return False
     candidate = extract_api_key(request)
     return bool(candidate) and store.verify(candidate)
@@ -142,12 +146,10 @@ async def require_admin(
     request: Request,
     admin_cookie: str | None = Cookie(default=None, alias=ADMIN_COOKIE_NAME),
 ) -> None:
-    """FastAPI dependency that gates admin routes.
+    """FastAPI dependency that gates admin routes: console session cookie only.
 
-    Accepts the signed session cookie minted by the login endpoint, or a gateway API key
-    in ``Bearer`` / ``X-API-Key``. The admin password itself is not a request credential,
-    so sending it in those headers does not match any key. Raises 503 when admin is not
-    configured (no ADMIN_PASSWORD), 401 when neither credential is valid.
+    Raises 503 when admin is not configured (no ADMIN_PASSWORD), 401 when the cookie
+    is missing, forged or expired. A gateway API key is intentionally *not* accepted.
     """
     key = get_admin_password()
     if not key:
@@ -155,11 +157,11 @@ async def require_admin(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Admin is not configured: set the ADMIN_PASSWORD environment variable.",
         )
-    if verify_admin_token(admin_cookie, key) or _gateway_key_authorized(request):
+    if verify_admin_token(admin_cookie, key):
         return
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Admin authentication required: sign in, or send a gateway API key.",
+        detail="Console sign-in required: management endpoints accept a session cookie only.",
     )
 
 

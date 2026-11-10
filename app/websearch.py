@@ -5,8 +5,10 @@ Exposes the OpenCode API Gateway `POST /v1/web-search` (keyword -> retrieved web
 passages) as `POST /v1/tools/web-search` on this gateway.
 
 Authentication split:
-  - The *caller* authenticates against llm-hub with the gateway's own API key
-    (cfg.auth.api_keys, from GATEWAY_API_KEYS / .env).
+  - The *caller* authenticates against llm-hub with a key from the SQLite api_keys
+    table (minted at /admin -> API keys), or a console session.
+    On the internal zone this API may be key-free when allow_anonymous is true;
+    the public zone always requires a credential.
   - The search provider is a regular entry in `cfg.upstreams`, selected by
     `websearch.upstream` (or the first `type: "opencode"` upstream). Its address,
     timeout and extra headers therefore also serve model routing and aggregation.
@@ -26,6 +28,7 @@ import socket
 from typing import Any
 
 import httpx
+from auth import read_limited_body
 from fastapi import HTTPException, Request, status
 from fastapi.responses import Response
 
@@ -42,6 +45,14 @@ _EXCLUDED_REQUEST_HEADERS = {
     "authorization",
     "x-api-key",
     "accept-encoding",
+    "cookie",
+    "referer",
+    "origin",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-real-ip",
+    "x-client-ip",
 }
 
 # Response headers that must not be forwarded back to the caller.
@@ -56,6 +67,7 @@ _EXCLUDED_RESPONSE_HEADERS = {
     "te",
     "trailers",
     "upgrade",
+    "set-cookie",
 }
 
 
@@ -146,7 +158,7 @@ class WebSearchService:
                 ),
             )
 
-        raw_body = await request.body()
+        raw_body = await read_limited_body(request, cfg.security.max_body_bytes)
         try:
             body: Any = json.loads(raw_body) if raw_body else {}
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
