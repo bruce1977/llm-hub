@@ -232,7 +232,7 @@ environment concern any more** — they are minted at `/admin` -> API keys and s
 | `SYSTEMONE_SERVER_API_KEY` | ❌ | System One backend key, needed only when `systemone.api_key_env` points at it; required by laya-server, ignored by Ollama 0.40+ backends |
 | `OPENCODE_GATEWAY_API_KEY` | ❌ | Web search upstream key, needed only when `websearch.api_key_env` points at it (empty by default = no signature) |
 | `ADMIN_PASSWORD` | ❌ | Console login password (the user name is always `admin`). It is a separate credential from caller API keys: it only buys a 12-hour session cookie via `POST /v1/management/auth/login`, and presenting it as `Bearer` / `X-API-Key` is still a 401. Every `/v1/management/*` route accepts **only** that signed session cookie — a gateway API key is handed to every client and answers 401 here, so scripts must log in once and keep the cookie jar. Unset, `/admin` says the console is not enabled and every `/v1/management/*` call returns 503 |
-| `ADMIN_SESSION_TTL` | ❌ | Console session lifetime in seconds, default `43200` (12h), clamped to `300` .. `604800` (5 min .. 7 days). Successful requests past half the TTL renew the session; logout only clears the browser cookie, there is no server-side session table |
+| `ADMIN_SESSION_TTL` | ❌ | Console session lifetime in seconds, default `43200` (12h), clamped to `300` .. `604800` (5 min .. 7 days). Successful requests past half the TTL renew the session; logout only clears the browser cookie, there is no server-side session table. The signed token carries a random session id and its key mixes `ADMIN_PASSWORD` with a per-process random seed, so a password change **or a restart** invalidates every session |
 | `REQUEST_LOG_DB` | ❌ | SQLite path for request details, defaults to `llmhub.db` next to `CONFIG_PATH` (`/data/llmhub.db` in the container). One file holds three tables: `requests` (details), `bench_results` (speed-test history) and `api_keys` (caller key hashes and masks) |
 | `LLMHUB_DB` | ❌ | Database path for the `bench_results` and `api_keys` tables, also `llmhub.db` next to `CONFIG_PATH` by default. Only set it to split those two away from the request log; all three tables share one file by default, so the container needs a single writable `/data` |
 | `REQUEST_LOG_RETENTION_DAYS` | ❌ | Retention for request details in days, default `30`; `0` keeps them forever |
@@ -265,16 +265,16 @@ A request is `internal` or `public` by the **local listening port the connection
 (`scope["server"]`, assigned by the kernel) — never by a client IP, `X-Forwarded-For`, an API key
 or any request header. `serve.py` sets `proxy_headers=False` so uvicorn cannot rewrite
 `scope["client"]` from a forged XFF, and `auth.peer_ip()` rejects any scope carrying the port-0
-proxy-rewrite fingerprint. The application parses XFF itself — **rightmost untrusted hop** — only
-for TCP peers declared in `security.trusted_proxies`, and uses it solely for IP fencing,
-rate-limit buckets and audit rows; it never changes the zone. Mapping two Docker host ports to one
-container port does **not** create two zones — the container sees a single socket.
+proxy-rewrite fingerprint. No forwarded header is honoured at all: the address used for
+rate-limit buckets and audit rows is always the real TCP peer. Behind a reverse proxy every
+request shares that one address, so prefer `rate_limit.by: key` or throttle at the proxy.
+Mapping two Docker host ports to one container port does **not** create two zones — the
+container sees a single socket.
 
 | Anchor | Configured by | Forgeable by a caller |
 |---|---|---|
 | Internal listener (kernel-assigned socket) | `server.port` | No |
 | Public listener (kernel-assigned socket) | `security.public.port` | No |
-| TCP peer of a declared reverse proxy | `security.trusted_proxies` (XFF for IP fencing / rate limit / audit only) | No |
 
 `security.public.port` selects the layout:
 
@@ -295,10 +295,9 @@ Hard rules:
   method+path pairs (`re.fullmatch`); management, docs, `/`, `/probe` and `/health` are red lines —
   see [Public zone](#public-zone-securitypublicport) below. `/admin` is **404** — the public zone
   has no admin-shell toggle.
-- A request carrying `X-Forwarded-*` / `X-Real-IP` is used only for IP fencing / rate limiting /
-  audit when its real TCP peer is a declared `security.trusted_proxies` member, via the rightmost
-  untrusted XFF hop; it never changes the zone. This stops a common `^127\.0\.0\.1$` fence from
-  being satisfied by a forged leftmost hop.
+- `X-Forwarded-For` / `X-Real-IP` never change a decision or a recorded address: `auth.peer_ip()`
+  always uses the real TCP peer. There is no trusted-proxy list, no IP fence and no client-IP
+  allowlist. (`X-Forwarded-Proto: https` is still read by the console cookie to set `Secure`.)
 - Zero API keys with no anonymous internal zone fails closed: the gateway **refuses to start** and
   logs an ERROR. Anonymous now means `security.internal.allow_anonymous: true` on a real internal
   socket only — never a global mode and never the public zone.
@@ -389,7 +388,7 @@ security:
 ```
 
 If you need a trusted LAN zone *and* an internet-facing zone with different policies, use Choice B.
-Do not try to express that split with `security.trusted_proxies` — it is not a zone anchor.
+Client IPs and forwarded headers are not zone anchors — only separate listening sockets are.
 
 ### Choice B - two container listeners (strongest, recommended)
 
@@ -453,12 +452,13 @@ envelope applied before routing, so a key revoked in the console stops working o
 and a streaming response is never re-framed by a second HTTP hop. Hard red lines the config cannot
 open: `/v1/management/*`, `/admin*`, paths with a `..` segment or a NUL byte — all 404 on public.
 
-nginx must **overwrite** forwarding headers rather than append to a caller-supplied chain:
+nginx must set `X-Forwarded-Proto` so the console cookie receives `Secure`. The gateway
+ignores `X-Forwarded-For` / `X-Real-IP` entirely, so no XFF configuration is needed —
+all traffic appears as the proxy's TCP peer (prefer `rate_limit.by: key` or throttle here):
 
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8835;
-    proxy_set_header X-Forwarded-For $remote_addr;   # not $proxy_add_x_forwarded_for
     proxy_set_header X-Forwarded-Proto https;        # session cookie gets Secure
 }
 ```
@@ -493,8 +493,8 @@ curl -m 3 -o /dev/null -w '%{http_code}\n' http://<public-host>:11434/api/tags  
 
 If the public socket returns 200 for an unlisted path, `/admin` or `/v1/management/*` answers
 anything but 404, or a listed API works without a key, check for an old image, a missing or wrong
-`security.public.port` / `security.public.path_allowlist` in the mounted `config.yaml`, a legacy
-port variable still in `.env`, or a proxy that appends instead of overwrites XFF.
+`security.public.port` / `security.public.path_allowlist` in the mounted `config.yaml`, or a
+legacy port variable still in `.env`.
 
 ### Public deployment checklist (post-audit, 2026-11-09)
 
@@ -508,25 +508,33 @@ Code fixes do not replace deployment hardening. Confirm each item on an internet
    provider key in `upstreams[].headers`.
 3. **Enable rate limiting**: `security.rate_limit.enabled: true`, or rate-limit at the proxy.
    Sign-in has its own 5-failure / 15-minute lockout; other endpoints do not.
-4. **Keep the console internal-only**: `/admin` and `/admin/*` are hard 404 on the public socket
+   This is abuse mitigation (429), not capacity protection. Behind a reverse proxy all
+   callers share one TCP peer, so an `by: ip` bucket would cover everyone — use `by: key`
+   or throttle at the proxy instead.
+4. **Size the inference concurrency gate**: set `server.max_concurrency` to the number of
+   simultaneous generation jobs the GPU can hold (1~2 on a single card) and
+   `server.upstream_queue_timeout` to an acceptable wait (default 120s). Excess requests
+   queue instead of being rejected; a wait that exceeds the cap gets 503 + `Retry-After`.
+   Both are read at startup only — restart after editing.
+5. **Keep the console internal-only**: `/admin` and `/admin/*` are hard 404 on the public socket
    (there is no admin-shell switch); reach the console only from the LAN/VPN or through a tunnel.
    All `/v1/management/*` endpoints accept a signed session cookie only — a caller API key answers
    401, and they are 404 on public regardless of the config.
-5. **Declare the zones in config**: set `security.public.port` to a port distinct from
+6. **Declare the zones in config**: set `security.public.port` to a port distinct from
    `server.port` (e.g. `8001`), map the two container ports to **different host ports**, and
    publish `server.port` on the LAN only. The listening socket is the anchor — no IP list, XFF or
    port environment variable can move a request between zones (legacy port variables are migration
-   hints only; remove them from `.env`). List reverse-proxy addresses in
-   `security.trusted_proxies` so only their XFF is honoured, using the rightmost untrusted hop.
+   hints only; remove them from `.env`). No forwarded header is honoured: behind a proxy all
+   callers share one IP, so prefer `rate_limit.by: key` or rate-limit at the proxy.
    Confirm the image starts with `python serve.py` (`proxy_headers=False`), never plain
-   `uvicorn main:app`; the latter cannot bind the public port and leaves IP fences
-   caller-controlled. A hidden `/docs` must never coexist with a key-free public API.
-6. **Reduce the information surface**: `security.internal.expose_version: false`,
+   `uvicorn main:app`; the latter cannot bind the public port and lets a caller forge the audit IP.
+   A hidden `/docs` must never coexist with a key-free public API.
+7. **Reduce the information surface**: `security.internal.expose_version: false`,
    `security.internal.expose_docs: false` unless needed, and keep `security.public.path_allowlist`
    to the minimum set of `re.fullmatch` method+path rules (e.g. `^/v1/chat/completions$`, not a
    broad `^/v1/.*$`). Unlisted pairs are 404 with or without a key. `GET /v1/management/config`
    masks upstream headers (saving the projection restores the real values from disk).
-7. **Container / dependencies (deployment-side TODO, no code change)**: the image still runs
+8. **Container / dependencies (deployment-side TODO, no code change)**: the image still runs
    as root and `requirements.txt` uses unbounded `>=`. Prefer a non-root user, a read-only root
    filesystem with only `/data` writable, and a hash-pinned lock file.
 

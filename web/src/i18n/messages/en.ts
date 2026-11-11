@@ -179,7 +179,7 @@ const en: MessageSchema = {
       errors: 'Errors',
       upstreamDist: 'Requests by upstream',
       modelDist: 'Requests by model',
-      statusDist: 'Success / failure split',
+      statusDist: 'Success / warning / failure split',
     },
   },
 

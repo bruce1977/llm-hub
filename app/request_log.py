@@ -56,13 +56,18 @@ API_PATH_SCOPE = "(path LIKE '/v1/%' OR path LIKE '/api/%')"
 
 # Grouping expressions for /v1/management/stats/distribution. Rows that never reached an
 # upstream (blocked, oversized, unrouted) bucket as "-", the same convention as `failures`.
-# `status` shares the >= 500 threshold with `error_rate`, the timeseries error bars and
-# `failures`: a 4xx is a caller-side/upstream rejection, not a gateway failure. Keeping one
-# definition means the three "error" numbers on the Dashboard always agree.
+# `status` is a three-way split for the Dashboard pie: 2xx -> ok, >= 500 -> failed, everything
+# else (3xx, 4xx, NULL/unknown) -> warning. `failed` deliberately keeps the >= 500 threshold
+# used by `error_rate`, the timeseries error bars and `failures`, so the red slice and the
+# three "error" numbers still agree; `warning` is the new middle bucket that makes caller-side
+# rejections (401/403/404/429) visible instead of silently folding them into `ok`.
 _DISTRIBUTION_KEYS = {
     "upstream": "COALESCE(upstream, '-')",
     "model": "COALESCE(model, '-')",
-    "status": "CASE WHEN status >= 500 THEN 'error' ELSE 'ok' END",
+    "status": (
+        "CASE WHEN status >= 200 AND status < 300 THEN 'ok' "
+        "WHEN status >= 500 THEN 'failed' ELSE 'warning' END"
+    ),
 }
 
 _SENSITIVE_KEYS = {
@@ -124,6 +129,62 @@ _ADDED_COLUMNS = (
     ("tokens_in", "INTEGER"),
     ("tokens_out", "INTEGER"),
 )
+
+
+def basic_entry(
+    *,
+    method: str,
+    path: str,
+    status: int,
+    ts: str,
+    started: float,
+    client_ip: str | None = None,
+    query: str | None = None,
+    req_size: int | None = None,
+    res_size: int | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Build a metadata-only row for calls that never reach ``ProxyService.forward``.
+
+    The rich row (request/response bodies, token usage, upstream, stream flags) is built
+    by the proxy from its own timing and parsed body. Two kinds of request bypass that
+    path entirely: (a) the security middleware refuses them before ``call_next``, and
+    (b) the in-process API handlers (``/v1/systemone``, ``/v1/tools/web-search``,
+    ``/v1/rerank``, ``/v1/messages``, ``/v1/models``, ``/api/tags``, ``/api/ps``) answer
+    without a proxy. Both still matter to the console: a 401 from a public probe and a
+    failed rerank are exactly the rows an operator needs to see. This helper produces
+    the same shape as a proxy row but leaves body/token/upstream fields unset, so the
+    list, counts, percentiles and status distribution include them without pretending
+    we captured a body we never read.
+
+    ``ts`` is the wall-clock arrival time (``now_ts()``) and ``started`` is the
+    ``time.perf_counter()`` reading taken at the same moment, for the duration.
+    """
+    return {
+        "ts": ts,
+        "ts_end": now_ts(),
+        "method": method,
+        "path": path,
+        "query": sanitize_query(query),
+        "requested_model": None,
+        "model": None,
+        "upstream": None,
+        "status": status,
+        "duration_ms": max(0, round((time.perf_counter() - started) * 1000)),
+        "ttfb_ms": None,
+        "stream": 0,
+        "tokens_in": None,
+        "tokens_out": None,
+        "tokens": None,
+        "req_size": req_size,
+        "res_size": res_size,
+        "client_ip": client_ip,
+        "error": error,
+        "request_body": None,
+        "response_body": None,
+        "request_body_truncated": 0,
+        "response_body_truncated": 0,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -207,8 +268,9 @@ _SENSITIVE_QUERY_KEYS = {
 def sanitize_query(query: str | None) -> str | None:
     """Mask credential values in the query string before it is written to SQLite.
 
-    `security.allow_query_api_key` deliberately allows a key in the URL; forwarding
-    already strips `api_key`, but the log used to keep the plaintext query forever.
+    A key in the URL is never accepted as a credential, but clients still send one
+    by mistake (or a `token` / `password` param); the log used to keep the plaintext
+    query forever.
     """
     if not query:
         return None

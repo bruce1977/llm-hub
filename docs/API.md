@@ -132,13 +132,13 @@ single socket with **no anonymous HTTP path at all**, so point the container HEA
 check rather than an HTTP probe. The two listeners must be published on different host ports — two host
 ports pointing at one container socket do not create two zones.
 
-**`security.trusted_proxies` is not a zone anchor.** X-Forwarded-For is never used to pick a zone. It is
-honoured only to compute `client_ip()` for the `security.allowed_client_ips` fence, rate-limit buckets and
-request-log audit rows, and only when the **real TCP peer** is a declared trusted proxy. `client_ip()` takes
-the **rightmost untrusted XFF hop**, so a front proxy must **overwrite** with
-`proxy_set_header X-Forwarded-For $remote_addr;` rather than append; a forged leftmost value cannot claim
-an internal address. `peer_ip()` also rejects an ASGI scope with the port-0 rewrite fingerprint left by
-`ProxyHeadersMiddleware`, which is why the image starts with `python serve.py` (`proxy_headers=False`).
+**Forwarded headers are never trusted.** `X-Forwarded-For` / `X-Real-IP` cannot pick a zone or
+change any access decision, and they never affect the address recorded for rate-limit buckets
+and request-log audit rows: `auth.peer_ip()` always returns the **real TCP peer** (there is no
+trusted-proxy list and no client-IP allowlist). Behind a reverse proxy every request therefore
+shares one address — prefer `rate_limit.by: key` or throttle at the proxy. `peer_ip()` also
+rejects an ASGI scope with the port-0 rewrite fingerprint left by `ProxyHeadersMiddleware`,
+which is why the image starts with `python serve.py` (`proxy_headers=False`).
 
 **Console session cookie:** the signed cookie minted by `/v1/management/auth/login` is also a credential
 in **both zones**, so the browser need not hold a caller key on business API routes. Its lifetime is `ADMIN_SESSION_TTL`
@@ -1140,7 +1140,10 @@ served by the gateway as static files at **`/admin/`** (the bundle lives in `app
 section of USAGE); the static shell is unauthenticated — the login page has to open — but every data request
 inside it goes through `require_admin_session`. Apart from login, every endpoint accepts **exactly one
 credential**: the console session cookie (`llmhub_admin`, HMAC-signed, HttpOnly) obtained from
-`POST /v1/management/auth/login` with `ADMIN_PASSWORD`.
+`POST /v1/management/auth/login` with `ADMIN_PASSWORD`. The token is `<sid>.<expiry>.<signature>`:
+the per-session signing key mixes `ADMIN_PASSWORD`, a fresh random session id and a process-scoped
+random seed that never leaves the server, so a stolen cookie cannot be used to brute-force the
+password offline. Changing the password or restarting the process invalidates every session.
 
 A **gateway API key is deliberately NOT an admin credential**. Those keys are distributed to every
 client of the gateway; accepting one on `/v1/management/*` used to let any caller read the full
@@ -1179,10 +1182,10 @@ before the first key is minted) or when the internal zone runs with
 | `GET` | `/v1/management/models/rerank` | Rerank config projection (`api_key` always masked as `••••••`), including `upstream_api` / `on_error` and request/response examples |
 | `GET` | `/v1/management/models/systemone` | System One config projection (masked the same way), with request/SSE examples |
 | `GET` | `/v1/management/tools/websearch` | Web Search config projection: `enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url` (derived from the provider upstream) / `api_key_env` / `api_key` (masked) / `timeout` / `provider_configured` |
-| `GET` | `/v1/management/requests` | Request details: `start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`, returning `stats` + `rows` + `pagination` + `request_log` (switch state). **API calls only**: the query always carries `request_log.API_PATH_SCOPE` (`path LIKE '/v1/%' OR path LIKE '/api/%'`), so rows such as `/health`, `/metrics`, `/openapi.json` and `/admin/*` are still stored but never appear in lists, charts, KPIs or failure stats |
+| `GET` | `/v1/management/requests` | Request details: `start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`, returning `stats` + `rows` + `pagination` + `request_log` (switch state). **API calls only**: the query always carries `request_log.API_PATH_SCOPE` (`path LIKE '/v1/%' OR path LIKE '/api/%'`); `/v1/management/*`, `/admin/*`, docs and static assets are never written at all, while non-API paths such as `/health` are still stored but stay out of lists, charts, KPIs and failure stats (`GET /requests/{id}` deliberately stays unscoped, so a deep link still opens) |
 | `GET` | `/v1/management/requests/{id}` | A single detail row (request/response bodies truncated to 8 KB, sensitive fields redacted) |
 | `GET` | `/v1/management/stats/timeseries` | Time-series aggregation: `bucket=hour\|day`, each bucket with `count` / `errors` / `p95`. `tz_offset` (minutes to add to UTC to reach the caller, UTC+8 = `480`, range -840..840) shifts **day** buckets so each bar is one local calendar day instead of one UTC day; hour buckets stay UTC because the console renders them as instants |
-| `GET` | `/v1/management/stats/distribution` | Grouped counts: `group_by=upstream\|model\|status`, returning `{group_by, start, end, items:[{key, count}]}`; `status` splits into `ok` (<500, 4xx included) / `error` (≥500) — the same threshold as the KPI error rate, the timeseries error bars and `/stats/failures` — and rows with no matched upstream are counted under `-` |
+| `GET` | `/v1/management/stats/distribution` | Grouped counts: `group_by=upstream\|model\|status`, returning `{group_by, start, end, items:[{key, count, display?}]}`. `status` is a **three-way split**: `ok` (2xx), `failed` (≥ 500) and `warning` (3xx / 4xx / NULL / anything else); `failed` keeps the ≥ 500 threshold shared with the KPI error rate, the timeseries error bars and `/stats/failures`, so 4xx is now visible as `warning` instead of being folded into `ok`. For `group_by=model` each item also carries `display`: the configured `model_aliases` short name when one exists, otherwise the real id — `key` always stays the resolved model id so filters keep working. Rows with no matched upstream are counted under `-` |
 | `GET` | `/v1/management/stats/failures` | Failure stats: `by_code` / `by_upstream` / `samples` |
 | `GET` | `/v1/management/api-test/models` | Available models, defaults and masked keys per API family: `kinds` is keyed by `generate` / `chat` / `messages` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch`, each with `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source` (which config field the options came from) / `models[]` (`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key` (masked) / `unknown`) / `default_model` / `api_key` (masked) / `api_key_env`; the top level also carries `max_response_bytes`. With `api_models` empty the lists are derived from the config; the native `/api/...` endpoints (`generate`, `embed_ollama`) list only models of `type: "ollama"` upstreams, while the `/v1/...` endpoints (`chat`, `messages`, `embed_openai`) also list `lmstudio` / `opencode` models; an explicit `api_models` list is returned as written (a closed set: blank placeholder entries ignored, `free_model=false`). All upstreams are probed in one pass, so the whole console shares a single cache, refreshed on first open and on "probe again" |
 | `POST` | `/v1/management/api-test` | Body `{"kind": "generate", "body": {...}}`; the server issues the request through the gateway's own service and returns an envelope with `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`. A `kind` outside the allowlist, or a model-requiring family without `model` → `400` |
@@ -1212,7 +1215,18 @@ before the first key is minted) or when the internal zone runs with
              { "key": "lmstudio", "count": 380 },
              { "key": "-", "count": 12 } ] }
 
-// group_by=status has only two keys: ok (status < 500, 4xx included) and error (status >= 500)
+// GET /v1/management/stats/distribution?group_by=status
+// Three keys: ok (2xx), failed (>= 500), warning (3xx / 4xx / NULL / other)
+{ "group_by": "status", "start": "...", "end": "...",
+  "items": [ { "key": "ok", "count": 642 },
+             { "key": "warning", "count": 37 },
+             { "key": "failed", "count": 5 } ] }
+
+// GET /v1/management/stats/distribution?group_by=model
+// `display` is the configured model_aliases short name; `key` stays the resolved id
+{ "group_by": "model", "start": "...", "end": "...",
+  "items": [ { "key": "bge-m3:latest", "count": 460, "display": "bge-m3" },
+             { "key": "qwen3.5:9b", "count": 348, "display": "qwen3.5:9b" } ] }
 
 // GET /v1/management/tools/websearch
 { "enabled": true, "endpoint": "/v1/tools/web-search", "upstream": "opencode",
@@ -1228,7 +1242,9 @@ never leaves the server.
 
 **Request log (SQLite):**
 
-Every request occupies one row in the `requests` table, covering request parameters, timings and the result:
+Every API call occupies one row in the `requests` table (including standalone handlers and middleware
+refusals — see coverage below; management / console / docs / static assets are excluded), covering
+request parameters, timings and the result:
 
 | Group | Fields |
 |------|------|
@@ -1244,11 +1260,21 @@ Every request occupies one row in the `requests` table, covering request paramet
   reasoning tokens are counted). When the upstream reports no usage, all three are `NULL`, which stays
   distinguishable from a genuine `0`.
 - **Logging switch**: `request_log.enabled` in `config.yaml` (default `true`, node reference:
-  `request_log` in [CONFIG.md](CONFIG.md)) is read per request, no restart
-  needed. Turned off, the proxy stops capturing bodies and writing rows, and `request_log.enabled` in
-  `/overview` and `/requests` reports `false`; turning it back on resumes logging. Config hot reload compares
-  the file mtime at most once per second, so the switch takes effect in **about a second** (measured). The
-  database path and retention stay environment-driven.
+  `request_log` in [CONFIG.md](CONFIG.md)) is read per request by both the proxy and the security
+  middleware, no restart needed. Turned off, neither writer captures bodies or writes rows, and
+  `request_log.enabled` in `/overview` and `/requests` reports `false`; turning it back on resumes
+  logging. Config hot reload compares the file mtime at most once per second, so the switch takes
+  effect in **about a second** (measured). The database path and retention stay environment-driven.
+- **One row per API call, including callers the proxy never sees.** `ProxyService.forward` writes the
+  rich row (bodies, token usage, `model`, `upstream`, `stream`); the security middleware writes a
+  metadata-only row for the standalone in-process handlers (`/v1/systemone`, `/v1/tools/web-search`,
+  `/v1/rerank`, `/v1/messages`, `/v1/models`, `/api/tags`, `/api/ps`) and for every middleware
+  refusal (public-zone 401/404, rate limit 429, body cap 413). On a metadata-only row
+  the body/token/upstream columns are `NULL`, but `error` holds the denial reason; a missing-key
+  probe such as `Missing API key: POST /v1/systemone` is therefore auditable in the Requests view.
+  A claim flag on the ASGI scope prevents a proxied call from being written twice. Management and
+  console paths (`/v1/management/*`, `/admin/*`), docs and static assets are never written; `HEAD`
+  and `OPTIONS` are forwarded but never recorded.
 - Rows go to `llmhub.db` next to `config.yaml` (`/data/llmhub.db` in the container), WAL mode;
   `REQUEST_LOG_DB` overrides the path, `REQUEST_LOG_RETENTION_DAYS` (default 30, 0 = keep forever) controls
   pruning.
@@ -1258,11 +1284,12 @@ Every request occupies one row in the `requests` table, covering request paramet
   queue drops rows and logs a warning.
 - Request/response bodies are truncated to 8 KB, and `authorization`, `api_key`, `token`, `password` and
   similar fields are replaced with `***` before they are stored.
-- **`HEAD` requests are forwarded but not logged**: they carry no bodies, and uptime probes send them
-  constantly, so recording them would only bury real calls. Forwarding is unchanged; the only gate is
-  `logging_on = self._logging_on(cfg) and method != "HEAD"`. The catch-all accepts `HEAD` (it is one of
-  `HTTP_METHODS`); there is no global method gate any more. On the public zone a `HEAD` still has to appear
-  as a method+path pair in `security.public.path_allowlist` or it is 404.
+- **`HEAD` and `OPTIONS` are forwarded but not logged**: they carry no bodies, and uptime probes / CORS
+  pre-flights send them constantly, so recording them would only bury real calls. Forwarding is unchanged;
+  both the proxy and the middleware exclude them with `method not in ("HEAD", "OPTIONS")`. The catch-all
+  accepts `HEAD` (it is one of `HTTP_METHODS`); an `OPTIONS` pre-flight is answered by the middleware with a
+  bodyless `204`. There is no global method gate any more. On the public zone a `HEAD` / `OPTIONS` still has
+  to appear as a method+path pair in `security.public.path_allowlist` or it is 404.
 
 **Caller API keys (stored in SQLite, implemented in `app/key_store.py`):**
 
@@ -1402,7 +1429,7 @@ capture all behave exactly as they do for an external caller, so the page shows 
 `security.public.path_allowlist` enforcement) and cookie-only on the internal zone — a gateway key never
 opens it. The single exception is `security.public.admin_endpoints: allow`, which routes `/admin*` and
 `/v1/management/*` on the public listener (prefix rule, not allowlist) while still demanding the session
-cookie. On the internal zone it is still subject to `security.allowed_client_ips` and `security.rate_limit`.
+cookie. On the internal zone it is still subject to `security.rate_limit`.
 The console is read-only: it exposes no write endpoint for `config.yaml`. Two
 groups of endpoints **do** send real requests outward: the speed test (`/bench`) additionally writes to
 `bench_results`, and the API tester (`/api-test`) only writes a request-log row like any other call — neither
@@ -1494,7 +1521,7 @@ Every error response follows one shape:
 |--------|----------|------|
 | `400` | Bad Request | Invalid JSON, a missing required field, or a malformed request |
 | `401` | Unauthorized | No API key supplied |
-| `403` | Forbidden | Invalid API key, IP outside `security.allowed_client_ips`, or a blocked endpoint |
+| `403` | Forbidden | Invalid API key or a blocked endpoint |
 | `404` | Not Found | Unknown endpoint, a path outside the gateway's forwardable set (both zones, see [Callable paths and refusals](#callable-paths-and-refusals)), a public-zone method+path not in `security.public.path_allowlist` (with or without a key), or the model was not found |
 | `405` | Method Not Allowed | A POST-only endpoint was called with a non-POST method. This comes from the catch-all's `POST_ONLY_PATHS` guard (`/v1/rerank`, `/rerank`, `/api/rerank`, `/v1/systemone`, `/v1/tools/web-search`, `/api/generate`, `/api/chat`, `/v1/chat/completions`, `/v1/completions`, `/api/embed`, `/v1/embeddings`, `/v1/messages`, `/v1/message`), which sends `Allow: POST` instead of proxying the call upstream. There is no global method allowlist; a wrong method on any other path in the public zone is 404 because that method+path pair is not listed |
 | `413` | Request Entity Too Large | Body exceeds the size limit (32 MB by default) |

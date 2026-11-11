@@ -7,6 +7,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (2026-11-11: `allow_query_api_key` and `trusted_proxies` removed)
+
+Both knobs had exactly one useful value in practice (`false` / `[]`), so keeping them in
+config suggested a switch that never existed. They are now fixed behaviour:
+
+- **Caller keys are header-only by construction.** `extract_api_key()` lost its `allow_query`
+  argument and never reads `?api_key=`. `sanitize_query()` still masks a key in a URL, because
+  clients send one by mistake and it must not be persisted in plaintext.
+- **Forwarded headers are never honoured.** `auth.client_ip()`, `ip_allowed()`, the XFF-chain
+  parser and the `trusted_proxies` CIDR validator are deleted; `peer_ip()` (the real TCP peer)
+  is used directly for rate-limit buckets and request-log audit rows in `main.py`, `proxy.py`
+  and `management.py`. `serve.py` still uses `proxy_headers=False`, and `peer_ip()` still refuses
+  the port-0 rewrite fingerprint left by `ProxyHeadersMiddleware`.
+- **Old config files keep loading.** `_migrate_legacy_security()` strips both keys with a
+  startup warning, so a stale non-default value (e.g. `trusted_proxies: [10.0.0.0/8]`) cannot
+  look like an active setting.
+
+Deployment note: if the public port ever sits behind nginx, every request shares one TCP peer,
+so `rate_limit.by: ip` would have a single bucket — use `by: key` or throttle at the proxy.
+`security.rate_limit` itself is unchanged (still disabled by default).
+
+`tests/verify_security.py::test_retired_security_knobs` asserts the fields, defaults and example
+config are clean, old values are ignored, `?api_key=` → 401 while headers still work, and a
+forged XFF/X-Real-IP chain cannot change `peer_ip()` or the zone. Suite now has 200 checks.
+
+### Added (2026-11-11: inference concurrency gate protects local model backends)
+
+High request volume is normal traffic, so the gateway now **paces** it instead of
+rejecting it. New `app/http_clients.py` builds two outbound httpx pools:
+
+- `inference_client` (used by `proxy.py`, `messages.py`, `rerank.py`) is capped at
+  `server.max_concurrency` (default **4**; previously that field merely sized a
+  64-connection shared pool). httpcore queues excess requests; a streaming response
+  holds its slot until its last chunk, bounding simultaneous generation jobs and
+  VRAM use. No 429 is involved.
+- `client` (System One, web search, discovery probes, management API) stays on a
+  larger ungated pool, so a busy model cannot make the console show upstreams as down.
+
+`server.upstream_queue_timeout` (default 120s) caps the wait: an `httpx.PoolTimeout`
+becomes **503 + `Retry-After: 5`** rather than a 502. Every inference call now passes
+an `httpx.Timeout` object — a bare float would silently drop the `pool` value.
+Both fields are startup-only (restart to change). `security.rate_limit` is unchanged
+and orthogonal: it rejects abuse with 429; the gate only paces legitimate traffic.
+
+`tests/verify_security.py::test_inference_concurrency_gate` asserts the pool limits,
+that a burst of 8 is queued without loss and never exceeds the cap at the backend,
+that a tiny queue timeout raises `PoolTimeout`, and that buffered and streaming calls
+both map it to 503.
+
+### Changed (2026-11-11: client-IP allowlist removed; admin sessions get a per-session salt)
+
+Two small hardening changes after the security-audit review.
+
+- **`security.allowed_client_ips` is gone.** With separate internal/public sockets the zone
+  split is the access-control boundary: the public listener always requires a caller key and
+  no client address grants a privilege. Removed the field, its CIDR validator, the default
+  config dict entry, the `authorize()` fence and the middleware's step 3 (403). `ip_allowed()`
+  and `client_ip()` stay — `trusted_proxies` still uses them to pick the rightmost untrusted
+  XFF hop for rate-limit buckets and request-log audit rows. Old config files that still carry
+  the key keep loading (unknown fields are ignored).
+- **Console session cookies now carry a per-session salt.** The token changed from
+  `<expiry>.<sig>` to `<sid>.<expiry>.<sig>`, and the signing key is
+  `HMAC-SHA256(key=process_seed, msg=ADMIN_PASSWORD + sid)` where `process_seed` is 32 random
+  bytes generated at import time, never persisted and never logged. A stolen cookie no longer
+  lets an attacker brute-force `ADMIN_PASSWORD` offline, and every session has its own key.
+  Changing the password **or restarting the process** invalidates every outstanding session.
+  Logout still only clears the browser cookie (there is no server-side session table).
+  `tests/smoke_test.py` now asserts that a cookie signed with the old
+  `ADMIN_PASSWORD`-only algorithm is rejected.
+
+### Changed (2026-11-11: the status pie now has three buckets, and model labels prefer aliases)
+
+Two pieces of feedback on the Dashboard pies: the status chart was a single green `ok` disc
+even though the database held plenty of 4xx rows, and the model chart showed verbose resolved
+ids (`bge-m3:latest`) instead of the configured short names.
+
+- **4xx was recorded all along — it was just folded into `ok`.** The old
+  `_DISTRIBUTION_KEYS["status"]` was `CASE WHEN status >= 500 THEN 'error' ELSE 'ok' END`, so
+  every 2xx/3xx/4xx row landed in the same green bucket and only a 5xx could paint a second
+  slice. On the local database, 22 of 46 rows are 403/404 (15 inside `API_PATH_SCOPE`), but the
+  chart still showed one solid `ok` disc. `status` now splits into **`ok` (2xx)**, **`failed`
+  (>= 500)** and **`warning` (3xx / 4xx / NULL / anything else)**; the frontend colours them
+  green / red / amber. `failed` deliberately keeps the >= 500 threshold, so the red slice still
+  agrees with `error_rate`, the timeseries error bars and `/stats/failures` — only `warning` is new.
+- **By-model labels are alias-first.** `GET /stats/distribution?group_by=model` now returns a
+  `display` field per item from the new `management._display_by_model()`: an
+  `upstreams[].model_aliases` short name wins (`bge-m3` over `bge-m3:latest`), otherwise the real
+  id. Root `aliases:` entries are models of their own and never relabel their target. `key` stays
+  the resolved model id, so the Requests-page filter and the pie's `colorFor` (which switches on
+  `key`) are unchanged. The Vue `pieOption()` renders `display || key`; the chart titles now say
+  "success / warning / failure".
+- **Tests**: `test_management.py` replaces the two-bucket assertions with three-bucket checks
+  (`failed` == 5xx, 4xx lands in `warning`, the three buckets cover the whole window) plus
+  by-model `display` checks (alias wins, root alias does not rename, unaliased models keep their id).
+- **Docs**: `API` / `API_CN` / `TESTCASES` / `USAGE` / `USAGE_CN` / `AGENTS` and the
+  web-management implementation notes. The console bundle in `app/web` is rebuilt; the running
+  gateway still needs a restart to pick up both backend changes.
+
+### Fixed (2026-11-11: standalone handlers and middleware refusals were missing from Requests)
+
+The Requests view only showed calls that reached `ProxyService.forward`. Looking at the SQLite
+table made the gap obvious: rows existed for `/v1/chat/completions`, `/api/generate` and `/api/embed`,
+but nothing for `/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`, `/v1/messages`, `/v1/models`
+or `/api/tags`/`/api/ps` — those are in-process handlers that never touch the proxy. Worse, a request
+the security middleware refused before `call_next` (an unauthenticated public-zone call, an
+off-allowlist scan) wrote nothing at all, so the very traffic worth auditing was invisible.
+
+- **A second writer in the security middleware.** Metadata-only rows are now queued for every
+  in-process handler and every middleware refusal (public 401/404, rate limit 429, body cap 413).
+  `request_log.basic_entry()` builds them with explicit arrival wall-clock `ts` and
+  `perf_counter` duration; bodies/tokens/`model`/`upstream` are `NULL`, but `error` keeps the denial
+  reason, so `Missing API key: POST /v1/systemone` is now visible in the console. The switch
+  `request_log.enabled` is read by both writers, and a claim flag on the shared ASGI scope
+  (`request.state.request_log_claimed`) keeps a proxied call from being written twice — vital for
+  streams, whose rich row lands in the body iterator's `finally` after the middleware returned.
+  `deny()` centralises "record then reject" so no refusal branch can skip logging.
+- **Control-plane and probe noise stays out.** `/v1/management/*`, `/admin*`, docs and static assets
+  are never written (the console polls them continuously); `HEAD` and `OPTIONS` are forwarded /
+  pre-flighted but never recorded. `API_PATH_SCOPE` still limits lists/charts/KPIs to `/v1/%` and
+  `/api/%`, so a non-API row such as `/health` is stored but does not skew the statistics.
+- **Rerank checked and covered.** `/v1/rerank` is a standalone `RerankService.handle()` handler, not a
+  proxy forward — it is now one of the metadata-only cases, verified by a bad-body request landing in
+  the table.
+- **Tests**: `verify_security.py` gains `test_request_log_coverage()` — 24 new checks (suite
+  **156 → 180**) covering standalone handlers, exactly-one-row proxy calls, no `HEAD`/`OPTIONS`
+  rows, metadata-only fields, denial reasons, management-path exclusion and the off switch. Other
+  suites unchanged at 229 / 100 / 414. Docs `CONFIG`, `USAGE`, `API` / `API_CN` and `TESTCASES`
+  (EN + ZH) now describe the two writers and the exclusions.
+- **Restart required**: the running gateway must be restarted to pick up the middleware writer.
+
+### Fixed (2026-11-10: `Environment variable  is not set` from `/v1/systemone`)
+
+The blank is not a missing key value — it is the **variable name**: the instance that emitted this
+had `systemone.api_key_env: ''`. `os.getenv("", "")` returns `""`, so the request was forwarded
+unsigned and `systemone.py` logged the empty name as if an env variable had been looked up. Checked
+the running local gateway through the read-only management API: its `api_key_env` is
+`SYSTEMONE_SERVER_API_KEY` **and** the key is present in its process environment, so this line came
+from a *different* deployment/config file, not from the local instance.
+
+- **Unsigned-by-design is now told apart from a missing named key.** New `systemone.backend_key()`
+  returns `(Authorization value, unsigned reason)`. An empty `api_key_env` (valid for an Ollama
+  0.40+ backend, which ignores `Authorization`) produces **no** per-request warning and **one**
+  startup warning naming the setting; a *named* variable that is unset still warns per request,
+  now with the actual name (`Environment variable SYSTEMONE_SERVER_API_KEY is not set`).
+- **Startup is explicit about both cases**: `backend key from $NAME (set)` / `backend key from $NAME
+  (NOT set - forwarding unsigned)` is now a WARNING when the named key is missing, instead of a
+  quiet INFO line; with an empty name it says `UNSIGNED: systemone.api_key_env is empty (set it to
+  SYSTEMONE_SERVER_API_KEY if the backend requires a key...)`.
+- **Tests**: `test_gateway_new.py` adds 5 checks covering all three states (signed, empty name,
+  named-but-unset) plus captured log messages (suite **95 → 100**); CONFIG 双语 now documents the
+  empty-name mode.
+
 ### Fixed (2026-11-10: every log line now carries a timestamp)
 
 uvicorn installs its own logging configuration when it starts, which replaces `logging.basicConfig()`

@@ -235,7 +235,8 @@ YAML key is silently ignored, `rerank.endpoint` is a label only, a `- ''` placeh
 | `host` / `port` | `0.0.0.0` / `8000` | Listen address & port |
 | `log_level` | `info` | `debug` / `info` / `warning` / `error` |
 | `request_timeout` | `600` | Default upstream timeout (seconds) |
-| `max_concurrency` | `64` | HTTP connection-pool cap |
+| `max_concurrency` | `4` | Inference concurrency gate: max in-flight requests to model backends; excess is **queued, not rejected** (single GPU: 1~2) |
+| `upstream_queue_timeout` | `120` | Max queue wait (seconds) before `503 + Retry-After` |
 
 ### `security` — zones, authentication & hardening
 
@@ -312,7 +313,7 @@ security:
   first key at `/admin`.
 
 The remaining `security.*` keys (`blocked_paths`, `cors_origins`, `max_body_bytes`,
-`allow_query_api_key`, `allowed_client_ips`, `trusted_proxies`, `rate_limit`)
+`rate_limit`)
 are shared hardening applied to **both** zones; the table is in
 [Security](#security-must-read-for-public-exposure) and every field with its default is in
 [CONFIG.md](CONFIG.md#security).
@@ -684,22 +685,31 @@ request_log:
 Feeds the console's "Requests" view: every call through the gateway becomes one SQLite row
 (`llmhub.db`, WAL).
 
-- `enabled`: the write switch, read **per request**, default `true`. With `false` the proxy stops
-  capturing request/response bodies and writes no row at all; because the flag is re-read on every
+- `enabled`: the write switch, read **per request**, default `true`. With `false` neither the proxy
+  nor the security middleware writes a row or copies a body; because the flag is re-read on every
   request, saving `config.yaml` applies without a restart — hot reload polls the file mtime at most
   once per second, so the switch takes effect within ~1s (verified against a live server)
 - While it is off, `/v1/management/overview` and `/requests` report `request_log.enabled: false`,
   so the console can say "logging disabled" instead of showing an empty list that looks like no traffic
 - Database path and retention stay deployment-level environment variables: `REQUEST_LOG_DB`,
   `REQUEST_LOG_RETENTION_DAYS`
-- **`HEAD` is forwarded but never recorded**: it carries no body and no answer, and liveness
-  monitors send it continuously, so logging it would drown the real calls. The catch-all accepts
-  `HEAD` through its `HTTP_METHODS` (there is no global method allowlist any more), so it is
-  forwarded normally, just without a row
+- **`HEAD` and `OPTIONS` are forwarded but never recorded**: they carry no body and no answer, and
+  liveness monitors / CORS pre-flights send them continuously, so logging them would drown the real
+  calls. The catch-all accepts both through its `HTTP_METHODS` (there is no global method allowlist
+  any more), so they are forwarded normally, just without a row
+- **Every API call gets exactly one row.** Two writers cover the whole surface, coordinated by a
+  claim flag on the ASGI scope: `ProxyService.forward` writes the **rich** row (request/response
+  bodies, token usage, resolved `model`, `upstream`, `stream`) for proxied calls; the security
+  middleware writes a **metadata-only** row for anything that bypasses the proxy — the standalone
+  in-process handlers (`/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`, `/v1/messages`,
+  `/v1/models`, `/api/tags`, `/api/ps`) and every rejected request (public-zone 401/404, rate limit
+  429, body cap 413). A rejected request's `error` column carries the denial reason,
+  so a scan or a missing-key caller is auditable. Body/token/upstream columns stay `null` on
+  metadata-only rows. `/v1/management/*`, `/admin/*`, docs and static assets are control-plane
+  noise and are not written at all, so the console polling itself never inflates the log.
 - **Statistics count API calls only**: the list, the charts, the KPIs and the failure view all add
-  `path LIKE '/v1/%' OR path LIKE '/api/%'` (`request_log.API_PATH_SCOPE`), so `/health`, `/metrics`,
-  `/openapi.json` and the `/admin/*` asset requests cannot dilute the numbers. Rows for those paths
-  are still **written** — nothing is thrown away, and `GET /requests/{id}` deliberately stays
+  `path LIKE '/v1/%' OR path LIKE '/api/%'` (`request_log.API_PATH_SCOPE`), so a non-API path that
+  still reaches the log cannot dilute the numbers. `GET /requests/{id}` deliberately stays
   unscoped, so a deep link to any row still opens
 - Recorded columns: `ts` / `ts_end` / `duration_ms` / `ttfb_ms` (timing — `ts` and `ts_end` are
   second precision, so read `duration_ms` for sub-second cost), `method` / `path` /
@@ -840,7 +850,7 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
 | `GET /v1/management/models/{llm,rerank,systemone}` | Per-upstream model inventory built from `config.yaml` declarations, with runtime device and memory where the instance reports them (LLM; hosted rows report `device: "cloud"`; a root `aliases:` entry is its own row carrying `derived` / `target` / `params` / `description`, and `aliases[].kind` tells a `rename` from a `derived` model), plus read-only config projections (Rerank / System One); API keys always masked as `••••••` |
 | `GET /v1/management/tools/websearch` | Web search config projection, with `base_url` derived from the provider upstream |
 | `GET /v1/management/requests[/{id}]` | Request log with time/upstream/model/status/path filters, pagination and per-entry detail |
-| `GET /v1/management/stats/{timeseries,distribution,failures}` | Hourly/daily counts, P95 and error counts; grouped counts per upstream / model / ok-vs-error for the three pie charts; failure breakdown by status and upstream |
+| `GET /v1/management/stats/{timeseries,distribution,failures}` | Hourly/daily counts, P95 and error counts; grouped counts per upstream / model / status for the three pie charts — `status` is now `ok` (2xx) / `warning` (3xx, 4xx, other) / `failed` (≥ 500), and by-model items carry an alias-priority `display`; failure breakdown by status and upstream |
 | `GET /v1/management/api-test/models` | Per-family model choices for the API testers (`api_models` narrowed; the Ollama-native `generate` / `embed_ollama` kinds keep `type: "ollama"` rows only), each row carrying `display` / `alias` / `upstream` / `running` / `device` and the masked upstream key, plus `default_model`, `free_model`, `enabled` and the masked provider key with its env-var name; the whole payload probes every upstream, so the console caches it and only refetches on **Re-probe** |
 | `POST /v1/management/api-test` | `{kind, body}` — execute that request server-side through the endpoint's own gateway service and return `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` → `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`; a `kind` outside the allowlist or a missing model for a family that needs one is `400`, and a gateway refusal comes back as data, not as a hidden failure |
 | `POST /v1/management/bench` | Start a speed test: `{upstream, model, rounds?, max_tokens?, think?}` → `{job_id, status: "pending"}`. Runs on its own thread + event loop, so closing the browser does not cancel it |
@@ -858,10 +868,12 @@ to be used instead, and `client*` when a reasoning channel leaked into the strea
 TTFT). `think: auto` keeps the model's default thinking behaviour; `off` forces `think: false`.
 Results land in the same `llmhub.db` as the request log, through the same batched write queue.
 
-**Request log storage:** every forwarded call (streaming, non-streaming, upstream failure) is
-appended to SQLite in WAL mode, by default `llmhub.db` next to `config.yaml`
+**Request log storage:** every API call is appended to SQLite in WAL mode — proxied calls
+(streaming, non-streaming, upstream failure) as full rows, and the in-process handlers plus
+middleware refusals as metadata-only rows — by default `llmhub.db` next to `config.yaml`
 (`/data/llmhub.db` in the container). Set `request_log.enabled: false` in `config.yaml` to stop
-writing altogether — the switch is read per request, so it applies without a restart.
+writing altogether — the switch is read per request by both writers, so it applies without a
+restart.
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
@@ -902,7 +914,7 @@ All error responses follow a consistent format:
 |-------------|-------|-------------|
 | `400` | Bad Request | Invalid JSON, missing required fields, or malformed request |
 | `401` | Unauthorized | Missing API key (when auth is enabled) |
-| `403` | Forbidden | Invalid API key, IP outside `allowed_client_ips`, or a gateway API path blocked by `security.blocked_paths` / the public `admin_endpoints` filter |
+| `403` | Forbidden | Invalid API key, or a gateway API path blocked by `security.blocked_paths` / the public `admin_endpoints` filter |
 | `404` | Not Found | A path outside the gateway's API (both zones), an unlisted public method+path, or a model no upstream serves |
 | `405` | Method Not Allowed | Non-POST on a POST-only route (`/v1/rerank`, `/api/generate`, `/api/chat`, `/v1/chat/completions`, ...); the response carries `Allow: POST` |
 | `413` | Request Entity Too Large | Request body exceeds `security.max_body_bytes` (default 32MB) |
@@ -1305,10 +1317,13 @@ apply to both zones:
 | `blocked_paths` | `[]` | Extra path prefixes to block, e.g. `["api/show"]` or `["api/*"]` — applies in both zones, and answers **403** only for a path that is part of the gateway API; an undeclared path is already **404** |
 | `cors_origins` | `[]` | Explicitly allowed cross-origin sources; empty means no CORS headers at all. A pre-flight is answered with a bodyless `204`, and on the public socket only when `OPTIONS` is listed for that path in `security.public.path_allowlist` |
 | `max_body_bytes` | `33554432` | Request-body cap (32 MiB); `Content-Length` is rejected before any byte is read, chunked bodies counted while streaming, so an oversized POST returns 413 without landing in memory |
-| `allow_query_api_key` | `false` | Whether to accept `?api_key=` (off by default, avoids keys in logs / browser history) |
-| `allowed_client_ips` | `[]` | Client-IP fence (CIDR, e.g. `10.0.0.0/8`); empty = unrestricted. Judged from the real TCP peer / `client_ip()`, never a forged `X-Forwarded-For` |
-| `trusted_proxies` | `[]` | CIDRs whose `X-Forwarded-For` may set `client_ip()` for the IP fence, rate-limit buckets and audit rows. `client_ip()` takes the **rightmost hop that is not a trusted proxy**, so a forged leftmost value cannot pick an internal address. **NOT a zone anchor** — it cannot move a request between internal and public |
 | `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | In-memory token-bucket limiter (single process): `by` = `ip` / `key`, `burst` = capacity, `per_minute` = refill rate; over-budget → **429** with `Retry-After`. **Enable it on any internet-facing instance** (or rate-limit at the proxy) |
+
+Credentials come from `Authorization: Bearer` / `X-API-Key` headers only — `?api_key=` is
+never a credential. `X-Forwarded-*` / `X-Real-IP` are never trusted: rate-limit buckets and
+audit rows always use the real TCP peer (`peer_ip()`). Neither behaviour is configurable
+(`allow_query_api_key` and `trusted_proxies` were removed). Behind a reverse proxy all
+requests share one IP, so prefer `rate_limit.by: key` or throttle at the proxy.
 
 `security.public.admin_endpoints` (`deny` / `readonly` / `allow`) is the one exception to
 "shared": it is enforced on the **public listener only**, and it drives both the Ollama
@@ -1353,8 +1368,11 @@ Every response also gets defensive headers by default: `X-Content-Type-Options: 
 
 The image starts through `python serve.py`, which sets uvicorn's `proxy_headers=False`. Plain
 `uvicorn main:app` lets `ProxyHeadersMiddleware` rewrite `scope["client"]` from a caller-supplied
-`X-Forwarded-For`, which used to defeat IP-based controls. Zone trust no longer depends on that
-address at all: it is the kernel-assigned **local listening port**, which a caller cannot forge.
+`X-Forwarded-For`, which used to defeat IP-based controls; `auth.peer_ip()` refuses such a
+rewritten scope (port 0). Zone trust does not depend on that address at all: it is the
+kernel-assigned **local listening port**, which a caller cannot forge. The address recorded
+for rate-limit buckets and audit rows is always the real TCP peer — no forwarded header is
+honoured, so behind a reverse proxy every caller shares one IP.
 
 Ports and zones are configured in `config.yaml` only:
 
@@ -1440,7 +1458,7 @@ no `ADMIN_PASSWORD`, no anonymous internal zone).
       imported keys exist any more; the store keeps hashes only, so protect `llmhub.db` as you
       would protect a secret file
 - [ ] A reverse proxy (Nginx / Caddy) in front terminates TLS
-- [ ] To restrict client IPs, set `security.allowed_client_ips` to trusted CIDRs (applies to both zones)
+- [ ] Restrict callers at the network layer (firewall / reverse proxy); the gateway has no client-IP allowlist — trust is the listening socket
 - [ ] Keep `security.internal.allow_anonymous: false` unless the internal port is on a trusted LAN; keep `security.internal.expose_docs: false` for a public-facing internal port. There is no IP allowlist that grants key-free access — trust is the listening socket
 - [ ] Set `security.public.port: 8001` (or `= server.port` for a public-only instance) in `config.yaml`, and keep `security.public.path_allowlist` to the minimum method+regex pairs. Start the image with `python serve.py`, never plain `uvicorn main:app`
 - [ ] Remove all legacy `LLMHUB_*` port vars from `.env` / compose; manage from the internal port / VPN (`/v1/management/*` and `/admin` are hard 404 on the public zone)

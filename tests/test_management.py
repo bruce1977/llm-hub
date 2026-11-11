@@ -915,29 +915,63 @@ def run() -> int:
             "/v1/management/stats/distribution", params={"group_by": "status", **wide}
         ).json()["items"]
         status_counts = {item["key"]: item["count"] for item in status_items}
-        check("status buckets into ok / error", set(status_counts) == {"ok", "error"}, str(status_counts))
-        # One error definition for the whole console: HTTP >= 500 only. The 403 from the
-        # blocked admin call above is a caller-side rejection and lands in `ok`; the 502 from
-        # the dead upstream is the only error, matching error_rate, timeseries and failures.
+        # Three buckets now: 2xx -> ok, >= 500 -> failed, everything else (3xx/4xx/NULL)
+        # -> warning. `failed` deliberately keeps the >= 500 threshold shared with
+        # error_rate, the timeseries error bars and `failures`.
+        check(
+            "status splits into ok / warning / failed",
+            set(status_counts) <= {"ok", "warning", "failed"} and "ok" in status_counts,
+            str(status_counts),
+        )
         failures_wide = client.get("/v1/management/stats/failures", params=wide).json()
         ts_wide = client.get("/v1/management/stats/timeseries", params=wide).json()
         four_xx = client.get(
             "/v1/management/requests", params={**wide, "status": "4xx", "page_size": 1}
         ).json()["pagination"]["total"]
         err = failures_wide["total"] - failures_wide["ok"]
-        check("status error counts only 5xx", status_counts.get("error", 0) == err, str(status_counts))
+        check("failed bucket counts only 5xx", status_counts.get("failed", 0) == err, str(status_counts))
         check(
-            "status error matches the timeseries bars",
+            "failed bucket matches the timeseries bars",
             sum(p["errors"] for p in ts_wide["points"]) == err,
             str(ts_wide["points"])[:200],
         )
-        check("4xx rows are not errors", four_xx >= 1 and status_counts.get("ok", 0) >= four_xx, str(status_counts))
+        check(
+            "4xx rows land in warning, not ok or failed",
+            four_xx >= 1 and status_counts.get("warning", 0) >= four_xx,
+            str(status_counts),
+        )
+        check(
+            "the three buckets cover the whole scoped window",
+            sum(status_counts.values()) == failures_wide["total"],
+            f"{sum(status_counts.values())} vs {failures_wide['total']}",
+        )
 
-        model_counts = {
-            item["key"]: item["count"]
-            for item in client.get("/v1/management/stats/distribution", params={"group_by": "model"}).json()["items"]
-        }
+        model_items = client.get(
+            "/v1/management/stats/distribution", params={"group_by": "model", **wide}
+        ).json()["items"]
+        model_counts = {item["key"]: item["count"] for item in model_items}
         check("model grouping uses the resolved name", model_counts.get("qwen3:8b", 0) >= 2, str(model_counts))
+        displays = {item["key"]: item.get("display") for item in model_items}
+        check("by-model items carry a display label", all(v is not None for v in displays.values()), str(displays))
+        check(
+            "a model_aliases rename wins over the real id",
+            displays.get("qwen3:8b") == "q8",
+            str(displays),
+        )
+        # `_display_by_model` only admits pure renames. The root `aliases:` entry `q35`
+        # is a model of its own and must never relabel the real id it points at.
+        from management import _display_by_model
+        helper = _display_by_model(client.app.state.manager.config)
+        check(
+            "a root aliases: entry never renames its target",
+            "q35" not in set(helper.values()),
+            str(helper),
+        )
+        check(
+            "a model without an alias keeps its own id",
+            all(v == k or (k == "qwen3:8b" and v == "q8") for k, v in displays.items()),
+            str(displays),
+        )
 
         check("invalid group_by -> 400", client.get("/v1/management/stats/distribution", params={"group_by": "client_ip"}).status_code == 400)
         empty = client.get(

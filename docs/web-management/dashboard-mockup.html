@@ -521,7 +521,7 @@
             <div id="pieModel" class="echart-box"></div>
           </div>
           <div class="echart-card">
-            <div class="card-h">成功 / 失败分布 <span class="tag">by status</span></div>
+            <div class="card-h">成功 / 警告 / 失败分布 <span class="tag">by status</span></div>
             <div id="pieStatus" class="echart-box"></div>
           </div>
         </div>
@@ -1270,8 +1270,9 @@
         {name:'qwen3.6:35b-pruned',value:410},{name:'qwen3.5:9b',value:320},{name:'qwen3-reranker:4b-rk',value:280},{name:'bge-m3',value:274}
       ]); });
       mk('pieStatus', function(){ return buildPie([
-        {name:'成功 2xx',value:1247,itemStyle:{color:'#3fb950'}},
-        {name:'失败 4xx/5xx',value:37,itemStyle:{color:'#f85149'}}
+        {name:'ok 2xx',value:1247,itemStyle:{color:'#3fb950'}},
+        {name:'warning 3xx/4xx',value:82,itemStyle:{color:'#d29922'}},
+        {name:'failed 5xx',value:37,itemStyle:{color:'#f85149'}}
       ]); });
       window.addEventListener('resize', function(){ ecCharts.forEach(function(c){ c.resize(); }); });
     }

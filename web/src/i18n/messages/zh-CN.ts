@@ -180,7 +180,7 @@ const zhCN = {
       errors: '错误',
       upstreamDist: '各 Upstream 请求分布',
       modelDist: '各 Model 请求分布',
-      statusDist: '成功 / 失败分布',
+      statusDist: '成功 / 警告 / 失败分布',
     },
   },
 

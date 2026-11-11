@@ -76,6 +76,22 @@ def _filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in _EXCLUDED_RESPONSE_HEADERS}
 
 
+def backend_key(api_key_env: str) -> tuple[str, str]:
+    """Return ``(Authorization value, unsigned reason)`` for the System One backend.
+
+    An empty ``api_key_env`` is the documented *unsigned by design* mode (e.g. an Ollama
+    0.40+ backend ignores ``Authorization``). It must not be reported as "environment
+    variable  is not set" - there is no variable name to look up. The caller logs the
+    reason only when it is non-empty.
+    """
+    if not api_key_env:
+        return "", ""
+    value = os.getenv(api_key_env, "").strip()
+    if value:
+        return f"Bearer {value}", ""
+    return "", f"Environment variable {api_key_env} is not set"
+
+
 class SystemOneService:
     def __init__(self, manager, client: httpx.AsyncClient):
         self.manager = manager
@@ -115,15 +131,16 @@ class SystemOneService:
         # Build upstream request headers.
         headers = self._build_headers(request)
 
-        # Sign the upstream request with the backend key from the environment.
-        laya_key = os.getenv(so.api_key_env, "").strip()
-        if laya_key:
-            headers["Authorization"] = f"Bearer {laya_key}"
-        else:
+        # Sign the upstream request with the backend key from the environment. An empty
+        # `api_key_env` is a valid unsigned mode, not a missing variable with a blank name.
+        authorization, unsigned_reason = backend_key(so.api_key_env)
+        if authorization:
+            headers["Authorization"] = authorization
+        elif unsigned_reason:
             logger.warning(
-                "Environment variable %s is not set; forwarding /%s to the System One "
-                "backend unsigned (only a problem if that backend requires a key).",
-                so.api_key_env,
+                "%s; forwarding /%s to the System One backend unsigned (only a problem "
+                "if that backend requires a key).",
+                unsigned_reason,
                 so.path,
             )
 

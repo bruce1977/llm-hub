@@ -277,8 +277,9 @@ export interface Timeseries {
 }
 
 export interface DistributionItem {
-  key: string
+  key: string // real model id / upstream / status bucket, used as the filter value
   count: number
+  display?: string // alias-priority label for the by-model pie; absent on other groupings
 }
 
 export interface Distribution {

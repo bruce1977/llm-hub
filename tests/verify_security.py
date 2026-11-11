@@ -6,7 +6,7 @@ Plain runner (no pytest needed)::
 
 Covers the config-driven public path allowlist, mandatory public auth, the
 internal/public listener split, shared hardening (headers, body cap, rate limit,
-IP fence, forwarding hygiene, log redaction, config masking) and the migration
+forwarding hygiene, log redaction, config masking) and the migration
 of the pre-1.3 `auth` / flat `security` schema.
 
 NOTE: CONFIG_PATH must be set *before* importing `config` (its CONFIG_PATH global
@@ -35,14 +35,13 @@ AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "app"))
 
+from auth import is_public, local_port, peer_ip, zone  # noqa: E402
+from bridge import bridge_denial  # noqa: E402
+from config import Config, SecurityConfig, build_default_config  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from main import app  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from starlette.requests import Request  # noqa: E402
-
-from auth import client_ip, is_public, local_port, peer_ip, zone  # noqa: E402
-from bridge import bridge_denial  # noqa: E402
-from config import Config  # noqa: E402
-from main import app  # noqa: E402
 
 EXAMPLE = Path("data/config.example.yaml").read_text(encoding="utf-8")
 
@@ -94,7 +93,7 @@ DEFAULT_RULES = {
 
 @contextmanager
 def client_with(*, public: bool = False, rules=None, allow_anonymous: bool = True,
-                public_cfg=None, **sec_overrides):
+                public_cfg=None, request_log=None, **sec_overrides):
     """Start the app with a fresh config.
 
     TestClient's ``scope["server"]`` port is 80. Setting ``public=True`` declares
@@ -108,6 +107,8 @@ def client_with(*, public: bool = False, rules=None, allow_anonymous: bool = Tru
     cfg["security"]["public"]["path_allowlist"] = DEFAULT_RULES if rules is None else rules
     if public_cfg is not None:  # a whole security.public node, e.g. an admin_endpoints mode
         cfg["security"]["public"] = dict(public_cfg)
+    if request_log is not None:  # a whole top-level request_log node
+        cfg["request_log"] = dict(request_log)
     cfg["security"].update(sec_overrides)
     Path(_TMP).write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     with TestClient(app, client=("127.0.0.1", 41000)) as c:  # enters lifespan -> ConfigManager
@@ -131,9 +132,18 @@ def test_rate_limit() -> None:
 
 
 def test_xff_is_not_a_decision_input() -> None:
-    with client_with(allowed_client_ips=["10.0.0.0/8"]) as c:
-        r = c.get("/health", headers={"X-Forwarded-For": "10.0.0.5"})
-        check("forged XFF cannot pass allowed_client_ips", r.status_code == 403, f"got {r.status_code}")
+    """XFF is ignored entirely; it must never grant or deny access."""
+    with client_with() as c:
+        plain = c.get("/health").status_code
+        forged = c.get(
+            "/health", headers={"X-Forwarded-For": "10.0.0.5", "X-Real-IP": "10.0.0.9"}
+        ).status_code
+        check("forged XFF leaves an internal decision unchanged", plain == forged == 200,
+              f"plain={plain} forged={forged}")
+    with client_with(public=True) as c:
+        r = c.get("/v1/models", headers={"X-Forwarded-For": "127.0.0.1"})
+        check("forged XFF cannot make a public call anonymous", r.status_code in (401, 403),
+              f"got {r.status_code}")
 
 
 def test_body_cap_and_retry_after() -> None:
@@ -193,6 +203,103 @@ def test_log_redaction() -> None:
     check("oversized body is still redacted before truncation", truncated and "SECRET-PLAIN" not in text, text[:120])
     q = sanitize_query("q=hello&api_key=SECRET&token=ABC")
     check("query-string credentials are masked", bool(q) and "SECRET" not in q and "ABC" not in q and "q=hello" in q, str(q))
+
+
+def test_request_log_coverage() -> None:
+    """Every API call lands in the request log exactly once: proxy, standalone handlers
+    and middleware denials. HEAD/OPTIONS probes and console traffic stay out.
+
+    Before the middleware wrote a metadata fallback, only ``ProxyService.forward``
+    produced rows, so ``/v1/systemone``, ``/v1/tools/web-search``, ``/v1/rerank``,
+    ``/v1/messages``, ``/v1/models``, ``/api/tags`` and ``/api/ps`` (all standalone
+    handlers) were invisible, as were every public-zone 401/404 refused in the middleware.
+    """
+    import sqlite3
+
+    log_db = f"{_TMP}.requests.db"
+    saved_db = os.environ.get("REQUEST_LOG_DB")
+    os.environ["REQUEST_LOG_DB"] = log_db
+    Path(log_db).unlink(missing_ok=True)
+    seed_api_keys(API_KEY)
+
+    def read_rows() -> list[dict]:
+        # client_with()'s lifespan shutdown calls RequestLog.stop(), which drains the
+        # queue via join(), so every row is committed by the time the with-block exits.
+        con = sqlite3.connect(log_db)
+        con.row_factory = sqlite3.Row
+        try:
+            cols = {row[1] for row in con.execute("PRAGMA table_info(requests)")}
+            wanted = [c for c in ("path", "method", "status", "error", "duration_ms", "model", "upstream",
+                                  "request_body", "response_body", "tokens") if c in cols]
+            return [dict(r) for r in con.execute(f"SELECT {', '.join(wanted)} FROM requests ORDER BY id")]
+        finally:
+            con.close()
+
+    try:
+        # --- internal zone: standalone handlers + proxy + probes -----------------
+        with client_with() as c:
+            check("standalone GET /v1/models", c.get("/v1/models").status_code == 200)
+            check("standalone POST /v1/rerank (bad body)", c.post("/v1/rerank", json={}).status_code >= 400)
+            check("standalone GET /api/tags", c.get("/api/tags").status_code == 200)
+            check("standalone GET /api/ps", c.get("/api/ps").status_code == 200)
+            check("standalone GET /health", c.get("/health").status_code == 200)
+            # proxy path: no upstream reachable -> 502, but it must still be recorded once
+            check("proxy POST /v1/chat/completions",
+                  c.post("/v1/chat/completions", json={"model": "missing:latest", "messages": []}).status_code >= 400)
+            c.head("/v1/models")
+            c.options("/v1/models")
+        rows = read_rows()
+        paths = [r["path"] for r in rows]
+        check("standalone /v1/models recorded", "/v1/models" in paths, str(paths))
+        check("standalone /v1/rerank recorded", "/v1/rerank" in paths, str(paths))
+        check("standalone /api/tags recorded", "/api/tags" in paths, str(paths))
+        check("standalone /api/ps recorded", "/api/ps" in paths, str(paths))
+        check("standalone /health recorded", "/health" in paths, str(paths))
+        check("proxy /v1/chat/completions recorded once", paths.count("/v1/chat/completions") == 1, str(paths))
+        check("HEAD /v1/models never recorded", not any(r["method"] == "HEAD" for r in rows), str(paths))
+        check("OPTIONS /v1/models never recorded", not any(r["method"] == "OPTIONS" for r in rows), str(paths))
+        check("a middleware-independent row has timing but no phantom model",
+              all(r["duration_ms"] is not None for r in rows), str(rows[:1]))
+
+        # metadata-only rows carry no body/token/model; the proxy row keeps its rich fields.
+        standalone = [r for r in rows if r["path"] in ("/v1/models", "/health", "/api/tags", "/api/ps")]
+        check("standalone rows are metadata-only",
+              all(r.get("model") is None and r.get("upstream") is None
+                  and r.get("request_body") is None and r.get("tokens") is None for r in standalone),
+              str(standalone[:1]))
+        proxy_rows = [r for r in rows if r["path"] == "/v1/chat/completions"]
+        check("proxy row keeps upstream/model",
+              bool(proxy_rows) and all(r.get("upstream") and r.get("model") for r in proxy_rows),
+              str(proxy_rows))
+
+        # --- public zone: refused calls are auditable ---------------------------
+        public_rules = {"GET": [r"^/v1/models$"], "POST": [r"^/v1/systemone$"]}
+        with client_with(public=True, rules=public_rules) as c:
+            check("public POST /v1/systemone without key is 401",
+                  c.post("/v1/systemone", json={}).status_code == 401)
+            check("public unlisted path is 404", c.get("/api/never").status_code == 404)
+        rows = read_rows()
+        denied = [r for r in rows if r["path"] == "/v1/systemone" and r["status"] == 401]
+        check("public 401 refusal recorded", len(denied) >= 1, str(rows[-4:]))
+        check("public 401 carries the denial detail",
+              bool(denied[0].get("error")) if denied else False, str(denied[:1]))
+        check("public 404 refusal recorded", any(r["path"] == "/api/never" and r["status"] == 404 for r in rows), str(rows[-4:]))
+        check("management polling is NOT self-logged",
+              not any(r["path"].startswith("/v1/management") for r in rows), str([r["path"] for r in rows]))
+
+        # --- request_log.enabled=false records nothing --------------------------
+        Path(log_db).unlink(missing_ok=True)
+        with client_with(request_log={"enabled": False}) as c:
+            c.get("/v1/models")
+            c.get("/health")
+        rows = read_rows()
+        check("enabled=false: no standalone rows", not any(r["path"] in ("/v1/models", "/health") for r in rows), str(rows))
+    finally:
+        if saved_db is None:
+            os.environ.pop("REQUEST_LOG_DB", None)
+        else:
+            os.environ["REQUEST_LOG_DB"] = saved_db
+        Path(log_db).unlink(missing_ok=True)
 
 
 def test_log_timestamps() -> None:
@@ -520,9 +627,9 @@ def test_public_only_instance() -> None:
 
 
 # 3. zone classification (pure functions) ------------------------------------
-def _raw_request(client, server, headers=None, *, public_port=None, trusted_proxies=()):
+def _raw_request(client, server, headers=None, *, public_port=None):
     """Build a bare ASGI Request without a running server, for pure-function checks."""
-    security = SimpleSecurity(public_port=public_port, trusted_proxies=list(trusted_proxies))
+    security = SimpleSecurity(public_port=public_port)
     fake_app = SimpleNamespace(
         state=SimpleNamespace(manager=SimpleNamespace(config=SimpleNamespace(security=security)))
     )
@@ -537,9 +644,8 @@ def _raw_request(client, server, headers=None, *, public_port=None, trusted_prox
 
 
 class SimpleSecurity:
-    def __init__(self, *, public_port, trusted_proxies):
+    def __init__(self, *, public_port):
         self.public = SimpleNamespace(port=public_port)
-        self.trusted_proxies = trusted_proxies
 
 
 def test_zone_uses_kernel_socket_not_headers() -> None:
@@ -547,7 +653,6 @@ def test_zone_uses_kernel_socket_not_headers() -> None:
                         {"X-Forwarded-For": "192.168.10.5"}, public_port=8001)
     check("local_port reads the kernel-assigned listener", local_port(real) == 8000)
     check("peer_ip keeps the real TCP peer despite a forged XFF", peer_ip(real) == "203.0.113.7")
-    check("client_ip ignores XFF from an undeclared proxy", client_ip(real) == "203.0.113.7")
     check("a declared internal socket is the internal zone", zone(real) == "internal")
     check("is_public agrees with zone()", is_public(real) is False)
 
@@ -563,11 +668,45 @@ def test_zone_uses_kernel_socket_not_headers() -> None:
     check("peer_ip rejects an XFF-rewritten scope (port 0)", peer_ip(polluted) is None)
 
     forged = _raw_request(("127.0.0.1", 41000), ("0.0.0.0", 8000),
-                          {"X-Forwarded-For": "192.168.10.5, 167.104.161.192"},
-                          public_port=8001, trusted_proxies=["127.0.0.1/32"])
-    check("client_ip takes the rightmost untrusted hop", client_ip(forged) == "167.104.161.192",
-          str(client_ip(forged)))
+                          {"X-Forwarded-For": "192.168.10.5, 167.104.161.192",
+                           "X-Real-IP": "10.0.0.9"}, public_port=8001)
+    check("a full forged XFF/X-Real-IP chain cannot change the recorded address",
+          peer_ip(forged) == "127.0.0.1", str(peer_ip(forged)))
     check("forged XFF cannot change the zone", zone(forged) == "internal")
+
+
+def test_retired_security_knobs() -> None:
+    """`allow_query_api_key` / `trusted_proxies` are gone: caller keys are
+    header-only, forwarded headers are ignored, and old config files still load.
+    """
+    fields = SecurityConfig.model_fields
+    check("allow_query_api_key is no longer a config field", "allow_query_api_key" not in fields)
+    check("trusted_proxies is no longer a config field", "trusted_proxies" not in fields)
+    defaults = build_default_config()["security"]
+    check("the default config no longer emits either knob",
+          "allow_query_api_key" not in defaults and "trusted_proxies" not in defaults)
+    check("the example config no longer emits either knob",
+          "allow_query_api_key" not in EXAMPLE and "trusted_proxies" not in EXAMPLE)
+
+    # An old config file with non-default values must not silently resurrect the knobs.
+    legacy = Config(**{"security": {"allow_query_api_key": True,
+                                    "trusted_proxies": ["10.0.0.0/8"]}})
+    check("old configs carrying retired keys still parse",
+          not hasattr(legacy.security, "allow_query_api_key")
+          and not hasattr(legacy.security, "trusted_proxies"))
+
+    with client_with(public=True, allow_query_api_key=True,
+                     trusted_proxies=["127.0.0.1/32"]) as c:
+        qs = c.get("/v1/models", params={"api_key": API_KEY})
+        check("?api_key= is never accepted as a credential", qs.status_code == 401,
+              f"got {qs.status_code}: {qs.text[:120]}")
+        check("the Authorization header still works",
+              c.get("/v1/models", headers=AUTH_HEADERS).status_code == 200)
+        with_xff = c.get("/v1/models", headers={**AUTH_HEADERS,
+                                                "X-Forwarded-For": "10.0.0.5",
+                                                "X-Real-IP": "10.0.0.9"})
+        check("forwarded headers never change an authenticated call", with_xff.status_code == 200,
+              f"got {with_xff.status_code}")
 
 
 # 4. internal zone + legacy migration ----------------------------------------
@@ -684,6 +823,121 @@ def test_config_security() -> None:
         os.environ.pop("ADMIN_PASSWORD", None)
 
 
+def test_inference_concurrency_gate() -> None:
+    """High request volume is QUEUED, not rejected: at most `max_concurrency`
+    requests are in flight against model backends, the rest wait for a free slot.
+
+    Control-plane traffic (System One, web search, probes) uses a separate pool,
+    so a busy model never makes the console report every upstream as offline.
+    """
+    import asyncio
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from unittest.mock import AsyncMock
+
+    import httpx
+    from http_clients import build_clients, inference_timeout
+
+    expected_limit = int(yaml.safe_load(EXAMPLE)["server"]["max_concurrency"])
+
+    with client_with() as c:
+        cfg = app.state.manager.config
+        control = app.state.client
+        inference = app.state.inference_client
+        check("control and inference are separate pools", control is not inference)
+        check("inference pool is capped at max_concurrency",
+              inference._transport._pool._max_connections == expected_limit,
+              str(inference._transport._pool._max_connections))
+        check("control-plane pool is not gated",
+              control._transport._pool._max_connections > expected_limit,
+              str(control._transport._pool._max_connections))
+        check("model forwarding uses the gated pool",
+              all(s.client is inference for s in (app.state.proxy, app.state.rerank, app.state.messages)))
+        check("systemone / websearch use the control pool",
+              app.state.systemone.client is control and app.state.websearch.client is control)
+        check("every inference request carries the queue wait cap",
+              inference_timeout(600.0, cfg).pool == cfg.server.upstream_queue_timeout)
+
+        # A full queue is back-pressure, not an upstream failure. Cover both the
+        # buffered path (client.request) and the default streaming path (client.send).
+        app.state.proxy.client.request = AsyncMock(side_effect=httpx.PoolTimeout("busy"))
+        app.state.proxy.client.send = AsyncMock(side_effect=httpx.PoolTimeout("busy"))
+        busy = c.post("/v1/chat/completions", json={"model": "qwen3:8b", "messages": [], "stream": False})
+        check("a saturated inference queue answers 503, not 502", busy.status_code == 503, busy.text[:160])
+        check("the 503 advertises Retry-After", busy.headers.get("retry-after") == "5", str(dict(busy.headers)))
+        busy_stream = c.post("/v1/chat/completions", json={"model": "qwen3:8b", "messages": []})
+        check("a saturated queue on a streaming call also answers 503", busy_stream.status_code == 503,
+              busy_stream.text[:160])
+
+    class _SlowHandler(BaseHTTPRequestHandler):
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def do_GET(self):
+            with _SlowHandler.lock:
+                _SlowHandler.active += 1
+                _SlowHandler.peak = max(_SlowHandler.peak, _SlowHandler.active)
+            try:
+                time.sleep(0.12)
+                self.send_response(200)
+                self.send_header("content-length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            finally:
+                with _SlowHandler.lock:
+                    _SlowHandler.active -= 1
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SlowHandler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/"
+    try:
+        async def burst(client, count, *, timeout=None):
+            # A per-request Timeout object is what proxy.py / messages.py / rerank.py
+            # actually pass; it must not silently drop the pool wait cap.
+            kwargs = {} if timeout is None else {"timeout": timeout}
+            results = await asyncio.gather(
+                *(client.get(url, **kwargs) for _ in range(count)), return_exceptions=True
+            )
+            return ["timeout" if isinstance(r, httpx.PoolTimeout) else getattr(r, "status_code", repr(r))
+                    for r in results]
+
+        async def main():
+            ctl1, inf1 = build_clients(cfg)
+            try:
+                statuses = await burst(inf1, 8)
+            finally:
+                await ctl1.aclose()
+                await inf1.aclose()
+
+            tiny = SimpleNamespace(server=SimpleNamespace(
+                max_concurrency=2, request_timeout=10.0,
+                upstream_queue_timeout=0.05, upstream_keepalive_expiry=30.0))
+            ctl2, inf2 = build_clients(tiny)
+            try:
+                tiny_statuses = await burst(inf2, 6, timeout=inference_timeout(10.0, tiny))
+            finally:
+                await ctl2.aclose()
+                await inf2.aclose()
+            return statuses, tiny_statuses
+
+        statuses, tiny_statuses = asyncio.run(main())
+        check("a burst of 8 is queued, never dropped", statuses == [200] * 8, str(statuses))
+        check("at most max_concurrency requests hit the backend at once",
+              1 <= _SlowHandler.peak <= expected_limit,
+              f"peak={_SlowHandler.peak} limit={expected_limit}")
+        check("a tiny queue wait cap produces PoolTimeout instead of an endless wait",
+              "timeout" in tiny_statuses, str(tiny_statuses))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 if __name__ == "__main__":
     print("Security verification:")
     try:
@@ -694,6 +948,7 @@ if __name__ == "__main__":
         test_nul_path_and_hidden_version()
         test_forwarding_hygiene()
         test_log_redaction()
+        test_request_log_coverage()
         test_log_timestamps()
         test_config_guards()
         test_dot_segments_and_redirects()
@@ -707,9 +962,11 @@ if __name__ == "__main__":
         test_admin_endpoints_allow_opens_the_management_plane()
         test_public_only_instance()
         test_zone_uses_kernel_socket_not_headers()
+        test_retired_security_knobs()
         test_internal_anonymous_toggle()
         test_legacy_config_migration()
         test_config_security()
+        test_inference_concurrency_gate()
     finally:
         if os.path.exists(_TMP):
             os.unlink(_TMP)

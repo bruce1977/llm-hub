@@ -222,7 +222,8 @@ docker push registry.example.com/llm-hub:1.0.0
 | `host` / `port` | `0.0.0.0` / `8000` | 监听地址与端口 |
 | `log_level` | `info` | `debug` / `info` / `warning` / `error` |
 | `request_timeout` | `600` | 上游默认超时（秒） |
-| `max_concurrency` | `64` | HTTP 连接池上限 |
+| `max_concurrency` | `4` | 推理并发闸门：同时打到模型后端的请求上限，超出的**排队等空位而不是拒绝**（单卡建议 1~2） |
+| `upstream_queue_timeout` | `120` | 排队等空位的最长秒数，超时返回 `503 + Retry-After` |
 
 ### `security` —— 分区、鉴权与加固
 
@@ -292,8 +293,8 @@ security:
   表为空**且** `ADMIN_PASSWORD` 未设置（管理台无法签发）**且**没有可匿名的内网区——即系统不可能
   存在任何凭据。设置 `ADMIN_PASSWORD` 启动后，到 `/admin` 签发第一把即可
 
-其余 `security.*` 键（`blocked_paths`、`cors_origins`、`max_body_bytes`、`allow_query_api_key`、
-`allowed_client_ips`、`trusted_proxies`、`rate_limit`）是**两个区共享**的加固项，
+其余 `security.*` 键（`blocked_paths`、`cors_origins`、`max_body_bytes`、`rate_limit`）
+是**两个区共享**的加固项，
 表格见[安全](#安全公网暴露必读)，每个键的默认值见
 [CONFIG_CN.md](CONFIG_CN.md#security)。
 
@@ -597,27 +598,34 @@ request_log:
   enabled: true
 ```
 
-管理台「请求明细」页的数据来源：每笔经过网关的请求写入 SQLite（`llmhub.db`，WAL）。
+管理台「请求明细」页的数据来源：每笔 API 调用写入 SQLite（`llmhub.db`，WAL），
+含代理转发、独立 handler 与被拒请求；management / console / 文档 / 静态资源不写。
 
-- `enabled`：**逐请求读取**的写库开关，默认 `true`。改成 `false` 后代理不再采集请求/响应体，
+- `enabled`：**逐请求读取**的写库开关，默认 `true`。改成 `false` 后代与 middleware 都不再采集请求/响应体，
   也不再落任何一行明细；因为每次请求都重新读取配置，改完保存即生效（热加载，无需重启）。
   配置的 mtime 每秒最多比对一次，所以开关在约 1 秒内生效（已用真实服务实测）
 - 关闭状态下 `/v1/management/overview` 与 `/requests` 会回报 `request_log.enabled: false`，
   管理台据此提示「日志已停用」，避免空列表被误读成没有流量
 - 库路径与保留天数属于部署级配置，走环境变量：`REQUEST_LOG_DB`、`REQUEST_LOG_RETENTION_DAYS`
+- **`HEAD` 与 `OPTIONS` 会被转发但永不入库**：它们没有请求/响应体，存活探测与 CORS 预检会持续发送，
+  记进来会淹没真实调用。catch-all 通过 `HTTP_METHODS` 接受这两个方法（不再有全局方法白名单），
+  所以照常转发，只是不落行
+- **每次 API 调用恰好一行。** 两个写入方通过 ASGI scope 上的认领标记协同覆盖全部调用面：
+  `ProxyService.forward` 为代理转发写**完整行**（请求/响应体、token 用量、解析后的 `model`、`upstream`、`stream`）；
+  安全 middleware 为绕过代理的调用写**仅元数据行**——进程内独立 handler（`/v1/systemone`、
+  `/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`、`/v1/models`、`/api/tags`、`/api/ps`）以及所有被拒请求
+  （公网 401/404、IP 403、限流 429、body 413）。被拒请求的 `error` 列带拒绝原因，扫描或未带 Key 的调用都可审计。
+  仅元数据行的 body/token/upstream 字段为 `null`。`/v1/management/*`、`/admin/*`、文档与静态资源属于控制面噪音，
+  完全不入库，所以管理台自身的轮询不会撑大日志
 - **统计只计 API 调用**：明细列表、图表、KPI 与失败统计一律带上
-  `path LIKE '/v1/%' OR path LIKE '/api/%'`（`request_log.API_PATH_SCOPE`），所以 `/health`、`/metrics`、
-  `/openapi.json` 与 `/admin/*` 的资源请求不会稀释数字。这些路径的行**照样入库**（数据没有丢），
-  且 `GET /requests/{id}` 有意不加这个条件，任何一条记录的深链都还能打开
+  `path LIKE '/v1/%' OR path LIKE '/api/%'`（`request_log.API_PATH_SCOPE`），避免少数仍会入库的非 API 路径稀释数字。
+  `GET /requests/{id}` 有意不加这个条件，任何一条记录的深链都还能打开
 - 记录字段：`ts` / `ts_end` / `duration_ms` / `ttfb_ms`（时间与耗时，`ts`/`ts_end` 精确到秒，
   亚秒耗时看 `duration_ms`）、`method` / `path` /
   `query` / `requested_model` / `model` / `request_body` / `req_size` / `stream` / `client_ip`
   （请求参数）、`status` / `upstream` / `response_body` / `res_size` / `tokens_in` / `tokens_out` /
   `tokens` / `error`（响应结果，token 按输入/输出分两列存，`tokens` 是总量）；
   响应体各截断 8 KB，凭据字段写盘前替换为 `***`；旧库启动时自动 `ALTER TABLE` 补列
-- **`HEAD` 请求只转发、不记录**：它没有请求体也没有响应体，监控探活又会持续发送，记下来只会
-  淹没真实调用。catch-all 的 `HTTP_METHODS` 里包含 `HEAD`（已无全局方法白名单），
-  所以它会正常转发，只是不写明细
 
 ## Web 管理台
 
@@ -720,7 +728,7 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
 | `GET /v1/management/models/{llm,rerank,systemone}` | LLM 为按 `upstreams[].models` 声明生成的模型清单（`display`/`alias` 表达 `model_aliases` 短名、`derived`/`target`/`params`/`description` 表达根 `aliases:` 的派生模型、`wildcard` 标记通配展开的模型，含运行态设备与显存/占用；托管上游设备为 `"cloud"`），`aliases[]` 每项带 `kind`（`rename` / `derived`），Rerank / System One 为配置只读投影（API Key 一律掩码为 `••••••`） |
 | `GET /v1/management/tools/websearch` | Web Search 配置投影，`base_url` 由 provider 上游派生 |
 | `GET /v1/management/requests[/{id}]` | 请求明细（按时间/上游/模型/状态/路径筛选、分页、详情抽屉） |
-| `GET /v1/management/stats/{timeseries,distribution,failures}` | 时序聚合（每小时/每天的请求数、P95、错误数）、分组占比（上游 / 模型 / 成功失败，驱动三张实心饼图）与失败明细统计 |
+| `GET /v1/management/stats/{timeseries,distribution,failures}` | 时序聚合（每小时/每天的请求数、P95、错误数）、分组占比（三张实心饼图：上游 / 模型 / 状态）与失败明细统计。状态分三类 `ok`(2xx) / `warning`(3xx、4xx、其他) / `failed`(≥500)；按模型分组时每项带 `display`，优先显示 `model_aliases` 别名短名，`key` 仍是真实模型 id |
 | `GET /v1/management/api-test/models` | 接口测试的按家族可用模型（按 `api_models` 收窄；Ollama 原生的 `generate` / `embed_ollama` 只保留 `type: "ollama"` 的行）：每行带 `display` / `alias` / `upstream` / `running` / `device` 与掩码后的上游密钥，外加 `default_model` / `free_model` / `enabled` 和掩码后的 provider 密钥及其环境变量名；这份数据要探测所有上游，前端整站共用一份缓存，只在首次打开与点击「重新探测」时取 |
 | `POST /v1/management/api-test` | `{kind, body}`——在服务端用该端点自己的网关服务发出这一笔请求，返回 `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` → `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`；`kind` 不在白名单、或需要模型的家族没给 `model` 时是 `400`，而网关自己的拒绝（403 / 404 / 413 / 上游 4xx）作为数据返回，不会被抹平 |
 | `POST /v1/management/bench` | 启动测速：`{upstream, model, rounds?, max_tokens?, think?}` → `{job_id, status: "pending"}`。任务跑在独立线程 + 独立事件循环上，关掉浏览器也不会中断 |
@@ -1160,10 +1168,12 @@ Ollama 的 gin 解析器会严格拒绝此类请求并报 400。网关在转发�
 | `blocked_paths` | `[]` | 额外封禁的路径前缀，如 `["api/show"]` 或 `["api/*"]`——两个区都生效 |
 | `cors_origins` | `[]` | 显式允许的跨域来源；留空则完全不返回 CORS 头。预检应答是不带 body 的 `204`，且在公网端口只有当该路径的 `OPTIONS` 也列进 `security.public.path_allowlist` 时才会到达这一步 |
 | `max_body_bytes` | `33554432` | 请求体上限（32 MiB）：先按 `Content-Length` 预检，chunked 请求边读边计数，超限直接 413，不会把整个 body 读进内存 |
-| `allow_query_api_key` | `false` | 是否接受 `?api_key=` 查询参数（默认关，避免密钥进日志/浏览器历史） |
-| `allowed_client_ips` | `[]` | 客户端 IP 围栏（支持 CIDR，如 `10.0.0.0/8`），留空不限制。判定只看真实 TCP 对端 / `client_ip()`，不理可伪造的 `X-Forwarded-For` |
-| `trusted_proxies` | `[]` | 可信反向代理的 CIDR 列表：只有这些对端发来的 `X-Forwarded-For` 才会影响 `client_ip()`，用于 IP 围栏、限流分桶与审计日志。`client_ip()` 取**最右侧的不受信跳**，伪造最左值无法伪装内网地址。**它不是分区锚点**——无法把请求在两个区之间搬移 |
 | `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | 内存令牌桶限流（单进程）：`by` 选 `ip` / `key`，`burst` 为桶容量，`per_minute` 为补充速率；超量返回 **429** 并带 `Retry-After`。**公网实例务必开启**（或由反代限流） |
+
+凭据只从 `Authorization: Bearer` / `X-API-Key` 请求头读取，`?api_key=` 永不作为凭据；
+`X-Forwarded-*` / `X-Real-IP` 一律不采信，限流分桶与审计行只用真实 TCP 对端（`peer_ip()`）。
+这两项行为**不可配置**（`allow_query_api_key`、`trusted_proxies` 已移除）。前置反代时所有请求
+共用一个 IP，建议 `rate_limit.by: key` 或直接在反代层限速。
 
 `security.public.admin_endpoints`（`deny` / `readonly` / `allow`）是唯一**不属于**「两个区共享」的一项：
 它**只在外网监听**上生效，同时驱动 Ollama 模型管理过滤与管理面（见上方分区说明）。`deny`（默认）拦住 `api/delete`、`api/copy`、
@@ -1200,8 +1210,10 @@ method+path 已经先被 **404**。所以公网开放 `pull` 需要两半都齐�
 
 镜像通过 `python serve.py` 启动，显式设置 uvicorn 的 `proxy_headers=False`。直接执行
 `python -m uvicorn main:app` 则会让 `ProxyHeadersMiddleware` 用调用方提交的 `X-Forwarded-For`
-改写 `scope["client"]`，这正是过去基于 IP 的控制可被绕过的根因。现在分区可信度完全不依赖该地址：
-判定依据是内核分配的**本地监听端口**，调用方无法伪造。
+改写 `scope["client"]`，这正是过去基于 IP 的控制可被绕过的根因；`auth.peer_ip()` 会拒绝这种
+被改写的 scope（端口为 0）。现在分区可信度完全不依赖该地址：判定依据是内核分配的
+**本地监听端口**，调用方无法伪造。限流桶与审计行记录的始终是真实 TCP 对端，任何转发头都
+不被采信，因此前置反代时所有调用方共用一个 IP。
 
 端口与分区只写在 `config.yaml`：
 
@@ -1296,7 +1308,7 @@ curl -s -b jar.txt http://127.0.0.1:8000/v1/management/api-keys \
 - [ ] 所有密钥都是随机的：管理台签发的 47 字符 `sk-hub-…`，约 238 位熵，已不存在弱 Key 或导入 Key。
       库里只存摘要，所以 `llmhub.db` 要与密钥文件同等保护
 - [ ] 前面有反向代理（Nginx/Caddy）终止 TLS
-- [ ] 如需限制来源，`security.allowed_client_ips` 填可信网段（两个区同时生效）
+- [ ] 如需限制来源，在网络层做（防火墙 / 反向代理）；网关没有客户端 IP 白名单，可信度只看监听端口
 - [ ] 除非内网端口确实在可信 LAN 上，否则保持 `security.internal.allow_anonymous: false`；内网端口
       对外可达时保持 `security.internal.expose_docs: false`。已不存在可免 Key 的 IP 白名单——可信度
       就是监听 socket

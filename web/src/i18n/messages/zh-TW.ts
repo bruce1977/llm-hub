@@ -185,7 +185,7 @@ const zhTW: MessageSchema = {
       errors: '錯誤',
       upstreamDist: '各 Upstream 請求分布',
       modelDist: '各 Model 請求分布',
-      statusDist: '成功 / 失敗分布',
+      statusDist: '成功 / 警告 / 失敗分布',
     },
   },
 

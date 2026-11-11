@@ -1,9 +1,9 @@
 """API key authentication and security helpers.
 
-Supported key transports:
+Supported key transports (headers only — a `?api_key=` query parameter is NEVER
+accepted as a credential, so a key cannot leak into access logs or browser history):
   - Authorization: Bearer <key>
   - X-API-Key: <key>
-  - ?api_key=<key>  (only when security.allow_query_api_key is enabled; disabled by default)
 
 Multiple keys are supported. They live in the ``api_keys`` table of ``llmhub.db`` as
 SHA-256 hashes (see ``key_store.py``) and are verified through that store's in-memory
@@ -25,19 +25,17 @@ Trust zones are decided by ONE anchor: the kernel-assigned local listening socke
 * ``security.public.port == server.port`` makes a public-only instance: the single
   socket is public, so there is no anonymous probe at all (use a TCP port check).
 
-``X-Forwarded-For`` is NEVER a trust anchor. uvicorn's ProxyHeadersMiddleware
+``X-Forwarded-For`` is NEVER trusted at all. uvicorn's ProxyHeadersMiddleware
 rewrites ``scope["client"]`` from that header when the peer is in
 ``--forwarded-allow-ips`` (127.0.0.1 by default), so ``serve.py`` starts uvicorn with
-``proxy_headers=False``. Application-level XFF parsing in :func:`client_ip` is used
-only for declared ``security.trusted_proxies``, for IP fencing, rate-limit buckets
-and audit rows - never to decide which zone a request is in.
+``proxy_headers=False``; :func:`peer_ip` additionally refuses a rewritten scope.
+There is no trusted-proxy list: the address used for rate-limit buckets and audit
+rows is always the real TCP peer, and no header can influence it (or the zone).
 """
 
 from __future__ import annotations
 
-import ipaddress
 import logging
-import re
 from collections.abc import Iterable
 
 from fastapi import HTTPException, Request, status
@@ -56,8 +54,8 @@ DOCS_PATHS = {"/docs", "/openapi.json"}
 
 WWW_AUTHENTICATE = "Bearer"
 
-#: Headers that mark a request as having traversed a proxy. Their presence alone is
-#: never proof of a trusted proxy - that requires the TCP peer to be allowlisted.
+#: Headers that mark a request as having traversed a proxy. Never trusted; their
+#: presence is only used to detect an ASGI scope rewritten by uvicorn.
 PROXY_HEADERS = (
     "x-forwarded-for",
     "x-forwarded-proto",
@@ -98,8 +96,12 @@ WEAK_KEY_PATTERNS = {
 EXAMPLE_MARKERS = ("example", "changeme", "change-me", "your-", "replace-me", "demo")
 
 
-def extract_api_key(request: Request, allow_query: bool = False) -> str | None:
-    """Extract the API key from the request headers (or optionally the query string)."""
+def extract_api_key(request: Request) -> str | None:
+    """Extract the API key from the request headers only.
+
+    A `?api_key=` query parameter is deliberately NOT a credential transport:
+    URLs end up in access logs, browser history and Referer headers.
+    """
     auth_header = request.headers.get("authorization")
     if auth_header:
         scheme, _, token = auth_header.partition(" ")
@@ -112,11 +114,6 @@ def extract_api_key(request: Request, allow_query: bool = False) -> str | None:
     api_key = request.headers.get("x-api-key")
     if api_key and api_key.strip():
         return api_key.strip()
-
-    if allow_query:
-        query_key = request.query_params.get("api_key")
-        if query_key:
-            return query_key.strip()
 
     return None
 
@@ -204,46 +201,13 @@ def has_proxy_headers(request: Request) -> bool:
     return any(request.headers.get(name) is not None for name in PROXY_HEADERS)
 
 
-def _trusted_proxy_cidrs(request: Request) -> list[str]:
-    cfg = _config(request)
-    return list(getattr(getattr(cfg, "security", None), "trusted_proxies", None) or [])
-
-
-def _xff_chain(request: Request) -> list[str]:
-    chain: list[str] = []
-    if raw := request.headers.get("x-forwarded-for"):
-        chain.extend(part.strip() for part in raw.split(",") if part.strip())
-    if real := request.headers.get("x-real-ip"):
-        if real.strip():
-            chain.append(real.strip())
-    return chain
-
-
-def client_ip(request: Request) -> str | None:
-    """Caller address for IP fencing, rate-limit buckets and audit rows.
-
-    XFF is honoured only when the **real TCP peer** is a declared trusted proxy.
-    Every proxy appends to XFF, so the leftmost value is caller-controlled; take
-    the rightmost hop that is not itself a trusted proxy. A forged
-    ``X-Forwarded-For: 192.168.10.5`` followed by nginx appending the real public
-    IP therefore resolves to the public IP, never to the forged one.
-    """
-    peer = peer_ip(request)
-    trusted = _trusted_proxy_cidrs(request)
-    if not (peer and trusted and ip_allowed(peer, trusted)):
-        return peer
-    for addr in reversed(_xff_chain(request) + [peer]):
-        try:
-            ipaddress.ip_address(addr)
-        except ValueError:
-            continue
-        if not ip_allowed(addr, trusted):
-            return addr
-    return peer
-
-
 def peer_ip(request: Request) -> str | None:
-    """The real TCP peer address, or None when the ASGI scope has been polluted.
+    """The only client address the gateway records: the real TCP peer.
+
+    Used for rate-limit buckets and request-log audit rows - never for access
+    control or zone selection. No ``X-Forwarded-For`` / ``X-Real-IP`` value is
+    ever honoured, so traffic arriving through a reverse proxy or NAT is one
+    address (which matters if rate limiting by IP is enabled).
 
     uvicorn's ProxyHeadersMiddleware rewrites ``scope["client"]`` to
     ``(<leftmost X-Forwarded-For value>, 0)`` when the peer is in
@@ -259,34 +223,11 @@ def peer_ip(request: Request) -> str | None:
     if port == 0 and has_proxy_headers(request):
         logger.warning(
             "ASGI client address %r was rewritten from forwarded headers; refusing to use it "
-            "for an access-control decision. Start with `python serve.py` (proxy_headers=False).",
+            "for rate-limit / audit rows. Start with `python serve.py` (proxy_headers=False).",
             client,
         )
         return None
     return host
-
-
-def ip_allowed(ip: str | None, allowed: Iterable[str]) -> bool:
-    """Check a client IP against an allowlist (supports CIDR, e.g. 10.0.0.0/8).
-
-    An empty allowlist means "no IP fence", not "nobody".
-    """
-    if not allowed:
-        return True
-    if not ip:
-        return False
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return ip in allowed
-    for a in allowed:
-        try:
-            if addr in ipaddress.ip_network(a, strict=False):
-                return True
-        except ValueError:
-            if ip == a:
-                return True
-    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -302,21 +243,13 @@ def docs_allowed(request: Request, cfg) -> bool:
 async def authorize(request: Request, cfg) -> str | None:
     """Require a valid caller key (or console session handled by the caller).
 
-    Also enforces the optional ``security.allowed_client_ips`` fence before
-    spending time on key verification. Raised errors are turned into responses by
-    the route dependency; ``bridge.public_auth_denial`` maps them into the
-    middleware's denial envelope, so the rules live in exactly one place.
+    Raised errors are turned into responses by the route dependency;
+    ``bridge.public_auth_denial`` maps them into the middleware's denial
+    envelope, so the rules live in exactly one place. Access control is the
+    two-zone listener split - there is deliberately no per-client IP allowlist.
     """
     path = request.url.path.rstrip("/") or "/"
-    ip = client_ip(request)
-    if not ip_allowed(ip, cfg.security.allowed_client_ips):
-        logger.warning("Client IP not allowed: %s %s", ip, path)
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Client address is not permitted to access this gateway.",
-        )
-
-    key = extract_api_key(request, allow_query=cfg.security.allow_query_api_key)
+    key = extract_api_key(request)
     if not key:
         logger.warning("Missing API key: %s %s", request.method, path)
         raise HTTPException(

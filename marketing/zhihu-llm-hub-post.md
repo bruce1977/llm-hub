@@ -211,10 +211,9 @@ event: message_stop
 | `admin_endpoints`（`security.public` 下） | `deny` | 仅外网监听，管两件事：① 过滤 Ollama 的模型管理端点（`pull` / `push` / `create` / `delete` / `copy` / `blobs`），这半边仍要求 `path_allowlist` 有对应规则；② 设为 `allow` 时 `/admin*` 和 `/v1/management/*` 在公网口不再 404——前缀规则先于 allowlist 判定，不需要加条目 |
 | `max_body_bytes` | 32 MB | 超了返回 413，防大 body 打挂 |
 | `cors_origins` | `[]` | 留空就不返回任何 CORS 头，不再有 `*` |
-| `allow_query_api_key` | `false` | 密钥不进日志、不进浏览器历史 |
 | `rate_limit` | 可开 | 内存令牌桶，按 IP 或按 Key 限流 |
 
-还有 `/docs` 和 `/openapi.json`：它们只在**内网口**提供，由 `security.internal.expose_docs` 控制；**公网口永远 404**，带不带 Key 都一样。管理台是另一回事：默认在公网口 404，只有 `admin_endpoints: allow` 才打开，而「打开」不等于「匿名」——只有静态外壳和 `POST /v1/management/auth/login` 免凭据，其余接口仍然只认会话 Cookie，网关 Key 不是管理凭据。这里有个容易翻车的点——XFF 改不了分区：网关用 `proxy_headers=False` 启动，`security.trusted_proxies` 只决定限流桶和审计日志里记的 `client_ip`，伪造一个内网 `X-Forwarded-For` 也进不了内网口。经本机反代部署时，记得 `proxy_set_header X-Forwarded-For $remote_addr;`（覆盖，不要追加），否则限流和审计看到的不是真实来源。
+还有 `/docs` 和 `/openapi.json`：它们只在**内网口**提供，由 `security.internal.expose_docs` 控制；**公网口永远 404**，带不带 Key 都一样。管理台是另一回事：默认在公网口 404，只有 `admin_endpoints: allow` 才打开，而「打开」不等于「匿名」——只有静态外壳和 `POST /v1/management/auth/login` 免凭据，其余接口仍然只认会话 Cookie，网关 Key 不是管理凭据。这里有个容易翻车的点——XFF 改不了分区：网关用 `proxy_headers=False` 启动，而且**完全不采信** `X-Forwarded-For` / `X-Real-IP`，限流桶和审计日志里记的是真实 TCP 对端；伪造一个内网 XFF 既进不了内网口，也改不了记录下来的地址。调用方 Key 同理只认请求头，`?api_key=` 一律不算凭据。代价是经反代部署时所有请求共用一个 IP，此时要按 Key 限流或直接在反代层限速。
 
 调用方密钥现在存在 `llmhub.db` 的 `api_keys` 表里，**只存 `sha256(明文)` 和掩码，库里没有明文**，复制走 `.db` 也没法重放。管理台签发 `sk-hub-` + 40 位 base62（共 47 字符，约 238 位随机），明文只显示一次，关掉弹窗就找不回来；吊销是两步确认。
 

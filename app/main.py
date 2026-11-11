@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -34,31 +33,31 @@ from admin_auth import (
 )
 from auth import (
     DOCS_PATHS,
-    client_ip,
     docs_allowed,
     extract_api_key,
-    ip_allowed,
     is_public,
     is_weak_key,
+    peer_ip,
     require_api_key,
 )
+from bench_store import BenchStore
 from bridge import bridge_denial, public_auth_denial
 from config import CONFIG_PATH, ConfigManager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from http_clients import build_clients
 from key_store import ApiKeyStore, set_store
 from logging_config import DATE_FORMAT, LOG_FORMAT, apply_to_existing_handlers
 from management import AdminLogin
 from management import login as admin_login
 from management import logout as admin_logout
 from management import router as management_router
-from proxy import ProxyService
-from bench_store import BenchStore
 from messages import MessagesService
-from request_log import RequestLog
+from proxy import ProxyService
+from request_log import RequestLog, basic_entry, now_ts
 from rerank import RerankService
-from systemone import SystemOneService
+from systemone import SystemOneService, backend_key
 from websearch import WebSearchService
 
 logger = logging.getLogger("llm_hub")
@@ -94,34 +93,22 @@ async def lifespan(app: FastAPI):
     cfg = manager.config
     setup_logging(cfg.server.log_level)
 
-    limits = httpx.Limits(
-        max_connections=max(16, cfg.server.max_concurrency),
-        max_keepalive_connections=min(32, max(8, cfg.server.max_concurrency)),
-        keepalive_expiry=cfg.server.upstream_keepalive_expiry,
-    )
-    # trust_env=False: the gateway always talks to explicitly-configured upstreams
-    # (Ollama / LM Studio / System One backend — all internal addresses). Inheriting ambient
-    # HTTP(S)_PROXY from the host breaks pooled keep-alive connections to LAN hosts
-    # (first request succeeds, later ones 404 through the proxy). Connect directly.
-    client = httpx.AsyncClient(
-        limits=limits,
-        timeout=httpx.Timeout(cfg.server.request_timeout, connect=10.0),
-        # Never follow upstream redirects: an upstream that cleans `api/../api/delete`
-        # into a 307 would otherwise make the gateway replay the original destructive
-        # body against a path the deny list never saw.
-        follow_redirects=False,
-        trust_env=False,
-    )
+    # Two outbound pools. `client` stays the general-purpose one used by probes,
+    # System One, web search and the management API. `inference_client` is the
+    # queued concurrency gate that protects local model backends (see
+    # http_clients.py): a burst waits for a free slot instead of being refused.
+    control_client, inference_client = build_clients(cfg)
 
     app.state.manager = manager
-    app.state.client = client
+    app.state.client = control_client
+    app.state.inference_client = inference_client
     app.state.request_log = RequestLog()
     await app.state.request_log.start()
-    app.state.proxy = ProxyService(manager, client, app.state.request_log)
-    app.state.rerank = RerankService(manager, client)
-    app.state.systemone = SystemOneService(manager, client)
-    app.state.websearch = WebSearchService(manager, client)
-    app.state.messages = MessagesService(manager, client)
+    app.state.proxy = ProxyService(manager, inference_client, app.state.request_log)
+    app.state.rerank = RerankService(manager, inference_client)
+    app.state.systemone = SystemOneService(manager, control_client)
+    app.state.websearch = WebSearchService(manager, control_client)
+    app.state.messages = MessagesService(manager, inference_client)
     app.state.bench_store = BenchStore()
     await app.state.bench_store.start()
     app.state.api_keys = ApiKeyStore()
@@ -228,15 +215,28 @@ async def lifespan(app: FastAPI):
     # variable at startup is the only place an operator can see it without reading code.
     if cfg.systemone.enabled:
         so = cfg.systemone
-        signed = bool(os.getenv(so.api_key_env or "", "").strip())
-        logger.info(
-            "System One: POST /v1/systemone -> %s%s | model=%s | backend key from $%s (%s)",
-            so.backend.rstrip("/"),
-            "/" + so.path.strip("/"),
-            so.model,
-            so.api_key_env,
-            "set" if signed else "NOT set - forwarding unsigned",
-        )
+        authorization, unsigned_reason = backend_key(so.api_key_env)
+        if so.api_key_env:
+            logger.log(
+                logging.WARNING if unsigned_reason else logging.INFO,
+                "System One: POST /v1/systemone -> %s%s | model=%s | backend key from $%s (%s)",
+                so.backend.rstrip("/"),
+                "/" + so.path.strip("/"),
+                so.model,
+                so.api_key_env,
+                unsigned_reason or "set",
+            )
+        else:
+            # Empty `api_key_env` is a valid unsigned mode, but it is also the usual way
+            # to lose the backend key by accident. Say so ONCE at startup, with a name.
+            logger.warning(
+                "System One: POST /v1/systemone -> %s%s | model=%s | UNSIGNED: "
+                "systemone.api_key_env is empty (set it to SYSTEMONE_SERVER_API_KEY if the "
+                "backend requires a key; an Ollama 0.40+ backend ignores Authorization).",
+                so.backend.rstrip("/"),
+                "/" + so.path.strip("/"),
+                so.model,
+            )
 
     # ADMIN_PASSWORD doubles as the HMAC key that signs console session cookies:
     # guessing it lets an attacker mint a token with any expiry. Warn (without
@@ -284,12 +284,15 @@ async def lifespan(app: FastAPI):
 
     # serve.py binds exactly cfg.listen_ports(); config.yaml is the single source.
     logger.info(
-        "LLM Hub started | config=%s | upstreams=%d | aliases=%d | listening=%s | public=%s",
+        "LLM Hub started | config=%s | upstreams=%d | aliases=%d | listening=%s | public=%s | "
+        "inference concurrency=%d (queue timeout=%.0fs)",
         CONFIG_PATH,
         len(cfg.upstreams),
         len(cfg.aliases),
         app.state.listen_endpoints,
         ",".join(str(p) for p in public_ports) or "none",
+        cfg.server.max_concurrency,
+        cfg.server.upstream_queue_timeout,
     )
     try:
         yield
@@ -297,7 +300,8 @@ async def lifespan(app: FastAPI):
         await app.state.request_log.stop()
         if getattr(app.state, "bench_store", None) is not None:
             await app.state.bench_store.stop()
-        await client.aclose()
+        await control_client.aclose()
+        await inference_client.aclose()
         logger.info("LLM Hub stopped")
 
 
@@ -472,17 +476,17 @@ def _deny(status_code: int, detail: str, headers: dict[str, str] | None = None) 
 _RATE_BUCKETS: dict[str, tuple[float, float]] = {}  # key -> (tokens, last_ts)
 
 
-def _rate_limit_key(rl, request: Request, sec) -> str:
+def _rate_limit_key(rl, request: Request) -> str:
     if rl.by == "key":
-        k = extract_api_key(request, allow_query=sec.allow_query_api_key)
+        k = extract_api_key(request)
         if k:
             return "key:" + k
-    return "ip:" + (client_ip(request) or "unknown")
+    return "ip:" + (peer_ip(request) or "unknown")
 
 
-def _rate_limited(rl, request: Request, sec) -> bool:
+def _rate_limited(rl, request: Request) -> bool:
     """Return True when the request should be throttled (HTTP 429)."""
-    key = _rate_limit_key(rl, request, sec)
+    key = _rate_limit_key(rl, request)
     now = time.time()
     capacity = max(int(rl.burst), 1)
     rate = max(float(rl.per_minute), 1) / 60.0  # tokens per second
@@ -523,12 +527,11 @@ async def gateway_security_middleware(request: Request, call_next):
        not explicitly listed; management API and /admin are always 404)
     1. body size cap                                  -> 413
     2. /docs, /openapi.json, Swagger assets            -> 404 outside internal
-    3. client IP fence (security.allowed_client_ips)  -> 403
-    4. rate limit (security.rate_limit)               -> 429
-    5. CORS only for explicitly listed origins        -> 204 / header
-    6. public listener -> caller key or console session -> 401 / 403
+    3. rate limit (security.rate_limit)               -> 429
+    4. CORS only for explicitly listed origins        -> 204 / header
+    5. public listener -> caller key or console session -> 401 / 403
 
-    Steps 0 and 6 are the two halves of the public-zone policy and live in
+    Steps 0 and 5 are the two halves of the public-zone policy and live in
     ``bridge.py``: an unlisted path never exists on that socket, and a listed one
     is never anonymous. Neither waives the other.
 
@@ -543,13 +546,70 @@ async def gateway_security_middleware(request: Request, call_next):
     method = request.method.upper()
     cors_origin = ""
 
+    # ---- request-log envelope for calls that never reach ProxyService.forward ----
+    # The rich row (bodies / tokens / upstream / stream) is built inside the proxy.
+    # Two kinds of traffic bypass it entirely: (a) this middleware refuses them
+    # before call_next, and (b) the in-process handlers (systemone, web-search,
+    # rerank, messages, models, tags, ps, health, probe, root) answer on their own.
+    # Both must still show up in the console's Requests view, so we write a
+    # metadata-only row here. A claim flag on the shared ASGI scope (set by the
+    # proxy once it has taken ownership) keeps the two writers from double-logging.
+    started = time.perf_counter()
+    arrived = now_ts()
+    log_store = getattr(request.app.state, "request_log", None)
+    # HEAD/OPTIONS are liveness/pre-flight probes and stay out of the log, matching
+    # the proxy's own rule. Management/console/docs paths are control-plane noise:
+    # the console polls them continuously and they are not gateway API calls.
+    noisy_path = (
+        path.rstrip("/") in DOCS_PATHS
+        or path.rstrip("/") in ("/redoc", "/admin")
+        or path.startswith(("/static/swagger/", "/admin/", "/v1/management"))
+    )
+    log_enabled = (
+        log_store is not None
+        and cfg is not None
+        and cfg.request_log.enabled
+        and method not in ("HEAD", "OPTIONS")
+        and not noisy_path
+    )
+
+    def record_basic(status_code: int, detail: str | None = None, *, resp=None) -> None:
+        """Queue a metadata-only row when no proxy row will be written for this call."""
+        if not log_enabled:
+            return
+        try:
+            req_size = int(value) if (value := request.headers.get("content-length")) and value.isdigit() else None
+            res_size = None
+            if resp is not None and (value := resp.headers.get("content-length")) and value.isdigit():
+                res_size = int(value)
+            log_store.record(
+                basic_entry(
+                    method=method,
+                    path=path,
+                    status=status_code,
+                    ts=arrived,
+                    started=started,
+                    client_ip=peer_ip(request),
+                    query=request.url.query,
+                    req_size=req_size,
+                    res_size=res_size,
+                    error=detail or (f"HTTP {status_code}" if status_code >= 400 else None),
+                )
+            )
+        except Exception as exc:  # logging must never change the response path
+            logger.debug("Request log: skipped metadata row for %s %s: %s", method, path, exc)
+
+    def deny(status_code: int, detail: str, headers: dict[str, str] | None = None) -> JSONResponse:
+        record_basic(status_code, detail)
+        return _deny(status_code, detail, headers)
+
     # 0. Public zone: the config file is the COMPLETE list of reachable routes.
     #    This runs first so an unlisted path never leaks a different status
     #    through another rule (and is 404 even when the caller has a valid key).
     if is_public(request) and cfg is not None:
         denial = bridge_denial(method, path, cfg)
         if denial is not None:
-            return _deny(*denial)
+            return deny(*denial)
 
     if sec is not None:
         # 1. Reject oversized bodies by declaration BEFORE the route reads a byte.
@@ -558,31 +618,27 @@ async def gateway_security_middleware(request: Request, call_next):
         if sec.max_body_bytes and sec.max_body_bytes > 0:
             declared = request.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > sec.max_body_bytes:
-                return _deny(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large.")
+                return deny(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Request body too large.")
 
         # 2. API docs and their vendored Swagger assets are internal-only.
         if (
             path.rstrip("/") in DOCS_PATHS or path.startswith("/static/swagger/")
         ) and not docs_allowed(request, cfg):
-            return _deny(status.HTTP_404_NOT_FOUND, "Not found.")
+            return deny(status.HTTP_404_NOT_FOUND, "Not found.")
 
         # /redoc was intentionally removed (superseded by /docs); return a clean
         # 404 instead of leaking into the catch-all (which would demand an API key).
         if path.rstrip("/") == "/redoc":
-            return _deny(status.HTTP_404_NOT_FOUND, "Not found.")
+            return deny(status.HTTP_404_NOT_FOUND, "Not found.")
 
-        # 3. client IP allowlist -----------------------------------------------
-        if not ip_allowed(client_ip(request), sec.allowed_client_ips):
-            return _deny(status.HTTP_403_FORBIDDEN, "Client address is not permitted to access this gateway.")
-
-        # 4. rate limit -------------------------------------------------------
-        if sec.rate_limit.enabled and _rate_limited(sec.rate_limit, request, sec):
+        # 3. rate limit -------------------------------------------------------
+        if sec.rate_limit.enabled and _rate_limited(sec.rate_limit, request):
             logger.warning("Rate limit exceeded: %s %r", method, path)
-            limited = _deny(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests.")
+            limited = deny(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests.")
             limited.headers["Retry-After"] = "1"
             return limited
 
-        # 5. CORS (only for explicitly allowed origins) -----------------------
+        # 4. CORS (only for explicitly allowed origins) -----------------------
         origin = request.headers.get("origin")
         if origin and sec.cors_origins:
             allowed = "*" in sec.cors_origins or origin in sec.cors_origins
@@ -615,12 +671,16 @@ async def gateway_security_middleware(request: Request, call_next):
             headers = dict(auth_headers)
             if cors_origin:
                 headers["Access-Control-Allow-Origin"] = cors_origin
-            return _deny(status_code, detail, headers)
+            return deny(status_code, detail, headers)
 
     resp = await call_next(request)
     _renew_admin_session(request, resp)
     if cors_origin:
         resp.headers["Access-Control-Allow-Origin"] = cors_origin
+    # The proxy claims ownership of a request in forward(); anything else that
+    # reached a route (standalone handlers, FastAPI 404s) has no row yet.
+    if log_enabled and not getattr(request.state, "request_log_claimed", False):
+        record_basic(resp.status_code, resp=resp)
     return _harden_response(resp, path)
 
 

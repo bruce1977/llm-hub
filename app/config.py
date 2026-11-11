@@ -10,7 +10,6 @@ a `.json` file parses exactly the same way.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import os
 import re
@@ -219,7 +218,18 @@ class ServerConfig(BaseModel):
     port: int = 8000
     log_level: str = "info"
     request_timeout: float = 600.0
-    max_concurrency: int = 64
+    # Concurrency gate for model-inference upstreams (Ollama / LM Studio / OpenCode
+    # chat). High request volume is legitimate traffic, so a burst is QUEUED rather
+    # than rejected: httpcore's connection pool hands out at most `max_concurrency`
+    # connections and makes the rest wait for a free slot. A streaming response
+    # holds its slot until the final chunk, so this also bounds concurrent
+    # generation jobs - the thing that actually exhausts local VRAM.
+    # Not a rate limiter (no 429, no requests/minute cap). Changing it needs a
+    # restart: the pools are built once in the lifespan.
+    max_concurrency: int = Field(default=4, ge=1)
+    # How long a request may wait for a free inference slot before answering 503
+    # with Retry-After. Bounds the queue so a sustained flood cannot pile up in RAM.
+    upstream_queue_timeout: float = Field(default=120.0, gt=0)
     upstream_keepalive_expiry: float = 30.0
 
 
@@ -696,6 +706,12 @@ class SecurityConfig(BaseModel):
     ``auth`` node, ``allowed_http_methods``, global ``path_allowlist``,
     ``allow_anonymous_health``, ``expose_health_details`` and IP trust anchors have
     been removed - see ``_migrate_legacy_security`` below for the upgrade mapping.
+
+    Credentials are accepted from ``Authorization: Bearer`` / ``X-API-Key`` headers
+    only: a ``?api_key=`` query parameter is never a credential. Forwarded headers
+    are never honoured, so the address used for rate-limit buckets and audit rows is
+    always the real TCP peer. ``allow_query_api_key`` and ``trusted_proxies`` were
+    retired because the only useful values were their defaults (false / empty).
     """
 
     internal: InternalSecurityConfig = Field(default_factory=InternalSecurityConfig)
@@ -704,24 +720,8 @@ class SecurityConfig(BaseModel):
     blocked_paths: list[str] = Field(default_factory=list)
     cors_origins: list[str] = Field(default_factory=list)
     max_body_bytes: int = 32 * 1024 * 1024
-    allow_query_api_key: bool = False
-    allowed_client_ips: list[str] = Field(default_factory=list)
-    # CIDR list of reverse proxies whose X-Forwarded-For may be trusted for IP
-    # fencing, rate-limit buckets and request-log audit rows. This is NOT a zone
-    # anchor: with proxy_headers=False, an undeclared proxy is simply untrusted.
-    trusted_proxies: list[str] = Field(default_factory=list)
     # In-memory token-bucket rate limiter (DoS / brute-force mitigation).
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
-
-    @field_validator("allowed_client_ips", "trusted_proxies")
-    @classmethod
-    def _validate_cidrs(cls, values: list[str]) -> list[str]:
-        for entry in values:
-            try:
-                ipaddress.ip_network(entry, strict=False)
-            except ValueError as exc:
-                raise ValueError(f"security CIDR entry {entry!r} is invalid: {exc}") from exc
-        return values
 
     @model_validator(mode="before")
     @classmethod
@@ -742,8 +742,15 @@ class SecurityConfig(BaseModel):
         legacy_admin = data.pop("admin_endpoints", None)
         had_health_details = "expose_health_details" in data
         data.pop("expose_health_details", None)
+        # Removed knobs: strip them from old config files so a non-default value
+        # (e.g. `trusted_proxies: [10.0.0.0/8]`) cannot be mistaken for a live setting.
+        retired = [k for k in ("allow_query_api_key", "trusted_proxies") if k in data]
+        for key in retired:
+            data.pop(key)
 
         dropped = []
+        if retired:
+            dropped.append(", ".join(retired) + " (removed; no longer configurable)")
         if had_health_details:
             dropped.append("expose_health_details (no-op)")
         if legacy_methods is not None:
@@ -756,8 +763,8 @@ class SecurityConfig(BaseModel):
             dropped.append("admin_endpoints (now public.admin_endpoints)")
         if dropped:
             logger.warning(
-                "Legacy security field(s) migrated/ignored: %s. Update config.yaml to the "
-                "security.internal / security.public structure",
+                "Legacy security field(s) migrated/ignored: %s. Review config.yaml for "
+                "removed or relocated keys (security.internal / security.public)",
                 "; ".join(dropped),
             )
 
@@ -1105,7 +1112,8 @@ def build_default_config() -> dict[str, Any]:
             "port": 8000,
             "log_level": "info",
             "request_timeout": 600.0,
-            "max_concurrency": 64,
+            "max_concurrency": 4,
+            "upstream_queue_timeout": 120.0,
         },
         "routing": {"strict": False},
         "upstreams": [
@@ -1216,9 +1224,6 @@ def build_default_config() -> dict[str, Any]:
             "blocked_paths": [],
             "cors_origins": [],
             "max_body_bytes": 32 * 1024 * 1024,
-            "allow_query_api_key": False,
-            "allowed_client_ips": [],
-            "trusted_proxies": [],
             "rate_limit": {"enabled": False, "per_minute": 60, "burst": 20, "by": "ip"},
         },
     }

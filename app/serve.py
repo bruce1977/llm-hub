@@ -3,9 +3,10 @@
 Why this file exists instead of `python -m uvicorn main:app`:
   * uvicorn's ProxyHeadersMiddleware rewrites ``scope["client"]`` from
     ``X-Forwarded-For`` whenever the TCP peer is in ``--forwarded-allow-ips``
-    (127.0.0.1 by default, i.e. a same-host nginx). That would make IP-based
-    decisions attacker-controlled. We disable it here; ``auth.client_ip()`` does
-    its own rightmost-untrusted-hop parsing for declared trusted proxies.
+    (127.0.0.1 by default, i.e. a same-host nginx). That would let a header forge
+    the address used for rate-limit buckets and audit rows. We disable it here;
+    no forwarded header is trusted at all - ``auth.peer_ip()`` always uses the
+    real TCP peer.
   * It can bind the internal listener and the optional public listener in ONE
     process. A local listening socket is a kernel-assigned, unspoofable trust
     anchor: requests on ``security.public.port`` are the untrusted zone, with a
@@ -19,8 +20,9 @@ Two-zone layout (recommended)::
 
     config.yaml : server.port: 8000 ; security.public.port: 8001
     docker run  : -p 192.168.10.5:8834:8000  -p 127.0.0.1:8835:8001
-    nginx       : TLS termination -> 127.0.0.1:8835, with
-                  proxy_set_header X-Forwarded-For $remote_addr;   (overwrite!)
+    nginx       : TLS termination -> 127.0.0.1:8835
+                  (XFF is ignored: behind a proxy every request shares one TCP
+                   peer, so IP-based rate limiting has a single bucket)
 
   8000 (internal zone): with ``security.internal.allow_anonymous: true`` normal
   APIs are key-free, /docs and /admin are reachable, and the management API

@@ -214,9 +214,13 @@ const trendOption = computed<ChartOption>(() => {
 
 function pieOption(items: DistributionItem[], colorFor?: (key: string) => string): ChartOption {
   const ct = chartTheme.value
-  const counts = new Map(items.map((item) => [item.key, item.count]))
+  // The by-model pie sends `display` (the configured short alias) alongside the resolved
+  // model id in `key`. Show the alias, keep `key` for colours/filters/toolbar actions.
+  const label = (item: DistributionItem): string => item.display || item.key
+  const counts = new Map(items.map((item) => [label(item), item.count]))
   // Long model ids would paint over the disc, so the pie carries no labels at all: name +
-  // count live in the one-per-line legend list under the chart.
+  // count live in the one-per-line legend list under the chart. ECharts passes the full
+  // series name here (the truncation is only what we render), so the count lookup is safe.
   const legendLabel = (name: string): string => {
     const short = name.length > 16 ? `${name.slice(0, 15)}…` : name
     return `${short}  ${fmtInt(counts.get(name) ?? 0)}`
@@ -256,7 +260,7 @@ function pieOption(items: DistributionItem[], colorFor?: (key: string) => string
         labelLine: { show: false },
         itemStyle: { borderColor: ct.surface, borderWidth: 2 },
         data: items.map((item) => ({
-          name: item.key,
+          name: label(item),
           value: item.count,
           itemStyle: colorFor ? { color: colorFor(item.key) } : undefined,
         })),
@@ -267,10 +271,15 @@ function pieOption(items: DistributionItem[], colorFor?: (key: string) => string
 
 const upstreamPie = computed(() => pieOption(pies.value.upstream))
 const modelPie = computed(() => pieOption(pies.value.model))
+// Three status buckets: 2xx -> ok (green), 5xx -> failed (red), everything else
+// (3xx / 4xx / unknown) -> warning (amber). The keys come from
+// request_log._DISTRIBUTION_KEYS, so the colour switch never guesses from the label.
 const statusPie = computed(() =>
   pieOption(pies.value.status, (key) => {
     const ct = chartTheme.value
-    return key === 'ok' ? ct.green : ct.red
+    if (key === 'ok') return ct.green
+    if (key === 'failed') return ct.red
+    return ct.amber
   }),
 )
 

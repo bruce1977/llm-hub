@@ -42,16 +42,17 @@
 - **每请求读取** —— 路由、别名、`rerank.*`、`systemone.*`、`websearch.*`、
   `request_log.enabled` 以及整个 `security.*`。永远不需要重启。
 - **仅启动时读取** —— 监听套接字（`server.host` / `server.port` /
-  `security.public.port` 由 `app/serve.py` 绑定一次）、共享的上游连接池
-  （容量来自 `server.max_concurrency`、`server.upstream_keepalive_expiry`、
-  `server.request_timeout`）以及 `api_keys` 表扫描，都只在启动时读取。
+  `security.public.port` 由 `app/serve.py` 绑定一次）、两个出站 HTTP 连接池
+  （`server.max_concurrency`、`server.upstream_queue_timeout`、
+  `server.upstream_keepalive_expiry`、`server.request_timeout` 由
+  `app/http_clients.py` 读取一次）以及 `api_keys` 表扫描，都只在启动时读取。
   改这些需要重启。
 
 ## 节点一览
 
 | 节点 | `app/config.py` 中的模型 | 消费方 | 决定什么 |
 |---|---|---|---|
-| `server` | `ServerConfig` | `main.py` lifespan、`serve.py`、`proxy.py` | 绑定地址、内网端口、日志级别、上游超时、连接池 |
+| `server` | `ServerConfig` | `main.py` lifespan、`serve.py`、`http_clients.py`、`proxy.py` | 绑定地址、内网端口、日志级别、上游超时、推理并发闸门 |
 | `routing` | `RoutingConfig` | `Config.resolve()` | 未声明的**具名**模型是 404 还是回退 |
 | `upstreams[]` | `UpstreamConfig` | `Config`、`proxy.py`、`main.py`、`management.py` | 每个后端：地址、方言、模型目录、请求头、优先级 |
 | `default_upstream` | `str \| None` | `Config.default_upstream_obj()` | 未匹配的具名模型（`routing.strict: false`）与**每一次不带模型的调用**的回退目标 |
@@ -72,8 +73,20 @@
 | `port` | `8000` | `Config.listen_ports()`、`serve.py` | **内网（可信 LAN）**套接字。这个端口就是分区锚点，不是可以靠 IP 或请求头改写的设置 |
 | `log_level` | `info` | `main.setup_logging()`、`app/logging.json` | 一个开关管所有 logger，包含 uvicorn 的访问日志：`2026-11-10 20:31:18.718 \| INFO    \| uvicorn.access \| 127.0.0.1:61641 - "GET /v1/models HTTP/1.1" 404 Not Found`。`debug` 会打印别名解析与路由决策；rerank 分数或路由看起来不对时就该用这个级别 |
 | `request_timeout` | `600.0` | `main.py`（httpx 客户端）、`proxy.py`、`messages.py`、`rerank.py`、`systemone.py`、`websearch.py` | 没有单独设置上游级或功能级超时的调用，用「连接 10s / 读取 `request_timeout`」这个预算 |
-| `max_concurrency` | `64` | `main.py` → `httpx.Limits` | 决定共享池容量：`max_connections = max(16, it)`、`max_keepalive_connections = min(32, max(8, it))` |
-| `upstream_keepalive_expiry` | `30.0` | `main.py` → `httpx.Limits` | 到后端的空闲 keep-alive 连接保留多久 |
+| `max_concurrency` | `4` | `http_clients.py` → `httpx.Limits` | **推理并发闸门**：同一时刻最多 N 个请求打到模型后端（Ollama / LM Studio / OpenCode chat）。超出的请求**排队**等空位，不会 429 拒绝；流式响应占槽到最后一个 chunk。单卡主机建议 1~2。它不是限流器 |
+| `upstream_queue_timeout` | `120.0` | `http_clients.py` → `httpx.Timeout(pool=...)` | 排队等空位的最长秒数，超时返回 **503 + `Retry-After: 5`**。给等待队列封顶，避免洪泛把请求堆在内存里 |
+| `upstream_keepalive_expiry` | `30.0` | `http_clients.py` → `httpx.Limits` | 到后端的空闲 keep-alive 连接保留多久 |
+
+启动时由 `app/http_clients.py` 建两个出站连接池：
+
+- `inference_client` —— 容量就是 `max_concurrency`，供 `proxy.py`、`messages.py`、
+  `rerank.py` 使用。httpcore 会把放不下的请求排队而不是丢弃，所以「请求量大」是正常流量。
+  排队超时（`PoolTimeout`）映射为 503，不是上游故障 502。
+- `client`（控制面）—— 容量更大、不设闸门，供 System One 后端、web search 提供方、
+  模型发现、健康探测与管理 API 使用。因此模型忙时管理台不会把所有上游都显示成离线。
+
+`security.rate_limit` 是**另一套**控制：按每分钟请求数超限直接 429（防暴力破解/滥用）。
+并发闸门只控制节奏，不会因为「来得太频繁」拒绝请求。两者可以同时启用。
 
 `follow_redirects=False` 与 `trust_env=False` 是代码级常量，不是配置：网关从不跟随上游重定向，
 也从不让系统级 `HTTP_PROXY` 劫持后端调用。
@@ -215,7 +228,7 @@
 | `enabled` | `false` | `false` → **404** |
 | `backend` | `http://127.0.0.1:8080` | 决策后端的 base URL —— 一个 laya-server 部署或 Ollama 0.40+。URL 校验与 `base_url` 相同 |
 | `model` | 模型里是 `auto`，生成的配置里是 `local`，随包发布的文件里是一个真实名字 | 只有当它是具体值且调用方没传 `model` 时才注入转发请求体；哨兵值 `"local"` 表示「不注入」。**两种后端并不一致**：laya-server 只接受枚举 `auto` / `english` / `multilingual` / `typed-decisions`（其它值 **422**），而 Ollama 要一个已安装的模型名（`auto` → **404**）。同时也是 `api_models.systemone` 的回退 |
-| `api_key_env` | `SYSTEMONE_SERVER_API_KEY` | 存放后端密钥的环境变量*名*；有值时以 `Authorization: Bearer` 发送，即使发给会忽略它的 Ollama 后端。必须以 `_API_KEY` / `_API_TOKEN` 结尾 —— 指向 `ADMIN_PASSWORD` 会被拒绝。这是**出站**密钥（llm-hub → 后端）；调用方的**入站**凭据是 `api_keys` 表里的网关 Key。启动日志会打出解析后的 URL 以及该变量是否已设置 |
+| `api_key_env` | `SYSTEMONE_SERVER_API_KEY` | 存放后端密钥的环境变量*名*；有值时以 `Authorization: Bearer` 发送，即使发给会忽略它的 Ollama 后端。必须以 `_API_KEY` / `_API_TOKEN` 结尾 —— 指向 `ADMIN_PASSWORD` 会被拒绝。这是**出站**密钥（llm-hub → 后端）；调用方的**入站**凭据是 `api_keys` 表里的网关 Key。启动日志会打出解析后的 URL 以及该变量是否已设置。留**空**是合法的「故意不签名」模式（Ollama 0.40+ 会忽略 `Authorization`）：启动时只打一条点名该设置的警告，不会再对每个请求打印「环境变量 未设置」这种空名字警告 |
 | `path` | `v1/systemone` | `backend` 上的端点路径 |
 | `timeout` | `60.0` | 读取超时；`0`/空回退到 `server.request_timeout` |
 
@@ -239,10 +252,12 @@
 
 | 字段 | 默认值 | 作用 |
 |---|---|---|
-| `enabled` | `true` | 入库开关，**每请求**求值（`proxy._logging_on`）：为 `false` 时连请求/响应体都不复制，也不写任何行。因为这个标志每次调用都重读，保存文件后约 1 秒内生效、无需重启。关闭期间 `/v1/management/overview` 与 `/requests` 会报 `request_log.enabled: false`，于是管理台可以说「日志已关闭」，而不是显示一个看起来像没流量的空列表 |
+| `enabled` | `true` | 入库开关，**每请求**求值（`proxy._logging_on` 与安全 middleware 都会读）：为 `false` 时连请求/响应体都不复制，也不写任何行。因为这个标志每次调用都重读，保存文件后约 1 秒内生效、无需重启。关闭期间 `/v1/management/overview` 与 `/requests` 会报 `request_log.enabled: false`，于是管理台可以说「日志已关闭」，而不是显示一个看起来像没流量的空列表 |
+
+**覆盖范围：** 每次 API 调用都会产生一行，不只是走代理的那些。完整行（请求/响应体、token 用量、解析后的 `model`、`upstream`、`stream`）在 `ProxyService.forward` 里构造。进程内独立 handler（`/v1/systemone`、`/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`、`/v1/models`、`/api/tags`、`/api/ps`）以及被安全 middleware 拒绝的请求（公网 401/404、IP 403、限流 429、body 413）由 middleware 写成**仅元数据**的行：方法、路径、query、状态、耗时、客户端 IP 与拒绝原因，没有 body/token/upstream。ASGI scope 上的认领标记避免代理调用被重复写两行。`/v1/management/*`、`/admin/*`、文档与静态资源属于控制面噪音，永不入库；`HEAD` 与 `OPTIONS` 会被转发但永不入库，所以存活探测和 CORS 预检不会淹掉日志。
 
 存储位置与保留期刻意**不**放在本文件里 —— `REQUEST_LOG_DB`、`LLMHUB_DB` 与
-`REQUEST_LOG_RETENTION_DAYS` 属于部署层。`HEAD` 请求会被转发但永不入库，所以存活探测不会淹掉日志。
+`REQUEST_LOG_RETENTION_DAYS` 属于部署层。
 
 ## `security`
 
@@ -348,9 +363,18 @@ security:
 | `blocked_paths` | `[]` | 运维方黑名单，**处处生效**（精确名或以 `*` 结尾的前缀），在公网管理黑名单之外额外叠加。在 `proxy.py` 里通过 `SecurityConfig.is_path_blocked()` 检查 |
 | `cors_origins` | `[]` | 允许跨站的精确 origin；留空则完全不发 CORS 头。中间件只对列表内的 origin 用**不带 body 的 `204`** 应答预检。预检同样受所在分区的路径策略约束：内网监听任何路径都能应答，公网侧 `OPTIONS` 却和其它方法一样必须在 `security.public.path_allowlist` 里列出，否则预检就是 **404**，浏览器根本发不出真正的请求 |
 | `max_body_bytes` | `33554432` | 请求体上限：`Content-Length` 超过它 → 中间件里 **413**；分块传输的 body 在流式读取时计数（`read_limited_body`），然后才由 proxy、messages、websearch、systemone 路径转发 |
-| `allow_query_api_key` | `false` | `?api_key=…` 是否算一种凭据传输方式。默认关闭：URL 里的 Key 会落进访问日志。无论如何，请求日志里的 Key 都会被掩码 |
-| `allowed_client_ips` | `[]` | CIDR 围栏，列表之外 **403**。它拦的是客户端；从不选择分区 |
-| `trusted_proxies` | `[]` | 哪些 CIDR 的 `X-Forwarded-For` 可以被 `client_ip()` 读取 —— 用于 IP 围栏、限流桶与审计行，绝不用于分区。取**最右侧的不受信跳**，所以伪造的最左值挑不到内网地址。放在 nginx 后面时请覆盖该头（`proxy_set_header X-Forwarded-For $remote_addr`）而不是追加 |
+
+另有两项行为**刻意不可配置**：
+
+- 调用方 Key 只从 `Authorization: Bearer` / `X-API-Key` 请求头读取。`?api_key=…`
+  查询参数永远不是凭据，Key 因此不会落进访问日志、浏览器历史或 `Referer`
+  （请求日志仍会掩码敏感查询值，因为客户端可能误传）。
+- `X-Forwarded-*` / `X-Real-IP` 一律不被采信。限流桶与审计行记录的始终是真实
+  TCP 对端（`auth.peer_ip()`）。前置反代时所有请求共用一个地址，此时建议
+  `rate_limit.by: key`，或直接在反代层限速。
+
+已移除的 `allow_query_api_key` / `trusted_proxies` 两个键会被忽略并给出启动告警，
+避免旧配置文件悄悄把它们「复活」。
 
 ### `security.rate_limit`
 
@@ -359,7 +383,7 @@ security:
 | `enabled` | `false` | 内存令牌桶，超预算时 **429** 并带 `Retry-After`。开了公网监听而这里是关闭时，启动会告警。仅单进程有效 —— 它不是分布式限流器 |
 | `per_minute` | `60` | 持续补充速率 |
 | `burst` | `20` | 桶容量 = 最大瞬时请求数 |
-| `by` | `ip` | 桶的键：`ip` → `client_ip()`（或 `unknown`），`key` → 调用方的 API Key，请求不带 Key 时回退到 IP。超过 5 000 条后清理陈旧桶 |
+| `by` | `ip` | 桶的键：`ip` → `peer_ip()`（或 `unknown`），`key` → 调用方的 API Key，请求不带 Key 时回退到 IP。超过 5 000 条后清理陈旧桶 |
 
 ## 路径面 —— 可调用路径的封闭集合
 
@@ -473,7 +497,7 @@ Starlette 更偏好 catch-all 的完全匹配，而不是有文档路由的「�
 |---|---|
 | `CONFIG_PATH` | 加载哪个文件 |
 | `ADMIN_PASSWORD` | 仅用于管理台登录；它绝不是 Bearer / `X-API-Key` 凭据 |
-| `ADMIN_SESSION_TTL` | Cookie 生命周期（默认 12 h，钳制在 5 min…7 d，滑动续期） |
+| `ADMIN_SESSION_TTL` | Cookie 生命周期（默认 12 h，钳制在 5 min…7 d，滑动续期）。会话按 session id 加盐签名；改 `ADMIN_PASSWORD` 或重启进程都会让全部会话失效 |
 | `REQUEST_LOG_DB` / `LLMHUB_DB` | `requests` 用的数据库文件 / `bench_results` + `api_keys` 用的数据库文件 |
 | `REQUEST_LOG_RETENTION_DAYS` | 行保留期（`0` = 永久保留，每小时清理一次） |
 | `*_API_KEY` / `*_API_TOKEN`，由 `systemone.api_key_env` / `websearch.api_key_env` 指名 | 提供方凭据；文件里只能写变量名，绝不能写值 |

@@ -43,15 +43,16 @@ Two read timings matter when you change a value:
 - **Per request** — routing, aliases, `rerank.*`, `systemone.*`, `websearch.*`,
   `request_log.enabled` and all of `security.*`. A restart is never needed.
 - **Startup only** — the listening sockets (`server.host` / `server.port` /
-  `security.public.port` are bound once by `app/serve.py`), the shared upstream connection pool
-  (sized from `server.max_concurrency`, `server.upstream_keepalive_expiry`,
-  `server.request_timeout`) and the `api_keys` table scan. Editing these needs a restart.
+  `security.public.port` are bound once by `app/serve.py`), the two outbound HTTP pools
+  (`server.max_concurrency`, `server.upstream_queue_timeout`,
+  `server.upstream_keepalive_expiry`, `server.request_timeout` are read once by
+  `app/http_clients.py`) and the `api_keys` table scan. Editing these needs a restart.
 
 ## Node map
 
 | Node | Model in `app/config.py` | Consumed by | Decides |
 |---|---|---|---|
-| `server` | `ServerConfig` | `main.py` lifespan, `serve.py`, `proxy.py` | Bind address, internal port, log level, upstream timeouts, connection pool |
+| `server` | `ServerConfig` | `main.py` lifespan, `serve.py`, `http_clients.py`, `proxy.py` | Bind address, internal port, log level, upstream timeouts, inference concurrency gate |
 | `routing` | `RoutingConfig` | `Config.resolve()` | Whether an undeclared **named** model 404s or falls back |
 | `upstreams[]` | `UpstreamConfig` | `Config`, `proxy.py`, `main.py`, `management.py` | Every backend: address, dialect, model catalog, headers, priority |
 | `default_upstream` | `str \| None` | `Config.default_upstream_obj()` | The fallback for an unmatched named model (`routing.strict: false`) and for **every model-less call** |
@@ -72,8 +73,23 @@ Two read timings matter when you change a value:
 | `port` | `8000` | `Config.listen_ports()`, `serve.py` | The **internal (trusted LAN)** socket. This port is the zone anchor; it is not a setting you can override by IP or header |
 | `log_level` | `info` | `main.setup_logging()`, `app/logging.json` | One knob for every logger, uvicorn's access log included: `2026-11-10 20:31:18.718 \| INFO    \| uvicorn.access \| 127.0.0.1:61641 - "GET /v1/models HTTP/1.1" 404 Not Found`. `debug` prints alias resolution and routing decisions; that is the level to use when a rerank score or a route looks wrong |
 | `request_timeout` | `600.0` | `main.py` (httpx client), `proxy.py`, `messages.py`, `rerank.py`, `systemone.py`, `websearch.py` | The connect-10s/read-`request_timeout` budget for a call that does not set a per-upstream or per-feature timeout |
-| `max_concurrency` | `64` | `main.py` → `httpx.Limits` | Sizes the shared pool: `max_connections = max(16, it)`, `max_keepalive_connections = min(32, max(8, it))` |
-| `upstream_keepalive_expiry` | `30.0` | `main.py` → `httpx.Limits` | How long an idle keep-alive connection to a backend stays open |
+| `max_concurrency` | `4` | `http_clients.py` → `httpx.Limits` | **Inference concurrency gate**: at most N requests are in flight against model backends (Ollama / LM Studio / OpenCode chat). Excess requests are **queued**, never rejected with 429; a streaming response holds its slot until its last chunk. Single-GPU hosts: 1~2. This is *not* a rate limiter |
+| `upstream_queue_timeout` | `120.0` | `http_clients.py` → `httpx.Timeout(pool=...)` | Max seconds a request waits for a free inference slot. Beyond that: **503 + `Retry-After: 5`**. Bounds the waiting queue so a flood cannot pile up in RAM |
+| `upstream_keepalive_expiry` | `30.0` | `http_clients.py` → `httpx.Limits` | How long an idle keep-alive connection to a backend stays open |
+
+Two outbound pools are built once in the lifespan (`app/http_clients.py`):
+
+- `inference_client` — capped at `max_concurrency`; used by `proxy.py`, `messages.py`
+  and `rerank.py`. httpcore queues excess requests instead of dropping them, so a
+  large request volume is legitimate traffic. A `PoolTimeout` (queue wait exceeded)
+  becomes 503, not a 502 upstream failure.
+- `client` (control plane) — larger and ungated; used by the System One backend, the
+  web search provider, model discovery, health probes and the management API. A busy
+  model therefore never makes the console report every upstream as offline.
+
+`security.rate_limit` is a **different** control: it rejects excess requests per minute
+with 429 (brute-force / abuse mitigation). The concurrency gate only paces traffic;
+it never refuses a request for arriving too frequently. Both can be enabled together.
 
 `follow_redirects=False` and `trust_env=False` are code-level constants, not config: the gateway
 never follows an upstream redirect and never lets a system-wide `HTTP_PROXY` hijack a backend call.
@@ -220,7 +236,7 @@ Consumed by `app/systemone.py` for `POST /v1/systemone`.
 | `enabled` | `false` | `false` → **404** |
 | `backend` | `http://127.0.0.1:8080` | Base URL of the decision backend — a laya-server deployment or Ollama 0.40+. Same URL validation as `base_url` |
 | `model` | `auto` in the model, `local` in a generated config, a real name in the shipped file | Injected into the forwarded body only when concrete and the caller sent no `model`; the sentinel `"local"` means "do not inject". **The two backends disagree**: laya-server accepts only the enum `auto` / `english` / `multilingual` / `typed-decisions` (anything else **422**), while Ollama wants an installed model name (`auto` → **404**). Also the `api_models.systemone` fallback |
-| `api_key_env` | `SYSTEMONE_SERVER_API_KEY` | *Name* of the env var holding the backend key; when set it is sent as `Authorization: Bearer` even to an Ollama backend, which ignores it. Must end in `_API_KEY` / `_API_TOKEN` — pointing it at `ADMIN_PASSWORD` is refused. This is the **outbound** key (llm-hub → backend); the caller's **inbound** key is a gateway API key from `api_keys`. Startup logs both the resolved URL and whether this variable is set |
+| `api_key_env` | `SYSTEMONE_SERVER_API_KEY` | *Name* of the env var holding the backend key; when set it is sent as `Authorization: Bearer` even to an Ollama backend, which ignores it. Must end in `_API_KEY` / `_API_TOKEN` — pointing it at `ADMIN_PASSWORD` is refused. This is the **outbound** key (llm-hub → backend); the caller's **inbound** key is a gateway API key from `api_keys`. Startup logs both the resolved URL and whether this variable is set. An **empty** value is a valid *unsigned by design* mode (Ollama 0.40+ ignores `Authorization`): it logs one startup warning naming the setting, but no per-request "environment variable is not set" with a blank name |
 | `path` | `v1/systemone` | Endpoint path on `backend` |
 | `timeout` | `60.0` | Read timeout; `0`/empty falls back to `server.request_timeout` |
 
@@ -245,11 +261,21 @@ may be omitted, in which case the provider picks.
 
 | Field | Default | Effect |
 |---|---|---|
-| `enabled` | `true` | The write switch, evaluated **per request** (`proxy._logging_on`): with `false` request/response bodies are not even copied and no row is written. Because the flag is re-read on every call, saving the file applies within ~1s with no restart. While off, `/v1/management/overview` and `/requests` report `request_log.enabled: false`, so the console can say "logging disabled" instead of showing an empty list that looks like no traffic |
+| `enabled` | `true` | The write switch, evaluated **per request** (both `proxy._logging_on` and the security middleware): with `false` request/response bodies are not even copied and no row is written. Because the flag is re-read on every call, saving the file applies within ~1s with no restart. While off, `/v1/management/overview` and `/requests` report `request_log.enabled: false`, so the console can say "logging disabled" instead of showing an empty list that looks like no traffic |
+
+**Coverage:** every API call produces one row, not just proxied ones. The rich row (request/response
+bodies, token usage, resolved `model`, `upstream`, `stream`) is built in `ProxyService.forward`.
+Standalone in-process handlers (`/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`,
+`/v1/messages`, `/v1/models`, `/api/tags`, `/api/ps`) and requests refused by the security
+middleware (public-zone 401/404, rate limit 429, body cap 413) are written by the
+middleware as a **metadata-only** row: method, path, query, status, duration, client IP and the
+denial reason, with no body/token/upstream. An ASGI-scope claim flag prevents a proxy call from
+being written twice. `/v1/management/*`, `/admin/*`, docs and static assets are control-plane
+noise and never enter the log; `HEAD` and `OPTIONS` are forwarded but never recorded, so a
+liveness monitor or CORS pre-flight cannot drown the log.
 
 Storage location and retention are deliberately **not** in this file — `REQUEST_LOG_DB`,
-`LLMHUB_DB` and `REQUEST_LOG_RETENTION_DAYS` stay deployment-level. A `HEAD` request is forwarded
-but never recorded, so a liveness monitor cannot drown the log.
+`LLMHUB_DB` and `REQUEST_LOG_RETENTION_DAYS` stay deployment-level.
 
 ## `security`
 
@@ -366,9 +392,19 @@ answers **403** rather than a **404** claiming the endpoint does not exist; see
 | `blocked_paths` | `[]` | Operator deny-list, enforced **everywhere** (exact name or trailing-`*` prefix), in addition to the public admin blocklist. Checked in `proxy.py` through `SecurityConfig.is_path_blocked()` |
 | `cors_origins` | `[]` | Exact origins allowed cross-site; empty sends no CORS headers at all. The middleware answers a preflight with a **bodyless `204`**, only for a listed origin. A preflight is still bound by the zone's path policy: the internal listener answers any path, while on the public socket `OPTIONS` is a method like any other and must be listed in `security.public.path_allowlist` — otherwise the preflight is a **404** and the browser never sends the real call |
 | `max_body_bytes` | `33554432` | Request body cap: a `Content-Length` over it → **413** in the middleware, and a chunked body is counted while streaming (`read_limited_body`) before the proxy, messages, websearch and systemone paths forward it |
-| `allow_query_api_key` | `false` | Whether `?api_key=…` is a credential transport. Off by default: a URL key lands in access logs. The key is masked in the request log either way |
-| `allowed_client_ips` | `[]` | CIDR fence, **403** outside the list. It fences clients; it never selects a zone |
-| `trusted_proxies` | `[]` | CIDRs whose `X-Forwarded-For` `client_ip()` may read — used for IP fencing, rate-limit buckets and audit rows, never for a zone. It takes the **rightmost untrusted hop**, so a forged leftmost value cannot pick an internal address. Behind nginx, overwrite the header (`proxy_set_header X-Forwarded-For $remote_addr`) rather than append |
+
+Two behaviours are deliberately **not configurable**:
+
+- Caller keys are read from `Authorization: Bearer` / `X-API-Key` headers only. A
+  `?api_key=…` query parameter is never a credential, so keys cannot leak into
+  access logs, browser history or `Referer` (the request log still masks sensitive
+  query values, because clients send them by mistake).
+- `X-Forwarded-*` / `X-Real-IP` are never trusted. Rate-limit buckets and audit rows
+  always record the real TCP peer (`auth.peer_ip()`). Behind a reverse proxy every
+  request shares one address, so prefer `rate_limit.by: key` or throttle at the proxy.
+
+The retired `allow_query_api_key` / `trusted_proxies` keys are ignored with a startup
+warning so an old config file cannot silently resurrect them.
 
 ### `security.rate_limit`
 
@@ -377,7 +413,7 @@ answers **403** rather than a **404** claiming the endpoint does not exist; see
 | `enabled` | `false` | In-memory token bucket, **429** with `Retry-After` when over budget. Startup warns when a public listener is open and this is off. Single process only — it is not a distributed limiter |
 | `per_minute` | `60` | Sustained refill rate |
 | `burst` | `20` | Bucket capacity = max immediate requests |
-| `by` | `ip` | Bucket key: `ip` → `client_ip()` (or `unknown`), `key` → the caller's API key, falling back to the IP when a request carries none. Stale buckets are pruned past 5 000 entries |
+| `by` | `ip` | Bucket key: `ip` → `peer_ip()` (or `unknown`), `key` → the caller's API key, falling back to the IP when a request carries none. Stale buckets are pruned past 5 000 entries |
 
 ## Path surface — the closed set of callable paths
 
@@ -495,7 +531,7 @@ ignored.
 |---|---|
 | `CONFIG_PATH` | Which file to load |
 | `ADMIN_PASSWORD` | Console sign-in only; it is never a Bearer / `X-API-Key` credential |
-| `ADMIN_SESSION_TTL` | Cookie lifetime (default 12 h, clamped 5 min…7 d, sliding renewal) |
+| `ADMIN_SESSION_TTL` | Cookie lifetime (default 12 h, clamped 5 min…7 d, sliding renewal). Sessions carry a per-session salt; changing `ADMIN_PASSWORD` or restarting the process invalidates all of them |
 | `REQUEST_LOG_DB` / `LLMHUB_DB` | Database file for `requests` / for `bench_results` + `api_keys` |
 | `REQUEST_LOG_RETENTION_DAYS` | Row retention (`0` = keep forever, pruned hourly) |
 | `*_API_KEY` / `*_API_TOKEN`, named by `systemone.api_key_env` / `websearch.api_key_env` | Provider credentials; the file may only name the variable, never hold the value |

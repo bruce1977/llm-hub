@@ -17,6 +17,7 @@ Run:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -329,6 +330,69 @@ def run() -> int:
         check("concrete model injected", kwargs["json"].get("model") == "multilingual", str(kwargs.get("json")))
         # caller credentials must NOT be forwarded
         check("caller key not forwarded", "X-Api-Key" not in {k.lower() for k in kwargs["headers"]})
+
+        # --------------------------------------------- /v1/systemone: unsigned modes ---
+        # `api_key_env: ''` is a valid unsigned mode (an Ollama backend ignores Authorization),
+        # NOT a missing variable with a blank name. A NAMED variable that is unset must still
+        # warn - and must print its name, so the operator knows what to set.
+        print("[5b] POST /v1/systemone unsigned modes (empty env NAME vs missing VALUE)")
+
+        class _Warnings(logging.Handler):
+            def __init__(self):
+                super().__init__(level=logging.WARNING)
+                self.messages: list[str] = []
+
+            def emit(self, record):
+                self.messages.append(record.getMessage())
+
+        hub_log = logging.getLogger("llm_hub")
+        captured = _Warnings()
+        hub_log.addHandler(captured)
+        old_level = hub_log.level
+        hub_log.setLevel(logging.WARNING)
+        so_cfg = app.state.manager._config.systemone
+        saved_env = so_cfg.api_key_env
+        try:
+            so_cfg.api_key_env = ""
+            app.state.client.request = AsyncMock(return_value=make_fake_response())
+            r = client.post("/v1/systemone", headers=HEADERS, json=payload)
+            call = app.state.client.request.call_args.kwargs
+            check("empty api_key_env still forwards -> 200", r.status_code == 200, r.text[:120])
+            check(
+                "empty api_key_env sends no Authorization",
+                "authorization" not in {k.lower() for k in call["headers"]},
+                str(call["headers"]),
+            )
+            check(
+                "empty api_key_env logs no nameless warning",
+                not any("Environment variable  is not set" in m for m in captured.messages),
+                str(captured.messages),
+            )
+
+            captured.messages.clear()
+            so_cfg.api_key_env = "SYSTEMONE_SERVER_API_KEY"
+            saved_value = os.environ.pop("SYSTEMONE_SERVER_API_KEY", None)
+            try:
+                app.state.client.request = AsyncMock(return_value=make_fake_response())
+                client.post("/v1/systemone", headers=HEADERS, json=payload)
+                call = app.state.client.request.call_args.kwargs
+                check(
+                    "named-but-unset key forwards unsigned",
+                    "authorization" not in {k.lower() for k in call["headers"]},
+                    str(call["headers"]),
+                )
+                check(
+                    "warning names the missing variable",
+                    any("Environment variable SYSTEMONE_SERVER_API_KEY is not set" in m for m in captured.messages),
+                    str(captured.messages),
+                )
+            finally:
+                if saved_value is not None:
+                    os.environ["SYSTEMONE_SERVER_API_KEY"] = saved_value
+        finally:
+            so_cfg.api_key_env = saved_env
+            hub_log.removeHandler(captured)
+            hub_log.setLevel(old_level)
 
         # --------------------------------------------- /v1/systemone: "local" sentinel ---
         print("[6] 'local' model sentinel (no injection)")

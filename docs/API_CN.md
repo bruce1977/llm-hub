@@ -101,17 +101,19 @@ public 区也从不提供文档（`/docs`、`/openapi.json`、`/static/swagger/*
 HEALTHCHECK 请改用 TCP 端口探测而不是 HTTP 探针。两个监听必须映射到不同的宿主端口——两个宿主端口
 指向同一个容器套接字并不会产生两个区。
 
-**`security.trusted_proxies` 不是区锚点。** X-Forwarded-For 绝不用于判定区。它只在**真实 TCP 对端**是
-声明的可信代理时才被采信以计算 `client_ip()`，用途仅限 `security.allowed_client_ips` 围栏、限流分桶与
-请求日志审计行。`client_ip()` 取**最右的不可信 XFF 跳**，因此前置代理必须用
-`proxy_set_header X-Forwarded-For $remote_addr;` **覆盖**而非追加——伪造的最左侧值无法冒充内网地址。
-`peer_ip()` 还会拒绝带「端口为 0」改写指纹的 ASGI scope，这正是镜像用 `python serve.py`
-（`proxy_headers=False`）启动、而不让 `ProxyHeadersMiddleware` 改写 `scope["client"]` 的原因。
+**转发头一律不被采信。** `X-Forwarded-For` / `X-Real-IP` 既不能判定区，也不能改变任何准入决策，
+更不会影响限流分桶与请求日志审计行里记录的地址：`auth.peer_ip()` 始终返回**真实 TCP 对端**
+（没有可信代理列表，也没有客户端 IP 白名单）。因此前置反代时所有请求共用一个地址——建议
+`rate_limit.by: key`，或直接在反代层限速。`peer_ip()` 还会拒绝带「端口为 0」改写指纹的
+ASGI scope，这正是镜像用 `python serve.py`（`proxy_headers=False`）启动、而不让
+`ProxyHeadersMiddleware` 改写 `scope["client"]` 的原因。
 
 **管理台会话 Cookie：** 登录 `/v1/management/auth/login` 后签发的签名 Cookie 在**两个区**都是业务 API 的
-凭据，浏览器无需持有调用方 Key。有效期 `ADMIN_SESSION_TTL` 秒（默认 `43200`，钳制 5 分钟 ~ 7 天），
-使用过半后成功请求会自动续期；退出登录只清除浏览器 Cookie，服务端没有会话表，
-被复制的 Cookie 在到期或 `ADMIN_PASSWORD` 变更之前仍然有效。
+凭据，浏览器无需持有调用方 Key。令牌格式为 `<sid>.<过期时间>.<签名>`：每次登录生成随机 session id，
+签名密钥由 `ADMIN_PASSWORD` + session id + 进程启动时生成的随机 seed 派生，seed 从不写入 Cookie 或日志，
+因此拿到 Cookie 也无法离线爆破密码。有效期 `ADMIN_SESSION_TTL` 秒（默认 `43200`，钳制 5 分钟 ~ 7 天），
+使用过半后成功请求会换一个新 session id 自动续期；退出登录只清除浏览器 Cookie，服务端没有会话表，
+被复制的 Cookie 在到期、`ADMIN_PASSWORD` 变更或进程重启（seed 轮换）之前仍然有效。
 
 **Swagger UI：** 在内网区打开 `/docs`（需 `security.internal.expose_docs: true`；public 区从不提供文档）。
 **每个端点的 Parameters 区都有一个 `X-API-Key` 输入框**——点 **Try it out** 后填入 Key，点 **Execute**
@@ -1058,7 +1060,7 @@ Web 管理台使用的只读接口，统一挂在 `/v1/management` 前缀下（�
 「Web 管理台」一节）；静态壳层不鉴权——登录页要能打开——但页面内每一次数据请求
 都经过 `require_admin_session`。除登录外，全部接口**只认一种凭据**：由
 `POST /v1/management/auth/login` 用 `ADMIN_PASSWORD` 换取的会话 Cookie
-（`llmhub_admin`，HMAC 签名、HttpOnly）。
+（`llmhub_admin`，HMAC 签名、HttpOnly）。签名密钥按 session id 加盐派生，Cookie 本身不含任何密钥。
 
 **网关 API Key 不是管理员凭据。** 这类 Key 会分发给每个调用方；如果管理接口也接受它，
 任一调用方就能读取完整配置（含上游供应商密钥）、导出所有人的请求正文、改写上游地址。
@@ -1094,10 +1096,10 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
 | `GET` | `/v1/management/models/rerank` | Rerank 配置投影（`api_key` 一律掩码为 `••••••`），含 `upstream_api` / `on_error` 与请求/响应示例 |
 | `GET` | `/v1/management/models/systemone` | System One 配置投影（同样掩码），含请求/SSE 示例 |
 | `GET` | `/v1/management/tools/websearch` | Web Search 配置投影：`enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url`（由 provider upstream 派生）/ `api_key_env` / `api_key`（掩码）/ `timeout` / `provider_configured` |
-| `GET` | `/v1/management/requests` | 请求明细：`start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`，返回 `stats` + `rows` + `pagination` + `request_log`（开关状态）。**只统计 API 调用**：查询始终带上 `request_log.API_PATH_SCOPE`（`path LIKE '/v1/%' OR path LIKE '/api/%'`），`/health`、`/metrics`、`/openapi.json`、`/admin/*` 等行照旧入库，但不出现在列表、图表、KPI 与失败统计里 |
+| `GET` | `/v1/management/requests` | 请求明细：`start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`，返回 `stats` + `rows` + `pagination` + `request_log`（开关状态）。**只统计 API 调用**：查询始终带上 `request_log.API_PATH_SCOPE`（`path LIKE '/v1/%' OR path LIKE '/api/%'`）；`/v1/management/*`、`/admin/*`、docs 与静态资源根本不写库，`/health` 等非 API 路径仍会入库但不出现在列表、图表、KPI 与失败统计里（`GET /requests/{id}` 详情接口故意不加这个范围，深链仍能打开） |
 | `GET` | `/v1/management/requests/{id}` | 单条明细（含截断至 8 KB 的请求/响应体，敏感字段已脱敏） |
 | `GET` | `/v1/management/stats/timeseries` | 时序聚合：`bucket=hour\|day`，每桶 `count` / `errors` / `p95`。`tz_offset`（UTC 加多少分钟等于调用方本地时间，UTC+8 为 `480`，取值 -840..840）只影响 **day** 桶的分组，让每根柱子是一个本地自然日而不是 UTC 日；hour 桶保持 UTC，因为控制台是把它们当时间点渲染成本的 |
-| `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count}]}`；`status` 只分 `ok`(<500，含 4xx) / `error`(≥500)，与错误率、趋势图错误柱、`failures` 同一口径；未命中上游的行计入 `-` |
+| `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count, display?}]}`。`status` 分**三类**：`ok`(2xx) / `failed`(≥500) / `warning`(3xx、4xx、NULL 及其他)；`failed` 仍与错误率、趋势图错误柱、`failures` 共用 ≥500 阈值，4xx 现在作为 `warning` 可见，不再被并入 `ok`。`group_by=model` 时每项另带 `display`：有 `model_aliases` 短名则显示短名，否则显示真实 id；`key` 始终是解析后的真实模型 id，筛选逻辑不变。未命中上游的行计入 `-` |
 | `GET` | `/v1/management/stats/failures` | 失败统计：`by_code` / `by_upstream` / `samples` |
 | `GET` | `/v1/management/api-test/models` | 每个 API 家族的可用模型、默认值与掩码密钥：`kinds` 以 `generate` / `chat` / `messages` / `embed_ollama` / `embed_openai` / `rerank` / `systemone` / `websearch` 为键，每键含 `method` / `endpoint` / `family` / `model_required` / `free_model` / `enabled` / `source`（选项来自哪个配置项）/ `models[]`（`model` / `display` / `alias` / `derived` / `target` / `upstream` / `type` / `running` / `device` / `api_key`（掩码）/ `unknown`）/ `default_model` / `api_key`（掩码）/ `api_key_env`；顶层另有 `max_response_bytes`。`api_models` 为空时按配置推导；`/api/...` 原生端点（`generate`、`embed_ollama`）只列 `type: "ollama"` 上游的模型，`/v1/...` 端点（`chat`、`messages`、`embed_openai`）也列 `lmstudio` / `opencode` 的模型；显式 `api_models` 列表按原样返回（封闭集合，忽略 `- ''` 之类的空白占位符，且 `free_model=false`）。一次探测所有上游，所以前端整站共用一份缓存，只在首次打开与点击「重新探测」时取 |
 | `POST` | `/v1/management/api-test` | Body `{"kind": "generate", "body": {...}}`；服务端用网关自己的服务发出这一笔请求，返回信封 `status` / `ok` / `duration_ms` / `ttft_ms` / `content_type` / `stream` / `requested_model` / `model` / `upstream` / `injected` / `body` / `text` / `truncated` / `error`。`kind` 不在白名单、或需要模型的家族没给 `model` → `400` |
@@ -1127,7 +1129,8 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
              { "key": "lmstudio", "count": 380 },
              { "key": "-", "count": 12 } ] }
 
-// group_by=status 只有两个键：ok（status < 500，含 4xx）与 error（status >= 500）
+// group_by=status 三个键：ok（2xx）、failed（>= 500）、warning（3xx / 4xx / NULL / 其他）
+// group_by=model 每项带 display（有别名显示短名，否则显示真实 id），key 始终是真实 id
 
 // GET /v1/management/tools/websearch
 { "enabled": true, "endpoint": "/v1/tools/web-search", "upstream": "opencode",
@@ -1142,7 +1145,8 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
 
 **请求日志（SQLite）：**
 
-每笔请求在 `requests` 表中占一行，字段覆盖请求参数、耗时与响应结果：
+每笔 API 调用在 `requests` 表中占一行（含独立 handler 与 middleware 拒绝，见下方覆盖范围；
+management / console / docs / 静态资源除外），字段覆盖请求参数、耗时与响应结果：
 
 | 分类 | 字段 |
 |------|------|
@@ -1156,20 +1160,30 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
   `prompt_eval_count` / `eval_count`；`tokens` 继续保存总量，优先采用上游自己回报的 `total_tokens`
   （它计入推理 token 时会大于两者之和）。上游没有回报用量时三列都是 `NULL`，与真实的 `0` 可区分。
 - **入库开关**：`config.yaml` 的 `request_log.enabled`（默认 `true`，节点参考见
-  [CONFIG_CN.md](CONFIG_CN.md) 的 `request_log`）逐请求读取，无需重启。
-  关掉后代理不再采集请求/响应体、也不写库，`/overview` 与 `/requests` 里的
+  [CONFIG_CN.md](CONFIG_CN.md) 的 `request_log`）由代理与安全 middleware **逐请求共同读取**，
+  无需重启。关掉后两个写入点都不采集请求/响应体、也不写库，`/overview` 与 `/requests` 里的
   `request_log.enabled` 会回报 `false`；改回 `true` 即恢复记录。
   配置热加载每秒最多比对一次文件 mtime，所以开关在**约 1 秒内**生效（已实测）。
   数据库路径与保留天数仍由环境变量决定。
+- **每笔 API 调用恰好一行，包含代理看不到的调用方**：`ProxyService.forward` 写**完整行**（请求/响应体、
+  token 用量、`model`、`upstream`、`stream`）；安全 middleware 为两类请求写**仅元数据行**——
+  进程内的独立 handler（`/v1/systemone`、`/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`、
+  `/v1/models`、`/api/tags`、`/api/ps`）以及所有 middleware 拒绝（公网区 401/404、限流 429、
+  请求体超限 413）。仅元数据行的 body/token/upstream 列为 `NULL`，但 `error` 保存拒绝原因，
+  因此像 `Missing API key: POST /v1/systemone` 这样的无 Key 探测也能在 Requests 页审计。
+  ASGI scope 上的认领标记（`request.state.request_log_claimed`）防止代理调用被写两次
+  （流式行在响应返回后才由 body 迭代器写入）。`/v1/management/*`、`/admin/*`、docs 与静态资源
+  **完全不写库**；`HEAD` 与 `OPTIONS` 照常转发但都不记录。
 - 默认写入 `config.yaml` 同级目录的 `llmhub.db`（容器内即 `/data/llmhub.db`），WAL 模式；
   可用 `REQUEST_LOG_DB` 覆盖路径、`REQUEST_LOG_RETENTION_DAYS`（默认 30，0 表示永久保留）控制清理。
 - 旧库自动升级：启动时比对 `PRAGMA table_info(requests)`，缺失的列用 `ALTER TABLE ADD COLUMN` 补齐。
 - 写入通过有界内存队列异步批量落盘，不阻塞转发主链路；队列满时丢弃并告警。
 - 请求/响应体截断至 8 KB，`authorization`、`api_key`、`token`、`password` 等字段在落库前替换为 `***`。
-- **`HEAD` 请求只转发、不记录**：它没有请求体也没有响应体，且监控探活会持续发送，记下来只会淹没真实
-  调用。转发路径照旧，写入判定只在 `logging_on = self._logging_on(cfg) and method != "HEAD"` 一处。
-  catch-all 接受 `HEAD`（它在 `HTTP_METHODS` 中）；现在没有全局方法门禁。public 区的 `HEAD` 仍须作为
-  方法+路径对出现在 `security.public.path_allowlist` 里，否则 404。
+- **`HEAD` 与 `OPTIONS` 只转发、不记录**：它们没有请求体也没有响应体，且监控探活与 CORS 预检会持续发送，
+  记下来只会淹没真实调用。转发路径照旧，代理与 middleware 的写入判定都排除了这两个方法
+  （`method not in ("HEAD", "OPTIONS")`）。catch-all 接受 `HEAD`（它在 `HTTP_METHODS` 中）；
+  `OPTIONS` 预检由 middleware 以无响应体的 `204` 直接应答。现在没有全局方法门禁。public 区的
+  `HEAD` / `OPTIONS` 仍须作为方法+路径对出现在 `security.public.path_allowlist` 里，否则 404。
 
 **调用方 API Key（存储在 SQLite，实现在 `app/key_store.py`）：**
 
@@ -1278,8 +1292,8 @@ Cookie（调用方 API Key 返回 401），把页面填好的 body 重建成一�
 **网关边界：** `/v1/management/*` 在 public 区默认是硬 404（`security.public.path_allowlist` 强制检查中的
 一条红线），在内网区则只认会话 Cookie——网关 Key 永远打不开它。唯一的例外是
 `security.public.admin_endpoints: allow`：它让 `/admin*` 与 `/v1/management/*` 在 public 监听上被路由
-（前缀规则，不走允许清单），但仍要求会话 Cookie。在内网区它仍受 `security.allowed_client_ips`
-与 `security.rate_limit` 约束。管理台只读，不提供任何修改 `config.yaml` 的写接口。
+（前缀规则，不走允许清单），但仍要求会话 Cookie。在内网区它仍受 `security.rate_limit` 约束。
+管理台只读，不提供任何修改 `config.yaml` 的写接口。
 两组成员会**真的向外发请求**：测速（`/bench`）额外写
 `bench_results` 表，接口测试（`/api-test`）只像一次普通调用那样写请求明细，两者都不碰配置。
 
@@ -1369,7 +1383,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 |--------|----------|------|
 | `400` | Bad Request | 无效 JSON、缺少必填字段或请求格式错误 |
 | `401` | Unauthorized | 缺少 API 密钥 |
-| `403` | Forbidden | API 密钥无效、IP 不在 `security.allowed_client_ips` 内或端点被阻止 |
+| `403` | Forbidden | API 密钥无效或端点被阻止 |
 | `404` | Not Found | 未知端点、不在网关可转发集合内的路径（两个区都一样，见[可调用路径与拒绝](#可调用路径与拒绝)）、public 区未列入 `security.public.path_allowlist` 的方法+路径（无论带不带 Key），或模型未找到 |
 | `405` | Method Not Allowed | 以非 POST 方法调用只接受 POST 的端点。这来自 catch-all 的 `POST_ONLY_PATHS` 守卫（`/v1/rerank`、`/rerank`、`/api/rerank`、`/v1/systemone`、`/v1/tools/web-search`、`/api/generate`、`/api/chat`、`/v1/chat/completions`、`/v1/completions`、`/api/embed`、`/v1/embeddings`、`/v1/messages`、`/v1/message`），会带上 `Allow: POST`，而不是把请求代理到上游。已没有全局方法白名单；public 区其它路径方法不对时，因该「方法+路径」对未列入而返回 404 |
 | `413` | Request Entity Too Large | 请求体超过大小限制 (默认 32MB) |

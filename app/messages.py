@@ -41,6 +41,7 @@ import httpx
 from auth import read_limited_body
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from http_clients import inference_timeout
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 logger = logging.getLogger("llm_hub")
@@ -227,7 +228,8 @@ class MessagesService:
         payload = self._build_payload(req, target, is_ollama, extra_params, cfg)
 
         url = f"{upstream.base_url_stripped()}/{'api/chat' if is_ollama else 'v1/chat/completions'}"
-        timeout = upstream.timeout or cfg.server.request_timeout
+        timeout_s = upstream.timeout or cfg.server.request_timeout
+        timeout = inference_timeout(timeout_s, cfg)
 
         logger.info(
             "Messages: %r -> %r | model=%r | stream=%s",
@@ -250,6 +252,12 @@ class MessagesService:
                 "POST", url, json=payload, timeout=timeout, headers=upstream_headers
             )
             resp = await self.client.send(http_req, stream=req.stream)
+        except httpx.PoolTimeout as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Inference upstreams are busy; please retry shortly.",
+                headers={"Retry-After": "5"},
+            ) from exc
         except httpx.ConnectError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -258,7 +266,7 @@ class MessagesService:
         except httpx.ReadTimeout as exc:
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail=f"Upstream '{upstream.name}' timed out after {timeout}s.",
+                detail=f"Upstream '{upstream.name}' timed out after {timeout_s}s.",
             ) from exc
         except httpx.HTTPError as exc:
             raise HTTPException(

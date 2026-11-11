@@ -1291,6 +1291,7 @@ def main() -> int:
         print("[16c] console session cookie / session lifecycle")
         from admin_auth import (
             ADMIN_COOKIE_NAME,
+            _mint,
             _sign,
             create_admin_token,
             refresh_due,
@@ -1310,8 +1311,8 @@ def main() -> int:
                   client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: token}).status_code == 200)
             check("a forged console session does not",
                   client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: "1.deadbeef"}).status_code == 401)
-            past = int(__import__("time").time()) - 10
-            expired = f"{past}.{_sign(str(past), pw)}"
+            past = int(time.time()) - 10
+            expired = _mint(past, pw)
             check("an expired console session does not",
                   client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: expired}).status_code == 401)
             check("session_remaining reports a live session",
@@ -1320,9 +1321,24 @@ def main() -> int:
             check("verify_admin_token rejects a tampered token",
                   verify_admin_token("1.deadbeef", pw) is False)
 
+            # Per-session salt: the cookie exposes `sid` but never the signing key.
+            sid = token.split(".")[0]
+            check("each session mints a fresh session id",
+                  create_admin_token(pw).split(".")[0] != sid)
+            swapped = token.split(".")
+            swapped[0] = "AAAAAAAAAAAAAAAAAAAAAA"
+            check("changing the session id breaks the signature",
+                  verify_admin_token(".".join(swapped), pw) is False)
+            legacy_expiry = int(time.time()) + 999
+            legacy = f"{sid}.{legacy_expiry}.{_sign(f'{sid}.{legacy_expiry}', pw)}"
+            check("a cookie signed with ADMIN_PASSWORD alone is no longer valid",
+                  verify_admin_token(legacy, pw) is False)
+            check("a cookie signed with a different password is rejected",
+                  verify_admin_token(_mint(legacy_expiry, "not-the-admin-password"), pw) is False)
+
             # Sliding renewal: a session past half its TTL gets a fresh cookie.
-            due_expiry = int(__import__("time").time()) + session_ttl() // 4
-            due = f"{due_expiry}.{_sign(str(due_expiry), pw)}"
+            due_expiry = int(time.time()) + session_ttl() // 4
+            due = _mint(due_expiry, pw)
             check("a session past half its TTL is due for renewal", refresh_due(due, pw) is True)
             renewed = client.get("/v1/models", cookies={ADMIN_COOKIE_NAME: due})
             check("middleware re-issues the session cookie",

@@ -83,8 +83,8 @@
 | 运行中模型 | 模型（`model_aliases` 短名作为显示名，`alias` 角标 + 悬停给出真实 id；根 `aliases:` 声明的派生模型是**独立一行**，带 `derived` 角标，悬停提示它运行在哪个目标模型上）/ 上游 / 设备（GPU / 部分 / 纯 CPU / Cloud，不显示百分比）/ 上下文长度。除 `/api/ps` 的驻留模型外，还列出托管上游（OpenCode）探测成功时它声明的模型，这些行设备显示 **Cloud**、显存与占用为 `-`；派生模型行设备沿用目标模型所在实例、显存同样显示 `-`（那份显存已计在目标模型名下），KPI「运行中模型数」只统计真实模型，不会重复计数 | `/v1/management/overview` |
 | 趋势图（起止时间） | 标题区提供 `起始时间 → 结束时间` 两个 `datetime-local` + 应用按钮（三者同为 32px 盒高），柱=每小时请求数，折线=P95 延迟（ECharts）；时间范围与 Requests 页一样只统计 `/v1/*`、`/api/*` 的调用 | `/v1/management/stats/timeseries` |
 | 分布饼图 · Upstream | 实心饼图（不是圆环），饼上不再画标签；名称与数量收在**图形下方一行一条**的可滚动图例里，字号 9.5px、行高 10.5px，名称超 16 字截断并附计数——长模型 id 既不会压到图形，也不会横向挤成一行 | `/v1/management/stats/distribution?group_by=upstream` |
-| 分布饼图 · Model | 同上，按 model 分组 | `/v1/management/stats/distribution?group_by=model` |
-| 分布饼图 · 成功/失败 | 同上，成功 `ok` 绿 / 失败 `error` 红 | `/v1/management/stats/distribution?group_by=status` |
+| 分布饼图 · Model | 同上，按 model 分组；图例**优先显示 `model_aliases` 别名短名**（后端 `display` 字段），`key` 仍是解析后的真实 id，供筛选与配色使用 | `/v1/management/stats/distribution?group_by=model` |
+| 分布饼图 · 状态 | 同上，分三类：`ok`(2xx) 绿 / `warning`(3xx、4xx、其他) 琥珀 / `failed`(≥500) 红；`failed` 与错误率、趋势图错误柱、`failures` 同一阈值 | `/v1/management/stats/distribution?group_by=status` |
 | 即时刷新 | 「聚合视图 · 数据每 1 分钟自动刷新」后 `↻` 按钮；刷新期间 `↻` 持续旋转并禁用、顶栏底部走一条不确定进度条、副标题转成「刷新中…」并带小号 spinner、KPI 卡降透明度、图表蒙上带 spinner 的薄纱，完成后恢复「最后更新 …」 | 前端轮询 |
 | 主题 / 折叠 | 左下角账户菜单内切换明暗（图表随主题重绘）；侧栏折叠 / 恢复 | 前端 |
 | 页签图标 | `web/public/favicon.svg`（蓝紫渐变圆角方块 + 汇聚节点标志），构建时原样复制到 `app/web/`，经 `/admin/favicon.svg` 服务，离线容器与 CSP 均可用 | 静态资源 |
@@ -428,12 +428,13 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
   "items": [ { "key": "Ollama-Arc-B65", "count": 642 },
              { "key": "Ollama-iGPU", "count": 380 },
              { "key": "LM-Studio-local", "count": 262 } ] }
-// group_by=model   -> items: qwen3.6:35b-pruned / qwen3.5:9b / qwen3-reranker:4b-rk / bge-m3
-// group_by=status  -> items: ok(<500, incl. 4xx)=1247 / error(5xx)=37
+// group_by=model   -> items: {key: "bge-m3:latest", display: "bge-m3", count: 460} / ...
+//                     display 优先取 model_aliases 短名，key 保持真实 id
+// group_by=status  -> items: ok(2xx)=1247 / warning(3xx、4xx、其他)=82 / failed(>=500)=37
 ```
-> 三张分布图（各 Upstream / 各 Model / 成功失败）均由该接口按不同 `group_by` 取数；前端用 **ECharts** 渲染**实心饼图**（不是圆环）：饼上不画任何标签（长模型 id 曾与图形叠在一起），名称与计数收在**图形下方一行一条**的可滚动图例里（9.5px 字号 / 10.5px 行高、名称超 16 字截断并附计数），圆盘半径按容器短边计算并上移，图例永不压到扇区；颜色随主题切换明暗。趋势图（柱+折线）由 `stats/timeseries` 驱动，同样为 ECharts。
+> 三张分布图（各 Upstream / 各 Model / 状态分布）均由该接口按不同 `group_by` 取数；前端用 **ECharts** 渲染**实心饼图**（不是圆环）：饼上不画任何标签（长模型 id 曾与图形叠在一起），名称与计数收在**图形下方一行一条**的可滚动图例里（9.5px 字号 / 10.5px 行高、名称超 16 字截断并附计数），圆盘半径按容器短边计算并上移，图例永不压到扇区；颜色随主题切换明暗。状态图三色：`ok` 绿、`warning` 琥珀、`failed` 红；模型图优先显示别名短名，避免长 id 被截断。趋势图（柱+折线）由 `stats/timeseries` 驱动，同样为 ECharts。
 
-> 说明：Dashboard 已移除「失败请求明细」列表（失败明细统一在 Requests 页按状态筛选查看）；成功/失败分布以饼图呈现，不再单列错误样例表。后端仍保留 `GET /v1/management/stats/failures`（返回 `by_code` / `by_upstream` / `samples`），本期前端不再调用。
+> 说明：Dashboard 已移除「失败请求明细」列表（失败明细统一在 Requests 页按状态筛选查看）；状态分布以饼图呈现，不再单列错误样例表。后端仍保留 `GET /v1/management/stats/failures`（返回 `by_code` / `by_upstream` / `samples`），本期前端不再调用。
 
 ### 3.5 接口测试（api-test）
 
@@ -560,7 +561,7 @@ API Key**（客户端拿 `Authorization: Bearer` / `X-API-Key` 调网关的那�
 - 网关按 fail-closed 规则拒绝启动：只有「`api_keys` 表为空 **且** `ADMIN_PASSWORD` 未设置 **且** 没有可
   匿名的内网分区（`security.internal.allow_anonymous: false`）」时才拒绝（`main.lifespan` 抛
   `RuntimeError`），因为此时系统不可能存在任何凭据。表为空但 `ADMIN_PASSWORD` 已设置是合法状态：登录
-  `/admin` 签一把 Key 即可。公网分区永远要求 Key，`security.allowed_client_ips` 围栏与任何转发头都不能
+  `/admin` 签一把 Key 即可。公网分区永远要求 Key，任何客户端 IP 或转发头都不能
   免除这一要求；存在允许匿名的内网分区（`security.internal.allow_anonymous: true`，适合仅 LAN 部署）时
   也不必启动即拒绝。
 

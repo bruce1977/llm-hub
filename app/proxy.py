@@ -16,9 +16,10 @@ import time
 from typing import Any
 
 import httpx
-from auth import client_ip, is_public, read_limited_body
+from auth import is_public, peer_ip, read_limited_body
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
+from http_clients import inference_timeout
 from request_log import extract_token_usage, now_ts, sanitize_body, sanitize_query
 
 logger = logging.getLogger("llm_hub")
@@ -263,9 +264,15 @@ class ProxyService:
         path_clean = posixpath.normpath(raw_path)
         if path_clean == ".":
             path_clean = ""
-        # A HEAD carries no body and no answer, and monitors send it continuously, so it is
-        # forwarded but never recorded - the log is for calls, not for liveness probes.
-        logging_on = self._logging_on(cfg) and method != "HEAD"
+        # HEAD (liveness) and OPTIONS (CORS pre-flight) carry no call to audit and are
+        # sent continuously, so they are forwarded but never recorded. Keep this in sync
+        # with the middleware's metadata fallback, which skips the same two verbs.
+        # Claim the row on the shared ASGI scope whether or not we end up writing it: this
+        # request went through the proxy, so the middleware's fallback must not add a
+        # second one (notably for streaming calls, whose rich row is written in the body
+        # iterator's finally block, after the middleware has already returned).
+        logging_on = self._logging_on(cfg) and method not in ("HEAD", "OPTIONS")
+        request.state.request_log_claimed = True
         req_text, req_trunc = sanitize_body(raw_body) if logging_on else (None, False)
         requested = (body or {}).get("model")
         meta: dict[str, Any] = {
@@ -276,7 +283,7 @@ class ProxyService:
             "model": None,
             "requested_model": requested if isinstance(requested, str) else None,
             "upstream": None,
-            "client_ip": client_ip(request),
+            "client_ip": peer_ip(request),
             "req_size": len(raw_body),
             "request_body": req_text,
             "request_body_truncated": 1 if req_trunc else 0,
@@ -406,7 +413,10 @@ class ProxyService:
         params = {k: v for k, v in request.query_params.items() if k.lower() != "api_key"}
 
         url = f"{upstream.base_url_stripped()}/{path_clean}" if path_clean else upstream.base_url_stripped()
-        timeout = upstream.timeout or cfg.server.request_timeout
+        timeout_s = upstream.timeout or cfg.server.request_timeout
+        # A Timeout object (not a bare float) keeps the `pool` limit, which caps
+        # how long this request waits for a free inference slot.
+        timeout = inference_timeout(timeout_s, cfg)
 
         logger.info(
             "Forwarding %s /%r -> %r | model=%r | stream=%s",
@@ -443,6 +453,17 @@ class ProxyService:
                 timeout=timeout,
                 meta=meta,
             )
+        except httpx.PoolTimeout as exc:
+            # All inference slots were occupied for `upstream_queue_timeout` seconds.
+            # This is back-pressure, not an upstream failure: tell the caller to retry.
+            logger.warning("Inference pool busy: %s /%r waited too long for a slot", method, path_clean)
+            detail = "Inference upstreams are busy; please retry shortly."
+            self._record_error(meta, status.HTTP_503_SERVICE_UNAVAILABLE, detail)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=detail,
+                headers={"Retry-After": "5"},
+            ) from exc
         except httpx.ConnectError as exc:
             logger.error("Cannot connect to upstream %s (%s): %s", upstream.name, url, exc)
             detail = f"Upstream '{upstream.name}' is unreachable: {exc}"
@@ -450,7 +471,7 @@ class ProxyService:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
         except httpx.ReadTimeout as exc:
             logger.error("Upstream %s read timed out: %s", upstream.name, exc)
-            detail = f"Upstream '{upstream.name}' timed out after {timeout}s."
+            detail = f"Upstream '{upstream.name}' timed out after {timeout_s}s."
             self._record_error(meta, status.HTTP_504_GATEWAY_TIMEOUT, detail)
             raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=detail) from exc
         except httpx.HTTPError as exc:

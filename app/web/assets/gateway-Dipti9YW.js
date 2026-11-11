@@ -1,0 +1,1 @@
+import{W as e}from"./index-vspiX9Cs.js";var t=e({version:null});export{t};

@@ -119,7 +119,7 @@ python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-he
 ```
 
 即使是本地 uvicorn 启动也必须加 `--no-proxy-headers`：否则 `ProxyHeadersMiddleware` 会用调用方提交的
-`X-Forwarded-For` 改写 `scope["client"]`（当 TCP 对端是 `127.0.0.1` 时），使 IP 围栏失效。`serve.py`
+`X-Forwarded-For` 改写 `scope["client"]`（当 TCP 对端是 `127.0.0.1` 时），使审计 IP 被客户端伪造。`serve.py`
 则在代码里设置等价的 `proxy_headers=False`。端口与分区策略只来自 `config.yaml`，不再有端口环境变量。
 
 工作目录必须是 `app/`（与镜像的 `WORKDIR /app` 一致），否则 `.env` 里的 `../data/config.yaml`
@@ -217,7 +217,7 @@ scripts\docker-build.bat
 | `SYSTEMONE_SERVER_API_KEY` | ❌ | System One 后端密钥，仅当 `systemone.api_key_env` 指向它时才需要；laya-server 必需，Ollama 0.40+ 后端会忽略该头 |
 | `OPENCODE_GATEWAY_API_KEY` | ❌ | 联网检索上游密钥，仅当 `websearch.api_key_env` 指向它时才需要（默认留空 = 不签名） |
 | `ADMIN_PASSWORD` | ❌ | Web 管理台登录密码（用户名固定 `admin`），与调用方 API Key 是两套凭据：它只用于 `POST /v1/management/auth/login` 换取 12 小时会话 Cookie，本身当作 `Bearer` / `X-API-Key` 提交仍是 401。所有 `/v1/management/*` 接口**只认**该签名会话 Cookie——网关 Key 会发给每个调用方，在这里一律 401，脚本需先登录并保存 Cookie。未设置时 `/admin` 显示「管理台未启用」，`/v1/management/*` 全部返回 503 |
-| `ADMIN_SESSION_TTL` | ❌ | 管理台会话有效期（秒），默认 `43200`（12 小时），钳制在 `300` ~ `604800`（5 分钟 ~ 7 天）。会话使用过半后成功请求会自动续期；退出登录只清除浏览器 Cookie，服务端没有会话表 |
+| `ADMIN_SESSION_TTL` | ❌ | 管理台会话有效期（秒），默认 `43200`（12 小时），钳制在 `300` ~ `604800`（5 分钟 ~ 7 天）。会话使用过半后成功请求会自动续期；退出登录只清除浏览器 Cookie，服务端没有会话表。签名令牌带随机 session id，密钥由 `ADMIN_PASSWORD` 与进程级随机 seed 共同派生，因此改密码**或重启进程**都会让全部会话失效 |
 | `REQUEST_LOG_DB` | ❌ | 请求明细 SQLite 路径，默认 `CONFIG_PATH` 同目录的 `llmhub.db`（容器内为 `/data/llmhub.db`）。同一个库文件里共有三张表：`requests`（明细）、`bench_results`（测速历史）与 `api_keys`（调用方 Key 的 hash 与掩码） |
 | `LLMHUB_DB` | ❌ | `bench_results` 与 `api_keys` 两张表的库路径，默认同样是 `CONFIG_PATH` 同目录的 `llmhub.db`。只在需要把它们与明细库分开时才设置；三张表默认落在同一个文件，容器只需一个可写 `/data` |
 | `REQUEST_LOG_RETENTION_DAYS` | ❌ | 请求明细保留天数，默认 `30`；`0` 表示永久保留 |
@@ -246,15 +246,14 @@ scripts\docker-build.bat
 请求属于 `internal` 还是 `public`，取决于它**落在哪个本地监听端口上**（`scope["server"]`，由内核分配），
 绝不由客户端 IP、`X-Forwarded-For`、API Key 或任何请求头决定。`serve.py` 设置 `proxy_headers=False`，
 让 uvicorn 无法用伪造的 XFF 改写 `scope["client"]`；`auth.peer_ip()` 还会拒绝带「端口为 0」代理改写
-指纹的 scope。应用侧自己解析 XFF——只对 `security.trusted_proxies` 中声明的 TCP 对端生效，取
-**最右侧的不受信跳**，且只用于 IP 围栏、限流分桶与审计行，绝不改变分区。把两个宿主端口映射到同一个
+指纹的 scope。任何转发头都不被采信：限流分桶与审计行记录的始终是真实 TCP 对端。前置反代时所有请求
+共用一个地址，此时建议 `rate_limit.by: key` 或直接在反代层限速。把两个宿主端口映射到同一个
 容器端口**不会**产生两个区——容器只看到一个 socket。
 
 | 锚点 | 配置方式 | 调用方可否伪造 |
 |---|---|---|
 | 内网监听 socket（内核分配） | `server.port` | 不能 |
 | 公网监听 socket（内核分配） | `security.public.port` | 不能 |
-| 已声明反代的 TCP 对端 | `security.trusted_proxies`（XFF 仅用于 IP 围栏 / 限流 / 审计） | 不能 |
 
 `security.public.port` 决定部署形态：
 
@@ -273,9 +272,9 @@ scripts\docker-build.bat
   `security.public.path_allowlist` 是现有 method+path 组合的完整清单（`re.fullmatch`）；管理接口、
   文档、`/`、`/probe`、`/health` 都是红线——见下方[公网区](#公网区securitypublicport)。
   `/admin` 返回 **404**（没有 admin 外壳开关）。
-- 携带 `X-Forwarded-*` / `X-Real-IP` 的请求，只有当真实 TCP 对端声明在 `security.trusted_proxies` 里时，
-  才用最右不可信跳参与 IP 围栏 / 限流 / 审计；它永不改变分区。这能防止常见的 `^127\.0\.0\.1$` 围栏
-  被伪造的最左侧跳满足。
+- `X-Forwarded-For` / `X-Real-IP` 既不改变任何准入决策，也不改变记录下来的地址：`auth.peer_ip()`
+  始终取真实 TCP 对端。没有可信代理列表，没有 IP 围栏，也没有客户端 IP 白名单。
+  （`X-Forwarded-Proto: https` 仍会被管理台会话 Cookie 读取，用于设置 `Secure`）。
 - 零 API Key 且没有匿名内网区时**失败关闭**：网关**拒绝启动**并打 ERROR。「匿名」现在只表示
   `security.internal.allow_anonymous: true` 作用于真实的内网 socket——既不是全局模式，也不适用于公网区。
 - 在**内网** socket 上 `/` 与 `/health` **永远**匿名（存活 / 信息探针），与 `allow_anonymous` 无关。
@@ -352,8 +351,8 @@ security:
       - ^/api/chat$
 ```
 
-如果既要有受信的内网区、又要有策略不同的公网区，请用方案 B。不要试图用 `security.trusted_proxies`
-表达这种拆分——它不是分区锚点。
+如果既要有受信的内网区、又要有策略不同的公网区，请用方案 B。客户端 IP 与转发头都不是分区锚点，
+只有分离的监听 socket 才是。
 
 ### 方案 B：容器内双监听端口（最可靠，推荐）
 
@@ -413,12 +412,13 @@ docker run -d --name llm-hub \
 吊销的 Key 会同时在这两个端口失效，流式响应也不会被第二跳 HTTP 重新封装。config 无法打开的红线：
 `/v1/management/*`、`/admin*`、含 `..` 段或 NUL 字节的路径——在公网一律 404。
 
-nginx 必须**覆盖**转发头，而不是把客户端给的链追加进去：
+nginx 需要设置 `X-Forwarded-Proto`，管理台会话 Cookie 才会带 `Secure`。网关完全忽略
+`X-Forwarded-For` / `X-Real-IP`，因此无需（也无法）配置 XFF；所有流量都显示为反代的
+TCP 对端，建议 `rate_limit.by: key` 或直接在 nginx 限速：
 
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8835;
-    proxy_set_header X-Forwarded-For $remote_addr;   # 不要用 $proxy_add_x_forwarded_for
     proxy_set_header X-Forwarded-Proto https;        # 会话 Cookie 才会带 Secure
 }
 ```
@@ -452,8 +452,7 @@ curl -m 3 -o /dev/null -w '%{http_code}\n' http://<公网域名>:11434/api/tags 
 
 若公网端口上未列出的路径返回 200、`/admin` 或 `/v1/management/*` 返回的不是 404、或列出的 API
 无 Key 就能用，依次检查：是否旧镜像、挂载的 `config.yaml` 里 `security.public.port` /
-`security.public.path_allowlist` 是否缺失或写错、`.env` 里是否残留旧版端口变量、反代是否追加而非
-覆盖 XFF。
+`security.public.path_allowlist` 是否缺失或写错、`.env` 里是否残留旧版端口变量。
 
 ### 公网部署加固清单（2026-11-09 安全审计后）
 
@@ -464,23 +463,28 @@ curl -m 3 -o /dev/null -w '%{http_code}\n' http://<公网域名>:11434/api/tags 
 2. **轮换凭据**：`ADMIN_PASSWORD` 换成 ≥32 位随机值（照抄 `.env.example` 示例值会被启动自检
    直接拒绝启动），轮换全部 `sk-hub-` 调用方 Key 与 `upstreams[].headers` 里的供应商密钥。
 3. **开启限流**：`security.rate_limit.enabled: true`，或由反代限流。登录已有「5 次失败锁定
-   15 分钟」保护，其他端点没有独立节流。
-4. **管理台只留在内网**：`/admin` 与 `/admin/*` 在公网 socket 上是硬 404（没有 admin 外壳开关）；
+   15 分钟」保护，其他端点没有独立节流。限流是防滥用（429），不是容量保护。前置反代时所有
+   调用方共用一个 TCP 对端，`by: ip` 会把大家算进同一个桶——改用 `by: key` 或在反代层限速。
+4. **设置推理并发闸门**：`server.max_concurrency` 按 GPU 能同时容纳的生成任务数设置（单卡
+   建议 1~2），`server.upstream_queue_timeout` 设成可接受的排队时长（默认 120 秒）。超出的
+   请求排队等空位而不是被拒绝，排队超时返回 503 + `Retry-After`。两者只在启动时读取，
+   改完要重启网关。
+5. **管理台只留在内网**：`/admin` 与 `/admin/*` 在公网 socket 上是硬 404（没有 admin 外壳开关）；
    只从内网 / VPN 或隧道访问管理台。所有 `/v1/management/*` 只认已签名的会话 Cookie，调用方 API Key
    一律 401，在公网更是 404。
-5. **在 config 里声明分区**：把 `security.public.port` 设为与 `server.port` 不同的端口（如 `8001`），
+6. **在 config 里声明分区**：把 `security.public.port` 设为与 `server.port` 不同的端口（如 `8001`），
    两个容器端口映射到**不同的宿主端口**，`server.port` 只发布到内网。监听 socket 才是锚点——
    任何 IP 列表、XFF 或端口环境变量都不能把请求在分区间挪动（旧版端口变量只是迁移提示，请从
-   `.env` 删除）。在 `security.trusted_proxies` 填反代地址；只有这些对端发来的 `X-Forwarded-For`
-   才参与 IP 围栏、限流分桶与审计，且取最右不可信跳。确认镜像以 `python serve.py` 启动
-   （`proxy_headers=False`），不要用裸 `uvicorn main:app`——后者绑不了公网端口，还会让 IP 围栏
+   `.env` 删除）。转发头一律不采信：前置反代时所有调用方共用一个 IP，建议
+   `rate_limit.by: key` 或在反代层限速。确认镜像以 `python serve.py` 启动
+   （`proxy_headers=False`），不要用裸 `uvicorn main:app`——后者绑不了公网端口，还会让审计 IP
    变成客户端可控。`docs` 被隐藏时，公网 API 绝不能同时免 Key。
-6. **收敛信息面**：`security.internal.expose_version: false`，不需要时
+7. **收敛信息面**：`security.internal.expose_version: false`，不需要时
    `security.internal.expose_docs: false`；`security.public.path_allowlist` 只保留最少量的
    `re.fullmatch` method+path 规则（例如 `^/v1/chat/completions$`，而不是宽泛的 `^/v1/.*$`）。
    未列出的组合带不带 Key 都是 404。`GET /v1/management/config` 已对上游 `headers` 打码，
    保存时会自动从磁盘回填真实值。
-7. **容器与依赖（部署层待办，代码未改）**：镜像当前以 root 运行且 `requirements.txt` 只用
+8. **容器与依赖（部署层待办，代码未改）**：镜像当前以 root 运行且 `requirements.txt` 只用
    `>=`，建议改为非 root + 只读根文件系统（仅 `/data` 可写），并生成带 hash 的 lock 文件。
 
 ---

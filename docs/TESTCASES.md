@@ -835,15 +835,12 @@ curl http://localhost:8000/api/chat \
 
 ### 测试 24: IP 白名单拒绝
 
-**配置:**
-
-```json
-{
-  "security": {
-    "allowed_client_ips": ["10.0.0.0/8"]
-  }
-}
-```
+> **本节已废弃（2026-11-11）**：`security.allowed_client_ips` 客户端 IP 围栏已移除。
+> 内外网用监听端口分区，公网一律要 Key，没有「来自某网段即免鉴权」的特权；
+> `X-Forwarded-For` / `X-Real-IP` 现在一律不采信，限流分桶与审计行只用真实 TCP 对端
+> （`auth.peer_ip()`）。现行断言见 `test_xff_is_not_a_decision_input`（伪造 XFF 不改变准入）与
+> `test_retired_security_knobs`（已移除的配置项不会复活）。
+> 下方保留历史用例描述，仅作背景。
 
 **请求 (从非白名单 IP):**
 
@@ -870,16 +867,16 @@ curl http://localhost:8000/v1/models \
 
 | 场景 | 期望 |
 |---|---|
-| 直连请求携带伪造 `X-Forwarded-For: 192.168.10.5` | `peer_ip()` 仍是真实 TCP 对端，白名单不命中 → 401 |
-| ASGI `scope["client"]` 端口为 0 且带转发头（uvicorn 改写指纹） | `peer_ip()` 返回 `None`，`client_ip()` 同样拿不到可信对端，IP 围栏失败关闭；`zone()` 仍只看内核监听 socket |
-| `trusted_proxies: [127.0.0.1/32]`，XFF = `192.168.10.5, 167.104.161.192` | `client_ip()` 取最右不可信跳 `167.104.161.192`，不豁免 |
-| 未声明代理、白名单为 `^127\.0\.0\.1$`、请求带转发头 | 不豁免（防止同机反代把公网请求伪装成 loopback） |
+| 直连请求携带伪造 `X-Forwarded-For: 192.168.10.5` | `peer_ip()` 仍是真实 TCP 对端，分区判定不变，按该区规则处理 |
+| ASGI `scope["client"]` 端口为 0 且带转发头（uvicorn 改写指纹） | `peer_ip()` 返回 `None`，限流 / 审计记为 `unknown`；`zone()` 仍只看内核监听 socket |
+| 伪造 XFF 链 + `X-Real-IP`，或前置反代 | 记录的地址始终是**真实 TCP 对端**；没有可信代理列表，也没有客户端 IP 白名单 |
+| 旧配置残留 `allow_query_api_key: true` / `trusted_proxies: [...]` | 两个键被忽略并给出启动告警；`SecurityConfig` 里没有这两个字段，`?api_key=` 仍是 `401` |
 | `security.public.port` 指定的公网监听端口（如 8001，双区） | 只有 `security.public.path_allowlist` 里「方法 + 正则全匹配」的组合才存在，测试配置列出 `GET /health`、`GET /v1/models`、`POST /v1/chat/completions`。列出的路径无 Key 401、无效 Key 403、伪造内网 XFF 仍 401；未列出的 `/`、`/probe`、`/api/tags`、`/api/ps`、`/api/version`、`/docs`、`/openapi.json`、`/healthz` 一律 404（带有效 Key 也是 404）；`/v1/management/*`、`/admin*` 以及含 `..` 段或 NUL 的路径恒 404 |
 | 双区模式的内网监听端口（`server.port: 8000`，`security.public.port: 8001`） | `/` 与 `/health` 始终匿名（探针指向这里）；`security.internal.allow_anonymous: true` 时其它业务 API 免 Key（带无效 Key 也放行）、`/docs`（由 `internal.expose_docs` 控制）与 `/admin` 可达；`false` 时业务 API 需 Key 或会话 Cookie，但 `/`、`/health` 仍匿名；`/v1/management/*` 始终无 Cookie 401 |
 | 公网监听端口上的存活探针 | 公网分区没有任何匿名 HTTP 路径：`/health` 只有显式列入 `security.public.path_allowlist` 且带 Key 才可达。默认模板未列出它（公网 `/health` 为 404）；测试配置显式列出 `GET /health`（带 Key 200、无 Key 401），而 `/healthz` 未列出恒 404。容器 HEALTHCHECK 必须指向内网端口，纯公网实例（`security.public.port == server.port`）改用 TCP 端口探测 |
 | 公网监听端口上的管理台与探查路由 | `/v1/management/*`、`/admin*` 是硬性 404（管理台只属于内网端口）；`/docs`、`/openapi.json`、`/probe`、`/api/ps`、`/api/version` 等未列入 `security.public.path_allowlist` 的探查路径一律 404，带有效 Key 也一样，从公网无法执行管理或探查操作 |
 | `security.internal.allow_anonymous: false` 且 `api_keys` 表无可用 Key | 失败关闭，拒绝启动；运行中的实例 `/v1/models` 无 Key 401。公网分区永远要求 Key，不存在全局匿名模式 |
-| 分区判定只认内核监听 socket | `zone()` 由 `scope["server"]` 的本地端口决定，与客户端 IP、XFF、API Key 无关；`security.trusted_proxies` 只影响 `client_ip()`（IP 围栏 / 限流 / 审计），不改变分区。两个宿主端口映射到一个容器端口不会产生两个分区 |
+| 分区判定只认内核监听 socket | `zone()` 由 `scope["server"]` 的本地端口决定，与客户端 IP、XFF、API Key 无关；XFF 也影响不了限流 / 审计地址，更不改变分区或准入。两个宿主端口映射到一个容器端口不会产生两个分区 |
 
 前置条件：镜像以 `python serve.py` 启动（`proxy_headers=False`）。裸 `python -m uvicorn main:app`
 会因端口 0 指纹被判为不可信，属于预期的失败关闭行为。注意「两个宿主端口映射到一个容器端口」
@@ -903,7 +900,7 @@ curl http://localhost:8000/v1/models \
 | `-NoReload` | `start-local.bat -NoReload -CheckOnly` | 入口为 `python serve.py`，无自动重载 |
 
 默认单监听路径下 uvicorn 必须带 `--no-proxy-headers`，否则 `ProxyHeadersMiddleware` 会用
-`X-Forwarded-For` 改写 `scope["client"]`，使 `security.allowed_client_ips` 围栏可被客户端控制。
+`X-Forwarded-For` 改写 `scope["client"]`，使请求日志里的客户端 IP 可被伪造。
 当 `security.public.port` 与 `server.port` 不同（或传 `-NoReload`）时脚本自动切到 `serve.py`：
 它在同一进程绑定所有监听端口，因此内存中的 Key 缓存、限流桶、登录锁定在两区共享。
 若 `.env` 里残留旧的端口变量，脚本仅将其当作一次性迁移提示并警告要求删除，显式配置优先。
@@ -1078,6 +1075,41 @@ ab -n 100 -c 10 -H "Authorization: Bearer sk-gateway-example-key" \
   http://localhost:8000/v1/models
 ```
 
+### 测试 29A: 推理并发闸门（排队不丢请求，2026-11-11）
+
+`server.max_concurrency` 不是限流：超出的请求排队等空位，不会 429 拒绝。
+自动化验证在 `tests/verify_security.py::test_inference_concurrency_gate`：
+
+- 两个出站池：推理池容量 == `max_concurrency`，控制面池（System One / web search /
+  探针 / 管理台）不受闸门约束；
+- 用一个故意 sleep 的本地 HTTP 后端同时发 8 个请求：全部返回 200，后端观测到的
+  峰值并发 ≤ `max_concurrency`；
+- 把 `upstream_queue_timeout` 调到 0.05 秒、闸门设为 2，排不到的请求抛
+  `httpx.PoolTimeout`；网关在缓冲与流式两条路径上都映射为 503 + `Retry-After: 5`。
+
+手工验证（先设 `max_concurrency: 2` 并重启网关）：
+
+```bash
+for i in 1 2 3 4 5 6; do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/generate \
+    -d '{"model":"qwen3:8b","prompt":"hi","stream":false}' &
+done; wait
+```
+
+6 个请求应全部完成，只有 2 个同时在 Ollama 侧执行；把 `upstream_queue_timeout`
+调小后，等不到空位的请求返回 503 并带 `Retry-After: 5`。
+
+### 测试 29B: 已移除的安全配置项（2026-11-11）
+
+`allow_query_api_key` 与 `trusted_proxies` 都已删除，行为固定为「Key 只在请求头」
+与「转发头一律不采信」。自动化验证在
+`tests/verify_security.py::test_retired_security_knobs`：
+
+- `SecurityConfig` 的字段表、`build_default_config()`、`config.example.yaml` 都不含这两个键；
+- 旧配置文件里残留（甚至带非默认值）仍能正常加载，但字段不会复活，启动时给出告警；
+- 公网区 `?api_key=<合法 Key>` -> `401`，`Authorization: Bearer` -> `200`；
+- 伪造的 `X-Forwarded-For` / `X-Real-IP` 链不改变 `peer_ip()`，也不改变分区。
+
 ### 测试 30: 流式响应延迟
 
 **测试脚本 (Python):**
@@ -1249,11 +1281,13 @@ curl -X POST http://localhost:8000/v1/management/auth/logout
 - 未带 Cookie 也未带网关 Key，或会话 token 被篡改、过期 -> `401`
 - 把 `ADMIN_PASSWORD` 放到 `Authorization: Bearer` / `X-API-Key` -> `401`（它只是登录凭据，
   不在网关 Key 列表里）；不在 `api_keys` 表中的随机 Key 同样 `401`
-- 网关 API Key 只接受请求头，放在查询串（`?api_key=...`）-> `401`，避免密钥落进访问日志
+- 网关 API Key 只接受 `Authorization: Bearer` / `X-API-Key` 请求头，放在查询串
+  （`?api_key=...`）-> `401`；该行为不可配置（`allow_query_api_key` 已移除）
 - 管理接口在任何配置下都只认会话 Cookie：即使内网 `security.internal.allow_anonymous: true`
   让业务 API 免 Key，或首次启动时 `api_keys` 表里一行都没有（还没在 `/admin` 签发过任何 Key），
   管理接口也绝不会变成匿名可访问，网关 Key 打不开它
-- 修改 `ADMIN_PASSWORD` 后旧会话立即失效（签名密钥即密码本身）
+- 修改 `ADMIN_PASSWORD` 或进程重启（随机 seed 轮换）后旧会话立即失效；签名密钥由
+  `ADMIN_PASSWORD` + session id + 进程随机 seed 派生
 - Cookie 为 HttpOnly + SameSite=Lax，仅在 HTTPS 下加 `Secure`
 - 未配置 `ADMIN_PASSWORD` -> 登录与所有受保护接口均为 `503`
 
@@ -1387,15 +1421,22 @@ curl -b cookie.txt "http://localhost:8000/v1/management/requests/42"
 ```
 
 **断言:**
-- 每笔经网关的请求都会落库：方法、路径、模型、上游、状态码、耗时、TTFT、是否流式、输入/输出/总 token 数、
+- 每笔 API 调用恰好一行：方法、路径、模型、上游、状态码、耗时、TTFT、是否流式、输入/输出/总 token 数、
   请求/响应大小、客户端 IP、错误信息；流式请求在流结束后落库
+- **代理看不到的调用也补齐**（对应 `tests/verify_security.py::test_request_log_coverage`）：
+  独立 handler（`/v1/models`、`/v1/rerank`、`/api/tags`、`/api/ps`、`/health`）与被 middleware 拒绝的请求
+  （公网未带 Key 的 401、白名单外的 404）都会由 middleware 写**仅元数据行**——body/token/upstream 列为
+  `NULL`，`error` 保存拒绝原因（如 `Missing API key: POST /v1/systemone`）；经代理的调用认领
+  ASGI scope 标记，不会被重复写两行。`/v1/management/*`、`/admin/*`、docs 与静态资源
+  **完全不写库**（控制台轮询不会污染表），`HEAD` 与 `OPTIONS` 也不记录
 - `status` 只接受档位 `2xx` / `3xx` / `4xx` / `5xx`（传具体数字 -> `400`）
 - `page < 1`、`page_size` 不在 `1..200`、`status` 非法 -> `400`；时间戳非法或 `start > end` -> `400`
 - 记录不存在 -> `404`
 - **只统计 API 调用**：列表、`stats`、分页 `total` 一律带
   `path LIKE '/v1/%' OR path LIKE '/api/%'`（`request_log.API_PATH_SCOPE`）。非 API 路径（如 `/metrics-probe`、
   `/health`）的请求照常 `200` 并**确实写进库**（直接查 sqlite 能看到行数增加），但列表里查不到、
-  用 `?path=metrics-probe` 也搜不出来；而它的 `/requests/{id}` 深链仍然 `200`（详情接口故意不加这个条件）
+  用 `?path=metrics-probe` 也搜不出来；而它的 `/requests/{id}` 深链仍然 `200`（详情接口故意不加这个条件）。
+  注意这里说的是**非 API 业务路径**；management / console / docs / 静态资源是另一回事——它们根本不写库
 - 请求/响应体各截断到 8 KB，并用 `request_body_truncated` / `response_body_truncated` 标记；
   `api_key`、`authorization`、`password` 等字段递归替换为 `***`
 
@@ -1425,6 +1466,19 @@ curl -b cookie.txt "http://localhost:8000/v1/management/stats/failures?start=202
   "end": "2026-11-03T12:00:00",
   "items": [{"key": "ollama", "count": 14}, {"key": "lmstudio", "count": 5}, {"key": "-", "count": 1}]
 }
+
+// group_by=status：2xx -> ok，>= 500 -> failed，其余（含 4xx）-> warning
+{
+  "group_by": "status", "start": "...", "end": "...",
+  "items": [{"key": "ok", "count": 14}, {"key": "warning", "count": 5}, {"key": "failed", "count": 1}]
+}
+
+// group_by=model：display 是别名短名，key 保持解析后的真实 id
+{
+  "group_by": "model", "start": "...", "end": "...",
+  "items": [{"key": "bge-m3:latest", "count": 460, "display": "bge-m3"},
+            {"key": "qwen3.5:9b", "count": 348, "display": "qwen3.5:9b"}]
+}
 ```
 
 ```json
@@ -1444,7 +1498,12 @@ curl -b cookie.txt "http://localhost:8000/v1/management/stats/failures?start=202
 - 时间桶格式：`hour` 为 `YYYY-MM-DDTHH:00`，`day` 为 `YYYY-MM-DD`
 - P95 为**桶内**分位数（窗口函数），不是整段时间的全局值
 - `distribution` 的 `group_by` 只接受 `upstream` / `model` / `status`（其他 -> `400`），按 `count` 倒序返回
-- `group_by=status` 只分两桶：`ok`（`status < 500`，含 4xx）与 `error`（`status >= 500`），阈值与错误率、趋势图错误柱、失败统计一致
+- `group_by=status` 分**三桶**：`ok`（2xx）、`failed`（`>= 500`）、`warning`（3xx / 4xx / NULL / 其他）。
+  `failed` 仍与错误率、趋势图错误柱、失败统计共用 `>= 500` 阈值；三桶相加等于同期 `/requests` 的
+  `pagination.total`。4xx 现在落在 `warning`，不再被算作 `ok`（这是「饼图只有一片绿色 ok」的根因）
+- `group_by=model` 的每项额外带 `display`：`model_aliases` 短名优先，没有别名就等于真实 id；
+  `key` 仍是解析后的真实模型 id，所以筛选与详情链接不受影响。根 `aliases:` 派生模型是独立模型，
+  不会反过来给它的目标改名
 - 未命中上游的行（被拦截 403 / 过大 413 / 无可用上游 404）在 `upstream`、`model` 分组里计入 `-`，
   因此 `items` 相加恒等于同期 `/requests` 的 `pagination.total`
 - `failures` 只统计 `status >= 500` 的请求，按状态码与上游聚合，另附最近 20 条样本
@@ -1484,7 +1543,7 @@ curl -b cookie.txt "http://localhost:8000/v1/management/requests/<id>"
 > 无 `model` 的 GET 无法路由，网关回 `404` 且 `error` 写明原因，但这一行**仍会入库**
 > （本地 Ollama 实测：`status=404`、`requested_model=null`、`query="format=json&verbose=1"`）。
 
-**入库开关（`config.yaml` -> `request_log.enabled`，默认 `true`，逐请求读取）:**
+**入库开关（`config.yaml` -> `request_log.enabled`，默认 `true`，代理与安全 middleware 逐请求共同读取）:**
 
 ```bash
 # 关闭：把 "request_log": {"enabled": false} 写进 config.yaml 并保存
@@ -1496,15 +1555,19 @@ curl -b cookie.txt http://localhost:8000/v1/management/overview
 **断言:**
 - `tokens_in` / `tokens_out` 与 `tokens` 三列同时入库，OpenAI 兼容与 Ollama 原生两个来源都能拆开
 - 上游没有回报用量时三列都是 `NULL`（与真实的 `0` 可区分）；`/requests` 的 `rows` 也带这三列
-- 关闭后请求照常转发（仍返回 `200`），但明细总数不再增加，请求体也不再采集
+- 关闭后请求照常转发（仍返回 `200`），但代理与 middleware 两个写入点都不再写库，明细总数不增加，
+  请求体也不再采集
 - `/overview` 与 `/requests` 的 `request_log.enabled` 同步回报 `false`，前端可提示「日志已停用」
 - 改回 `true` 后，越过约 1 秒的热加载窗口，下一条请求即入库（无需重启容器）
 - 自动化用例里直接调用 `ConfigManager.reload()` 跳过该窗口；对真实服务需等待或先发一次探测请求
 - 旧版本留下的 `llmhub.db` 在启动时自动 `ALTER TABLE ADD COLUMN` 补上新列，历史行不受影响
-- **`HEAD` 只转发不记录**：`HEAD` 由 catch-all 的 `HTTP_METHODS` 接受（已无全局方法白名单），
-  `curl -I -H "X-API-Key: ..." http://localhost:8000/api/version` 在内网端口正常返回 `200`，但
-  `/requests` 里没有这一行（同样的 `GET` 会有一行）；公网分区只有 `security.public.path_allowlist`
-  显式列出 `HEAD <路径>` 时才会存在，否则 404。只有 `POST_ONLY_PATHS` 里的业务路径对非 POST
+- 独立 handler 与 middleware 拒绝写的是**仅元数据行**：`request_body` / `response_body` / `tokens` /
+  `upstream` / `model` 为 `NULL`，但 `error` 带拒绝原因（如 401 的 `Missing API key`），所以控制台
+  Requests 页能看到本不被代理感知的调用；`/v1/management/*` 与 `/admin/*` 不写库
+- **`HEAD` 与 `OPTIONS` 只转发不记录**：两者都由 catch-all 的 `HTTP_METHODS` 接受（已无全局方法白名单），
+  `HEAD` 在内网端口正常返回 `200`、`OPTIONS` 预检由 middleware 回 `204`，但 `/requests` 里都没有这一行
+  （同样的 `GET` 会有一行）；公网分区只有 `security.public.path_allowlist` 显式列出对应
+  方法+路径时才会存在，否则 404。只有 `POST_ONLY_PATHS` 里的业务路径对非 POST
   方法仍返回 `405`（带 `Allow: POST`），这与旧的方法白名单无关
 
 ### 测试 40: Web Search 配置投影

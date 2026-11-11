@@ -28,6 +28,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import yaml
 from admin_auth import (
     ADMIN_COOKIE_NAME,
     ADMIN_USERNAME,
@@ -36,19 +37,10 @@ from admin_auth import (
     require_admin_session,
     set_admin_cookie,
 )
-from api_test import MAX_RESPONSE_BYTES, KINDS, execute, get_kind
-from auth import client_ip, peer_ip
+from api_test import KINDS, MAX_RESPONSE_BYTES, execute, get_kind
+from auth import peer_ip
 from bench import BenchError, BenchOptions, run_bench
 from bench_store import BenchStore
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi import status as http_status
-from fastapi.responses import JSONResponse
-from key_store import LABEL_MAX_CHARS, ApiKeyStore, get_store
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from request_log import _DISTRIBUTION_KEYS, MAX_PAGE_SIZE, normalize_ts, now_ts
-
-import yaml
-
 from config import (
     Config,
     RerankConfig,
@@ -57,6 +49,12 @@ from config import (
     WebSearchConfig,
     _dump_yaml,
 )
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import status as http_status
+from fastapi.responses import JSONResponse
+from key_store import LABEL_MAX_CHARS, ApiKeyStore, get_store
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from request_log import _DISTRIBUTION_KEYS, MAX_PAGE_SIZE, normalize_ts, now_ts
 
 logger = logging.getLogger("llm_hub")
 
@@ -219,6 +217,22 @@ def _alias_by_target(cfg) -> dict[tuple[str, str], str]:
         if owner is not None:
             mapping.setdefault((owner.name, alias.model), alias_name)
     return mapping
+
+
+def _display_by_model(cfg) -> dict[str, str]:
+    """``real model id -> preferred display name`` for the by-model pie; first alias wins.
+
+    Only `upstreams[].model_aliases` (pure display renames) qualify. A root `aliases:`
+    entry is a model of its own with fixed parameters, so it must not rename the real id
+    it points at. The distribution query groups by the resolved `model` column and has no
+    upstream in scope, so the mapping is global rather than keyed by upstream.
+    """
+    display: dict[str, str] = {}
+    for alias_name, alias in cfg.aliases.items():
+        if not cfg.is_renamed_model(alias_name):
+            continue
+        display.setdefault(alias.model, alias_name)
+    return display
 
 
 def _derived_row(cfg, runtime: dict[tuple[str, str], dict[str, Any]], reachable: dict[str, bool], name: str, alias) -> dict[str, Any] | None:
@@ -931,7 +945,15 @@ async def stats_distribution(
     begin, finish = _resolve_range(start, end)
     log = _log(request)
     await log.flush()
-    return JSONResponse(await log.distribution(start=begin, end=finish, group_by=group_by))
+    result = await log.distribution(start=begin, end=finish, group_by=group_by)
+    if group_by == "model":
+        # The pie labels are operator-facing: prefer the configured short alias over the
+        # verbose resolved id (`bge-m3` instead of `bge-m3:latest`). Keep `key` as the
+        # real id so filtering and the Requests view keep working with the same value.
+        display = _display_by_model(request.app.state.manager.config)
+        for item in result["items"]:
+            item["display"] = display.get(item["key"], item["key"])
+    return JSONResponse(result)
 
 
 @router.get("/stats/failures", summary="Failure breakdown and recent samples", tags=["management"])
@@ -1371,7 +1393,7 @@ async def api_test_run(payload: ApiTestRequest, request: Request, _=Depends(requ
         body["model"] = model.strip()
     if kind.executor == "rerank":
         kind = dataclasses.replace(kind, endpoint=cfg.rerank.endpoint)
-    result = await execute(request.app, kind, body, (client_ip(request) or "console", 0))
+    result = await execute(request.app, kind, body, (peer_ip(request) or "console", 0))
     return JSONResponse(result)
 
 

@@ -32,6 +32,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException, status
+from http_clients import inference_timeout
 from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger("llm_hub")
@@ -674,7 +675,10 @@ class RerankService:
         rcfg = cfg.rerank
         upstream = resolved.upstream
         model_name = resolved.target or resolved.requested
-        timeout = upstream.timeout or cfg.server.request_timeout
+        # The per-document semaphore below bounds ONE rerank call; the inference
+        # client's pool bounds ALL model traffic gateway-wide. A Timeout object
+        # keeps the pool's queue wait cap on each document request.
+        timeout = inference_timeout(upstream.timeout or cfg.server.request_timeout, cfg)
 
         plan = self._endpoint_plan(upstream, rcfg.upstream_api)
         top_logprobs = max(1, min(int(rcfg.top_logprobs or 1), MAX_TOP_LOGPROBS))
