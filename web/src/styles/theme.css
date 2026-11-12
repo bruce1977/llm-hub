@@ -1295,16 +1295,18 @@ input[type='checkbox'] {
 /* ---------- native form layout (Settings console) ---------- */
 /* Settings renders every field with the same native .sel / .inp controls as the rest
    of the app (Requests filters, Login), so the dropdown panel is the OS-native one and
-   the whole form shares one look. These helpers give it the label/control rhythm. */
+   the whole form shares one look. A field keeps its label and control on one row. When a
+   control spans several lines (control + helper note), the label is pinned to the top row
+   instead of being vertically centred, so it sits at the same height as single-line rows. */
 .fform {
   display: flex;
   flex-direction: column;
-  gap: 13px;
+  gap: 20px;
 }
 .frow {
   display: grid;
   grid-template-columns: 190px 1fr;
-  align-items: center;
+  align-items: start;
   gap: 10px;
 }
 .frow > label {
@@ -1312,6 +1314,10 @@ input[type='checkbox'] {
   color: var(--text-dim);
   font-size: 12px;
   line-height: 1.4;
+  /* Controls are 32px tall with 12px text vertically centred (~8px above the text).
+     Offset the top-aligned label by the same amount so it lines up with the first
+     control line, whether the value is one line or several. */
+  padding-top: 8px;
 }
 .fctl {
   min-width: 0;
@@ -1322,7 +1328,7 @@ input[type='checkbox'] {
 .fctl.col {
   flex-direction: column;
   align-items: flex-start;
-  gap: 6px;
+  gap: 8px;
 }
 .fnote {
   margin: 0;

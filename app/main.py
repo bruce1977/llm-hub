@@ -15,6 +15,7 @@ All other requests (/api/*, /v1/*) are routed to the matching Ollama instance by
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import ip_guard
 from admin_auth import (
     ADMIN_COOKIE_NAME,
     create_admin_token,
@@ -38,6 +40,7 @@ from auth import (
     is_public,
     is_weak_key,
     peer_ip,
+    read_limited_body,
     require_api_key,
 )
 from bench_store import BenchStore
@@ -55,7 +58,7 @@ from management import logout as admin_logout
 from management import router as management_router
 from messages import MessagesService
 from proxy import ProxyService
-from request_log import RequestLog, basic_entry, now_ts
+from request_log import RequestLog, attach_request_detail, basic_entry, now_ts
 from rerank import RerankService
 from systemone import SystemOneService, backend_key
 from websearch import WebSearchService
@@ -294,9 +297,57 @@ async def lifespan(app: FastAPI):
         cfg.server.max_concurrency,
         cfg.server.upstream_queue_timeout,
     )
+
+    # TCP deny-list visibility. blocked_ips is enforced BELOW ASGI, so it is easy
+    # to configure it and forget that the serving entrypoint must install the
+    # custom protocol. Say so once at startup, and name the fix when it is missing.
+    deny_rules = ip_guard.active_rules()
+    if deny_rules:
+        if ip_guard.guard_protocol_active():
+            logger.info(
+                "security.blocked_ips: %d TCP deny rule(s) active (%s). Denied peers get one "
+                "'deny <ip>' log line and an immediate socket abort - no HTTP response, no "
+                "access-log line, no request-log row.",
+                len(deny_rules),
+                ", ".join(deny_rules),
+            )
+        else:
+            logger.warning(
+                "security.blocked_ips: %d rule(s) enforced by the ASGI fallback only (the "
+                "socket-level GuardProtocol is NOT installed). Denied requests are still "
+                "interrupted before any route -- one 'deny <ip>' line, no request-log row -- "
+                "but the TCP handshake and an ASGI scope already happened. Start through "
+                "serve.py, or pass --http ip_guard_protocol:GuardProtocol to uvicorn, for a "
+                "pre-ASGI socket drop. Rules: %s",
+                len(deny_rules),
+                ", ".join(deny_rules),
+            )
+
+    # Drive config hot-reload on a timer as well. Every other security setting is
+    # refreshed lazily by the middleware's manager.config access, but a denied TCP
+    # connection never reaches that middleware -- so on an otherwise idle gateway
+    # a newly added IP would stay effective only after some unrelated request came
+    # in. The mtime check is throttled to one stat() per second and every successful
+    # load republishes the deny-list snapshot to the protocol layer.
+    async def _config_watch() -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                manager.config  # property -> _reload_if_needed() -> ip_guard.configure()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # a broken edit must not kill future reloads
+                logger.debug("Config watch tick failed: %s", exc)
+
+    config_watch = asyncio.create_task(_config_watch())
     try:
         yield
     finally:
+        config_watch.cancel()
+        try:
+            await config_watch
+        except asyncio.CancelledError:
+            pass
         await app.state.request_log.stop()
         if getattr(app.state, "bench_store", None) is not None:
             await app.state.bench_store.stop()
@@ -519,6 +570,12 @@ def _renew_admin_session(request: Request, response: Response) -> None:
         set_admin_cookie(response, request, create_admin_token(password))
 
 
+# Bound on the response bytes buffered solely for the request log. ``sanitize_body``
+# keeps only 8 KB anyway; capping the capture stops a large SSE answer from being held
+# in memory twice just to fill the console's detail pane.
+_LOG_RESPONSE_CAPTURE_LIMIT = 64 * 1024
+
+
 @app.middleware("http")
 async def gateway_security_middleware(request: Request, call_next):
     """Per-request hardening, evaluated in this order:
@@ -573,8 +630,14 @@ async def gateway_security_middleware(request: Request, call_next):
         and not noisy_path
     )
 
-    def record_basic(status_code: int, detail: str | None = None, *, resp=None) -> None:
-        """Queue a metadata-only row when no proxy row will be written for this call."""
+    def record_basic(status_code: int, error_detail: str | None = None, *, resp=None) -> None:
+        """Queue the single row for a call that never claimed the proxy's writer.
+
+        Standalone handlers publish what they know (model / upstream / raw bodies /
+        tokens) on ``request.state.request_log_detail``; ``basic_entry`` merges it
+        here, so a denied request or a tool endpoint gets one complete row rather
+        than a second, empty "metadata-only" stub.
+        """
         if not log_enabled:
             return
         try:
@@ -593,7 +656,8 @@ async def gateway_security_middleware(request: Request, call_next):
                     query=request.url.query,
                     req_size=req_size,
                     res_size=res_size,
-                    error=detail or (f"HTTP {status_code}" if status_code >= 400 else None),
+                    error=error_detail or (f"HTTP {status_code}" if status_code >= 400 else None),
+                    detail=getattr(request.state, "request_log_detail", None),
                 )
             )
         except Exception as exc:  # logging must never change the response path
@@ -680,7 +744,40 @@ async def gateway_security_middleware(request: Request, call_next):
     # The proxy claims ownership of a request in forward(); anything else that
     # reached a route (standalone handlers, FastAPI 404s) has no row yet.
     if log_enabled and not getattr(request.state, "request_log_claimed", False):
-        record_basic(resp.status_code, resp=resp)
+        # Only handlers that published detail (model/tool APIs) need their response
+        # captured. Pure discovery endpoints and rejections stay metadata-only, so
+        # a console polling /v1/models cannot fill SQLite with 8 KB snapshots of a
+        # body nobody asked to inspect.
+        published = getattr(request.state, "request_log_detail", None) is not None
+        original_iterator = getattr(resp, "body_iterator", None)
+        if original_iterator is None or not published:
+            record_basic(resp.status_code, resp=resp)
+        else:
+            # ``BaseHTTPMiddleware.call_next`` returns a streaming wrapper whose
+            # iterator is consumed only after this middleware returns. Buffering a
+            # bounded copy on the way through captures the response body of every
+            # standalone handler -- including streaming ones -- without reading the
+            # client's bytes or duplicating the proxy's rich row. Writing from
+            # ``finally`` also leaves a trace when the client disconnects mid-stream.
+            async def logging_iterator():
+                chunks: list[bytes] = []
+                captured = 0
+                try:
+                    async for chunk in original_iterator:
+                        if isinstance(chunk, bytes) and captured < _LOG_RESPONSE_CAPTURE_LIMIT:
+                            take = chunk[: _LOG_RESPONSE_CAPTURE_LIMIT - captured]
+                            chunks.append(take)
+                            captured += len(take)
+                        yield chunk
+                finally:
+                    if chunks:
+                        attach_request_detail(request, response_raw=b"".join(chunks))
+                    record_basic(resp.status_code, resp=resp)
+
+            try:
+                resp.body_iterator = logging_iterator()
+            except AttributeError:  # not a mutable streaming wrapper: log without a body
+                record_basic(resp.status_code, resp=resp)
     return _harden_response(resp, path)
 
 
@@ -953,17 +1050,28 @@ async def rerank_response(request: Request) -> JSONResponse:
             status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
             detail="Rerank endpoint only accepts POST.",
         )
+    cfg = request.app.state.manager.config
+    raw = await read_limited_body(request, cfg.security.max_body_bytes)
     try:
-        payload = await request.json()
-    except Exception:
+        payload = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Request body must be valid JSON."
         ) from None
     if not isinstance(payload, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body must be a JSON object.")
 
+    # Publish what we know before resolving: even a 404/502 from the service must
+    # leave the caller's raw body (and the model it named) auditable.
+    requested_model = (
+        str(payload.get("model") or payload.get("model_name") or payload.get("model_id") or "").strip() or None
+    )
+    attach_request_detail(request, requested_model=requested_model, request_raw=raw)
+
     service: RerankService = request.app.state.rerank
     result = await service.handle(payload)
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    attach_request_detail(request, model=result.get("model"), upstream=meta.get("upstream"))
     return JSONResponse(result)
 
 
@@ -1903,6 +2011,23 @@ async def gateway(request: Request, full_path: str = "", _auth=Depends(require_a
         )
     proxy: ProxyService = request.app.state.proxy
     return await proxy.forward(request, (full_path or "").strip("/"))
+
+
+# --------------------------------------------------------------------------- #
+# Outermost ASGI layer: the safety net for security.blocked_ips.
+#
+# Starlette's ``add_middleware`` INSERTS at index 0 and builds the stack in
+# reverse, so the LAST registered middleware is the OUTERMOST one. This call
+# must therefore stay at the very end of the module, after every
+# ``@app.middleware("http")`` decorator above. Registered earlier it would land
+# inside the HTTP middleware, and a denied request would already have written a
+# request-log row before it was interrupted.
+# It is a pure ASGI middleware, not BaseHTTPMiddleware, because a deny must not
+# produce a Response at all. The custom uvicorn protocol normally drops these
+# connections earlier still; this covers bare `uvicorn main:app` and keep-alive
+# sockets opened before a hot-reloaded deny-list took effect.
+# --------------------------------------------------------------------------- #
+app.add_middleware(ip_guard.BlockedIPMiddleware)
 
 
 # --------------------------------------------------------------------------- #

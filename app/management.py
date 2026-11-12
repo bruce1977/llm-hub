@@ -44,6 +44,8 @@ from bench_store import BenchStore
 from config import (
     Config,
     RerankConfig,
+    SecurityConfig,
+    ServerConfig,
     SystemOneConfig,
     UpstreamConfig,
     WebSearchConfig,
@@ -89,6 +91,15 @@ class AdminLogin(BaseModel):
     # page fails with 401 instead of silently accepting anything.
     username: str = ADMIN_USERNAME
     password: str
+
+
+class RequestCleanup(BaseModel):
+    """Delete request-log rows older than ``before`` (ISO8601 date or datetime)."""
+
+    before: str = Field(min_length=1, max_length=64)
+    # A DELETE does not shrink a SQLite file. VACUUM does, but holds the write lock,
+    # so the console only opts in explicitly.
+    vacuum: bool = False
 
 
 def _login_blocked(peer: str) -> bool:
@@ -836,6 +847,30 @@ async def tools_websearch(request: Request, _=Depends(require_admin_session)):
 # --------------------------------------------------------------------------- #
 # Request log queries
 # --------------------------------------------------------------------------- #
+def _cleanup_cutoff(before: str | None) -> str:
+    """Parse the cleanup date into the naive-UTC form used by ``requests.ts``.
+
+    A plain ``YYYY-MM-DD`` is accepted (UTC midnight), as is a full ISO8601
+    datetime with or without a zone. A future cutoff is rejected: the console is
+    meant to expire old history, not wipe the whole table by accident.
+    """
+    try:
+        cutoff = normalize_ts(before)
+    except ValueError as exc:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if not cutoff:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="before is required (ISO8601 date or datetime, e.g. 2026-10-12).",
+        )
+    if cutoff > now_ts():
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="before must not be in the future.",
+        )
+    return cutoff
+
+
 @router.get("/requests", summary="Request log with stats, filters and pagination", tags=["management"])
 async def list_requests(
     request: Request,
@@ -887,6 +922,40 @@ async def list_requests(
     )
     payload["request_log"] = _request_log_state(request.app.state.manager.config, log)
     return JSONResponse(payload)
+
+
+# NOTE: these two MUST stay above ``/requests/{record_id}``. Starlette matches
+# routes in registration order and ``{record_id}`` is an untyped path parameter,
+# so a later "/requests/cleanup" would be swallowed and answered 422.
+@router.get("/requests/cleanup", summary="Preview a request-log cleanup (no writes)", tags=["management"])
+async def request_cleanup_preview(
+    request: Request,
+    before: str | None = None,
+    _=Depends(require_admin_session),
+):
+    cutoff = _cleanup_cutoff(before)
+    log = _log(request)
+    payload = await log.cleanup_preview(cutoff)
+    return JSONResponse({"before": cutoff, **payload})
+
+
+@router.post("/requests/cleanup", summary="Delete request-log rows older than a date", tags=["management"])
+async def request_cleanup(
+    body: RequestCleanup,
+    request: Request,
+    _=Depends(require_admin_session),
+):
+    cutoff = _cleanup_cutoff(body.before)
+    log = _log(request)
+    payload = await log.cleanup(cutoff, vacuum=body.vacuum)
+    logger.info(
+        "Request log cleanup: removed %d row(s) older than %s (remaining=%d, vacuum=%s)",
+        payload["deleted"],
+        cutoff,
+        payload["remaining"],
+        payload["vacuum"],
+    )
+    return JSONResponse({"ok": True, "before": cutoff, **payload})
 
 
 @router.get("/requests/{record_id}", summary="One request log entry with bodies", tags=["management"])
@@ -1508,6 +1577,7 @@ def _restore_masked_headers(incoming: dict[str, Any], raw: dict[str, Any]) -> No
 
 
 _SEGMENT_MODELS: dict[str, type[BaseModel]] = {
+    "server": ServerConfig,
     "rerank": RerankConfig,
     "systemone": SystemOneConfig,
     "websearch": WebSearchConfig,
@@ -1529,14 +1599,14 @@ class ConfigSaveBody(BaseModel):
 async def _save_config(manager, incoming: dict[str, Any]) -> JSONResponse:
     """Validate each edited segment, then overwrite the whole config.yaml atomically.
 
-    Only the four UI-editable segments (``upstreams``, ``rerank``, ``systemone``,
-    ``websearch``) are taken from the request; every other top-level key is preserved
-    verbatim from the file on disk. Missing segments are left untouched (an empty PUT
-    must never clear the upstream list). Each segment is checked on its own first so the
-    error names the exact block that failed; a clean pass then re-validates the merged
-    whole before writing.
+    Only the six UI-editable segments (``server``, ``security``, ``upstreams``,
+    ``rerank``, ``systemone``, ``websearch``) are taken from the request; every other
+    top-level key is preserved verbatim from the file on disk. Missing segments are
+    left untouched (an empty PUT must never clear the upstream list or the security
+    policy). Each segment is checked on its own first so the error names the exact
+    block that failed; a clean pass then re-validates the merged whole before writing.
     """
-    segments = ["upstreams", "rerank", "systemone", "websearch"]
+    segments = ["server", "security", "upstreams", "rerank", "systemone", "websearch"]
     errors: dict[str, str] = {}
 
     # Re-parse the on-disk file so untouched sections keep their exact current shape.
@@ -1563,6 +1633,23 @@ async def _save_config(manager, incoming: dict[str, Any]) -> JSONResponse:
             if seg == "upstreams":
                 validated = TypeAdapter(list[UpstreamConfig]).validate_python(value)
                 raw[seg] = [u.model_dump(mode="json", exclude_defaults=True) for u in validated]
+            elif seg == "server":
+                validated = ServerConfig.model_validate(value or {})
+                # Persist the FULL node (like security): the Service tab edits every
+                # field, so dropping defaults would leave the file disagreeing with
+                # the form. These are startup-only settings, so reload() picks up the
+                # new values on the next restart.
+                raw[seg] = validated.model_dump(mode="json")
+            elif seg == "security":
+                validated = SecurityConfig.model_validate(value or {})
+                # Persist the FULL node, including keys that equal their defaults.
+                # Unlike the other segments, dropping defaults here is unsafe: the
+                # whole-config validation still runs Config._migrate_auth_node, which
+                # would re-derive `internal.allow_anonymous` from a stale top-level
+                # `auth.enabled` and silently flip the LAN zone after a Settings save.
+                # The console sends back the complete node it got from GET /config,
+                # so writing every key is also what the operator sees in the form.
+                raw[seg] = validated.model_dump(mode="json")
             else:
                 model_cls = _SEGMENT_MODELS[seg]
                 validated = model_cls.model_validate(value or {})

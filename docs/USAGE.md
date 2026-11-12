@@ -66,7 +66,7 @@ llm-hub/
 │   ├── bench.py      # Model speed test: TTFT / decode / prefill measurement
 │   ├── bench_store.py # Speed-test history (shares llmhub.db, keeps 3 runs per model)
 │   ├── api_test.py   # Engine behind the console's API testers (closed endpoint allowlist)
-│   ├── management.py # Web console API (/v1/management: read-only views + speed test + API testers + API key management + Settings save)
+│   ├── management.py # Web console API (/v1/management: read-only views + speed test + API testers + API key management + request-log cleanup + Settings save)
 │   ├── websearch.py  # Web search proxy (OpenCode API Gateway upstream)
 │   └── web/          # Built console bundle (output of `npm run build`), served at /admin
 ├── web/
@@ -312,8 +312,8 @@ security:
   internal zone — i.e. no credential could ever exist. Set `ADMIN_PASSWORD`, start, then create the
   first key at `/admin`.
 
-The remaining `security.*` keys (`blocked_paths`, `cors_origins`, `max_body_bytes`,
-`rate_limit`)
+The remaining `security.*` keys (`blocked_paths`, `blocked_ips`, `cors_origins`,
+`max_body_bytes`, `rate_limit`)
 are shared hardening applied to **both** zones; the table is in
 [Security](#security-must-read-for-public-exposure) and every field with its default is in
 [CONFIG.md](CONFIG.md#security).
@@ -700,13 +700,20 @@ Feeds the console's "Requests" view: every call through the gateway becomes one 
 - **Every API call gets exactly one row.** Two writers cover the whole surface, coordinated by a
   claim flag on the ASGI scope: `ProxyService.forward` writes the **rich** row (request/response
   bodies, token usage, resolved `model`, `upstream`, `stream`) for proxied calls; the security
-  middleware writes a **metadata-only** row for anything that bypasses the proxy — the standalone
-  in-process handlers (`/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`, `/v1/messages`,
-  `/v1/models`, `/api/tags`, `/api/ps`) and every rejected request (public-zone 401/404, rate limit
-  429, body cap 413). A rejected request's `error` column carries the denial reason,
-  so a scan or a missing-key caller is auditable. Body/token/upstream columns stay `null` on
-  metadata-only rows. `/v1/management/*`, `/admin/*`, docs and static assets are control-plane
-  noise and are not written at all, so the console polling itself never inflates the log.
+  middleware writes the only row for anything that bypasses the proxy, merging in the detail a
+  handler published via `request_log.attach_request_detail()`:
+  - Tool handlers (`/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`, `/v1/messages`) publish
+    the caller's model, resolved `model`/`upstream` and the raw request body; the middleware
+    buffers the response (bounded 64 KB, streaming included) and extracts token usage. The detail
+    drawer therefore shows real req/res for these endpoints, and the Requests list shows the model
+    (or a tool label / upstream when the body carries no model) instead of `—`.
+  - Pure discovery probes (`/v1/models`, `/api/tags`, `/api/ps`, `/health`) and every rejected
+    request (public-zone 401/404, rate limit 429, body cap 413) stay **metadata-only**: body/token/
+    model/upstream stay `null`, and a rejection's `error` column carries the denial reason, so a
+    scan or a missing-key caller is auditable. Capturing only published detail keeps console
+    polling from filling SQLite with 8 KB response snapshots.
+  `/v1/management/*`, `/admin/*`, docs and static assets are control-plane noise and are not
+  written at all, so the console polling itself never inflates the log.
 - **Statistics count API calls only**: the list, the charts, the KPIs and the failure view all add
   `path LIKE '/v1/%' OR path LIKE '/api/%'` (`request_log.API_PATH_SCOPE`), so a non-API path that
   still reaches the log cannot dilute the numbers. `GET /requests/{id}` deliberately stays
@@ -729,10 +736,12 @@ gateway itself at **`http://localhost:8888/admin/`**, so the image needs no node
 and inside the container). Sign in as `admin`
 with the `ADMIN_PASSWORD` from `.env`; a successful login mints a 12h HttpOnly session cookie.
 The views — Dashboard, Upstreams, Requests, Models (LLM / Embed / Rerank / System One), Tools (Web Search),
-API keys, Settings and About — write only in four places: the
+API keys, Settings and About — write only in five places: the
 per-model speed test on Models · LLM, the API testers on every `API usage` tab, minting or
-revoking a caller key on the **API keys** page, and the Settings page itself (the single editor that
-validates and saves `config.yaml`); the first three never touch `config.yaml`. A 401 from any management call
+revoking a caller key on the **API keys** page, the **Requests** tab's request-log cleanup,
+and the Settings config editor — the **Service** / **Security** / Upstream / Rerank / System One /
+Web Search tabs all share the one route that validates and saves `config.yaml`; only these tabs
+touch `config.yaml`. A 401 from any management call
 signs the user out and returns to the login page. A 503 is never treated as an auth failure:
 it means an unreachable upstream, `ADMIN_PASSWORD` unset, or the frontend not built yet.
 The account chip sits at the bottom-left of the panel and opens the account menu: language
@@ -740,6 +749,51 @@ The account chip sits at the bottom-left of the panel and opens the account menu
 Settings (its old sidebar row is
 gone), **API keys** (its own page, also without a sidebar row), About (project introduction, features, live version info, repository link and the WeChat QR)
 and sign-out.
+
+**Settings → Service** is the first tab and opens by default. It is a real `config.yaml` editor:
+it writes the whole `server` node through `PUT /v1/management/config`, so the **Save configuration**
+bar is shown here. The form covers the trusted listener (`server.host`, `server.port`, `log_level`,
+`request_timeout`) and the **inference concurrency gate** (`max_concurrency`, `upstream_queue_timeout`,
+`upstream_keepalive_expiry`) that queues bursts instead of rejecting them with 429 to protect local
+Ollama. Every field is **startup-only**: saving rewrites the file, but the port, log level, timeouts
+and connection pools take effect only after a gateway restart (the success hint says so). The save
+replaces the entire `server` node, writing every key including defaults; invalid values (a port
+outside 1..65535, a non-numeric field, a concurrency below 1) answer **422** with the error attached
+to the Service tab, leaving `config.yaml` untouched.
+
+**Settings → Security** is the second tab and is also a real `config.yaml` editor: it writes the whole
+`security` node through `PUT /v1/management/config`, so the Save configuration bar is shown here.
+The form is grouped into the trusted **internal zone** (`server.port`: anonymous APIs, build
+version, docs), the **public zone** (`security.public.port`: listener port, **Allow external admin
+access** / `admin_endpoints`, and the method → full-match-regex `path_allowlist`) and **shared hardening**
+(blocked paths, blocked IPs / CIDRs, CORS origins, a MiB body limit and the token-bucket rate limiter).
+`admin_endpoints` is the public-only switch for whether this socket exposes the `/admin` console and
+`/v1/management/*`: `deny` blocks all admin access, `readonly` allows only Ollama model pull while the
+console stays closed, and `allow` opens the admin plane. A matching `path_allowlist` entry and a signed
+console session are still required for management routes.
+
+**Settings → Requests** is the third tab. It is not a `config.yaml` editor (the **Save configuration**
+bar is hidden there), so it is the home for console maintenance actions. The first one is
+**request-log cleanup**: the date picker defaults to the same calendar day one month ago, refuses
+future dates, and counts the rows that would be deleted before anything happens. `before` is a UTC
+boundary — a plain `YYYY-MM-DD` means UTC midnight — and the delete is a strict `ts < before`, so a
+row exactly at that moment survives. Deleting is permanent; the confirm dialog repeats the exact row
+count. Rows older than the cutoff are removed from the whole table, including `/health` and 404
+rows that the request list and charts hide. Because `DELETE` does not shrink a SQLite file, the
+optional **Also compact the database (VACUUM)** checkbox rewrites the file to reclaim free space at
+the cost of briefly holding the write lock. The separate hourly retention prune
+(`REQUEST_LOG_RETENTION_DAYS`, default 30) keeps running independently.
+
+Two things are worth knowing before saving. First, `blocked_ips` is a deny-list on the **real TCP
+peer**, enforced before ASGI: a match produces one `deny <ip>` log line, no HTTP response and no
+request row — so adding the gateway's own IP also cuts off the console, and the form warns you
+when the list is non-empty. IP / path / rate-limit edits hot-reload within about a second; changing
+`public.port` needs a process restart. Second, the save replaces the **entire** `security` node,
+not a few fields, and the confirm dialog says so. The backend writes every key, including defaults,
+so an old top-level `auth.enabled` left in the file cannot silently re-lock the LAN zone after a
+harmless-looking save. Invalid values (a port outside 1..65535, an unknown `admin_endpoints` /
+bucket key / HTTP verb, a non-numeric bucket size) answer **422** with the error attached to the
+Security tab, and `config.yaml` is left unchanged.
 
 **API keys** (`/admin/api-keys`) is where caller credentials are born and die. The table lists every
 key as a mask (`sk-hub-FNdc…SVvw`) with its label and creation time — the plaintext is not in any
@@ -869,8 +923,9 @@ TTFT). `think: auto` keeps the model's default thinking behaviour; `off` forces 
 Results land in the same `llmhub.db` as the request log, through the same batched write queue.
 
 **Request log storage:** every API call is appended to SQLite in WAL mode — proxied calls
-(streaming, non-streaming, upstream failure) as full rows, and the in-process handlers plus
-middleware refusals as metadata-only rows — by default `llmhub.db` next to `config.yaml`
+(streaming, non-streaming, upstream failure) as full rows, tool handlers with published detail
+(model/upstream/req/res/tokens) as merged rows, and pure probes plus middleware refusals as
+metadata-only rows — by default `llmhub.db` next to `config.yaml`
 (`/data/llmhub.db` in the container). Set `request_log.enabled: false` in `config.yaml` to stop
 writing altogether — the switch is read per request by both writers, so it applies without a
 restart.
@@ -1315,6 +1370,7 @@ apply to both zones:
 | Field | Default | Description |
 |------|------|------|
 | `blocked_paths` | `[]` | Extra path prefixes to block, e.g. `["api/show"]` or `["api/*"]` — applies in both zones, and answers **403** only for a path that is part of the gateway API; an undeclared path is already **404** |
+| `blocked_ips` | `[]` | Client IP / CIDR deny-list (`203.0.113.7`, `10.0.0.0/8`, `2001:db8::/32`). A matched **real TCP peer** is interrupted before any route: one `deny <ip>` log line, no HTTP response, no access-log line, no request-log row. Both zones; forwarded headers ignored; invalid entries skipped with a warning; hot-reloads in ~1 s even on an idle gateway. Requires `serve.py` / `--http ip_guard_protocol:GuardProtocol` for the pre-ASGI drop — without it the ASGI fallback still interrupts the request (startup warns). See [Blocking client IPs](#blocking-client-ips) |
 | `cors_origins` | `[]` | Explicitly allowed cross-origin sources; empty means no CORS headers at all. A pre-flight is answered with a bodyless `204`, and on the public socket only when `OPTIONS` is listed for that path in `security.public.path_allowlist` |
 | `max_body_bytes` | `33554432` | Request-body cap (32 MiB); `Content-Length` is rejected before any byte is read, chunked bodies counted while streaming, so an oversized POST returns 413 without landing in memory |
 | `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | In-memory token-bucket limiter (single process): `by` = `ip` / `key`, `burst` = capacity, `per_minute` = refill rate; over-budget → **429** with `Retry-After`. **Enable it on any internet-facing instance** (or rate-limit at the proxy) |
@@ -1444,6 +1500,37 @@ may be key-free via `security.internal.allow_anonymous`, while the public zone a
 key or a console session. Startup refuses only when no credential could ever exist (empty table,
 no `ADMIN_PASSWORD`, no anonymous internal zone).
 
+### Blocking client IPs
+
+`security.blocked_ips` is a deny-list of bare IPs / CIDRs (IPv4 and IPv6). Unlike
+`blocked_paths` (a **403** for a real API path) or `rate_limit` (a **429**), a match produces
+**no response at all**: the request is interrupted before any route, with exactly one
+`deny <ip>` log line, no `uvicorn.access` line and no request-log row.
+
+```yaml
+security:
+  blocked_ips: ["203.0.113.7", "10.0.0.0/8", "2001:db8::/32"]
+```
+
+- The match uses the **real TCP peer** only; `X-Forwarded-*` / `X-Real-IP` are ignored. It
+  applies to both listeners and is not a rate limiter.
+- Invalid entries are skipped with a warning (a typo never stops startup). CIDR shorthand such
+  as `203.0.113.7/24` resolves to the containing network; duplicates collapse.
+- It **hot-reloads in ~1 s without a restart**, even with zero traffic: a background config
+  watch publishes the new snapshot, because a denied connection never reaches the middleware
+  that normally triggers a reload.
+- Two layers enforce it. `serve.py` and `start-local.ps1` install `GuardProtocol`
+  (`--http ip_guard_protocol:GuardProtocol` on the CLI), which resets the socket in
+  `connection_made` **before ASGI exists** — zero HTTP bytes. An outermost pure-ASGI
+  `BlockedIPMiddleware` is always installed as a safety net, so a bare `uvicorn main:app`
+  without `--http`, or a keep-alive connection opened before a hot reload, is still
+  interrupted. Startup logs an INFO line with the active rules when the protocol is installed,
+  or a WARNING naming the ASGI-fallback-only mode when it is not.
+- To check what is in force: `scripts\start-local.bat -CheckOnly` prints the normalised rules.
+
+The cut is deliberately best-effort: what is guaranteed is that the **request is interrupted**,
+not a specific TCP reset sequence on every ASGI server.
+
 ### Public-deployment checklist
 
 - [ ] Think before setting `security.public.admin_endpoints: allow`. It does two things: it stops
@@ -1478,7 +1565,8 @@ public** port, and an unbuilt console — then prints the resolved zone layout a
 zones come only from `config.yaml`** (`server.port`, `security.public.port`); the launcher warns
 about legacy `LLMHUB_*` port vars in `.env` but does not use them. It picks the entrypoint:
 
-- Single internal listener (default): uvicorn with `--no-proxy-headers` and auto-reload.
+- Single internal listener (default): uvicorn with `--no-proxy-headers`,
+  `--log-config logging.json`, `--http ip_guard_protocol:GuardProtocol` and auto-reload.
 - A distinct public listener configured, or `-NoReload`: `python serve.py`, which binds every
   listener in one process and applies the public path policy. No auto-reload.
 
@@ -1506,7 +1594,19 @@ scripts\start-local.bat -NoReload                     # serve.py binds 8000 + 80
 Both entrypoints run from `app/`, i.e. the same working directory as the image's `WORKDIR /app`,
 so the relative path in `.env` (`../data/config.yaml`) resolves exactly as it does in the
 container. When starting uvicorn by hand (not via the launcher), always pass
-`--no-proxy-headers` so a caller-supplied `X-Forwarded-For` cannot rewrite the client IP.
+`--no-proxy-headers` so a caller-supplied `X-Forwarded-For` cannot rewrite the client IP, and
+`--http ip_guard_protocol:GuardProtocol` so `security.blocked_ips` is enforced before ASGI:
+
+```bash
+cd app
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env \
+  --no-proxy-headers --log-config logging.json \
+  --http ip_guard_protocol:GuardProtocol
+```
+
+Without `--http` the ASGI fallback still interrupts denied requests, but startup logs a
+WARNING about the degraded mode. `serve.py` (the Docker / two-zone entrypoint) always
+installs the protocol.
 
 ### Quick start
 
@@ -1524,15 +1624,17 @@ cp .env.example .env
 
 # 4. Run the single-listener dev server (loads ../.env automatically)
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env \
+  --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 # Production / two-zone: set security.public.port: 8001 in data/config.yaml, then
 #   cd app && python serve.py
 ```
 
 For anything reachable off-host, prefer `python serve.py` (or the Windows launcher with
 `-NoReload`): it binds every listener in one process and disables uvicorn's proxy-header rewrite.
-The `--no-proxy-headers` flag above gives single-listener uvicorn the same protection. A public
-listener is opened **only** by `security.public.port` in `config.yaml` — there is no port env var.
+The `--no-proxy-headers` flag above gives single-listener uvicorn the same protection, and
+`--http` installs the `security.blocked_ips` socket guard. A public listener is opened
+**only** by `security.public.port` in `config.yaml` — there is no port env var.
 
 ### Windows PowerShell
 
@@ -1547,33 +1649,34 @@ $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 
 # 3. Run the single-listener dev server (loads ../.env automatically)
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 ```
 
 ### Run with specific config
 
 ```bash
 cd app
-CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
+CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 ```
 
 ```powershell
 # Windows PowerShell
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 cd app
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 ```
 
 ### Run in background (Linux/macOS)
 
 ```bash
 cd app
-nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers > ../llm-hub.log 2>&1 &
+nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol > ../llm-hub.log 2>&1 &
 ```
 
 For a bound host/port other than loopback, or to open a public listener, use `python serve.py`
-instead of uvicorn so the proxy-header rewrite is disabled in code and the
-`security.public.port` listener (from `config.yaml`) works.
+instead of uvicorn so the proxy-header rewrite is disabled in code, the
+`security.blocked_ips` socket guard is installed and the `security.public.port`
+listener (from `config.yaml`) works.
 
 ### Run as Windows service (using NSSM)
 

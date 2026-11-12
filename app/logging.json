@@ -15,15 +15,22 @@
       "use_colors": false
     }
   },
+  "filters": {
+    "name_alias": {
+      "()": "logging_config.LoggerNameAliasFilter"
+    }
+  },
   "handlers": {
     "default": {
       "class": "logging.StreamHandler",
       "formatter": "default",
+      "filters": ["name_alias"],
       "stream": "ext://sys.stderr"
     },
     "access": {
       "class": "logging.StreamHandler",
       "formatter": "access",
+      "filters": ["name_alias"],
       "stream": "ext://sys.stdout"
     }
   },

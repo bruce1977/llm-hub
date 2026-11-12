@@ -112,15 +112,19 @@ cp data/config.example.yaml data/config.yaml
 cp .env.example .env                                # 填 ADMIN_PASSWORD
 
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
-# 正式启动或需要公网监听端口时改用加固入口（禁用转发头改写，
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env \
+  --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
+# 正式启动或需要公网监听端口时改用加固入口（禁用转发头改写、装载 GuardProtocol，
 # 按 config.yaml 的 server.port / security.public.port 绑定监听）：
 # python serve.py
 ```
 
 即使是本地 uvicorn 启动也必须加 `--no-proxy-headers`：否则 `ProxyHeadersMiddleware` 会用调用方提交的
-`X-Forwarded-For` 改写 `scope["client"]`（当 TCP 对端是 `127.0.0.1` 时），使审计 IP 被客户端伪造。`serve.py`
-则在代码里设置等价的 `proxy_headers=False`。端口与分区策略只来自 `config.yaml`，不再有端口环境变量。
+`X-Forwarded-For` 改写 `scope["client"]`（当 TCP 对端是 `127.0.0.1` 时），使限流桶、审计行和
+`security.blocked_ips` 使用的地址被客户端伪造。`serve.py` 则在代码里设置等价的
+`proxy_headers=False`。`--http ip_guard_protocol:GuardProtocol` 装载 `security.blocked_ips` 的
+预 ASGI socket 切断；不带它时 ASGI 兜底仍会中断被拒请求，但启动会打印 WARNING 说明处于降级模式，
+`serve.py` 则始终装载自定义 protocol。端口与分区策略只来自 `config.yaml`，不再有端口环境变量。
 
 工作目录必须是 `app/`（与镜像的 `WORKDIR /app` 一致），否则 `.env` 里的 `../data/config.yaml`
 解析不到；`--env-file` 指向仓库根的 `.env`。管理台在 `http://localhost:8000/admin`，
@@ -132,7 +136,8 @@ python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-he
 
 ```bat
 :: 单内网监听（端口取 config.yaml 的 server.port），uvicorn + 自动重载
-:: （会带 --no-proxy-headers）。要改端口请改 config.yaml，不是在命令行上。
+:: （会带 --no-proxy-headers、--log-config logging.json 与
+::  --http ip_guard_protocol:GuardProtocol）。要改端口请改 config.yaml，不是在命令行上。
 scripts\start-local.bat
 
 :: 只做启动前检查，不启动服务
@@ -469,22 +474,28 @@ curl -m 3 -o /dev/null -w '%{http_code}\n' http://<公网域名>:11434/api/tags 
    建议 1~2），`server.upstream_queue_timeout` 设成可接受的排队时长（默认 120 秒）。超出的
    请求排队等空位而不是被拒绝，排队超时返回 503 + `Retry-After`。两者只在启动时读取，
    改完要重启网关。
-5. **管理台只留在内网**：`/admin` 与 `/admin/*` 在公网 socket 上是硬 404（没有 admin 外壳开关）；
+5. **在 socket 层封禁恶意 IP**：`security.blocked_ips` 支持单 IP 与 CIDR（IPv4/IPv6）。命中后
+   请求在进路由前被中断——只输出一条 `deny <ip>`，没有 HTTP 响应、没有访问日志、没有请求记录；
+   判定只用真实 TCP 对端，不采信 `X-Forwarded-*`。约 1 秒内热加载，无需重启。镜像请用
+   `python serve.py` 启动（它会注入 `http=GuardProtocol`）；裸 `uvicorn main:app` 需补
+   `--http ip_guard_protocol:GuardProtocol` 才有预 ASGI 切断，否则 ASGI 兜底仍会中断请求但
+   启动会告警。`-CheckOnly` 会打印生效规则。
+6. **管理台只留在内网**：`/admin` 与 `/admin/*` 在公网 socket 上是硬 404（没有 admin 外壳开关）；
    只从内网 / VPN 或隧道访问管理台。所有 `/v1/management/*` 只认已签名的会话 Cookie，调用方 API Key
    一律 401，在公网更是 404。
-6. **在 config 里声明分区**：把 `security.public.port` 设为与 `server.port` 不同的端口（如 `8001`），
+7. **在 config 里声明分区**：把 `security.public.port` 设为与 `server.port` 不同的端口（如 `8001`），
    两个容器端口映射到**不同的宿主端口**，`server.port` 只发布到内网。监听 socket 才是锚点——
    任何 IP 列表、XFF 或端口环境变量都不能把请求在分区间挪动（旧版端口变量只是迁移提示，请从
    `.env` 删除）。转发头一律不采信：前置反代时所有调用方共用一个 IP，建议
    `rate_limit.by: key` 或在反代层限速。确认镜像以 `python serve.py` 启动
    （`proxy_headers=False`），不要用裸 `uvicorn main:app`——后者绑不了公网端口，还会让审计 IP
    变成客户端可控。`docs` 被隐藏时，公网 API 绝不能同时免 Key。
-7. **收敛信息面**：`security.internal.expose_version: false`，不需要时
+8. **收敛信息面**：`security.internal.expose_version: false`，不需要时
    `security.internal.expose_docs: false`；`security.public.path_allowlist` 只保留最少量的
    `re.fullmatch` method+path 规则（例如 `^/v1/chat/completions$`，而不是宽泛的 `^/v1/.*$`）。
    未列出的组合带不带 Key 都是 404。`GET /v1/management/config` 已对上游 `headers` 打码，
    保存时会自动从磁盘回填真实值。
-8. **容器与依赖（部署层待办，代码未改）**：镜像当前以 root 运行且 `requirements.txt` 只用
+9. **容器与依赖（部署层待办，代码未改）**：镜像当前以 root 运行且 `requirements.txt` 只用
    `>=`，建议改为非 root + 只读根文件系统（仅 `/data` 可写），并生成带 hash 的 lock 文件。
 
 ---

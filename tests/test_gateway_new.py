@@ -62,6 +62,11 @@ os.environ["CONFIG_PATH"] = _cfg_path
 # One data file per run: `llmhub.db` holds the api_keys table, and this suite writes its own
 # key row there (keys are minted in the console, never seeded from the environment).
 os.environ["LLMHUB_DB"] = f"{_cfg_path}.db"
+# Isolate the request log from other suites: standalone handlers (systemone, web
+# search) now publish model/upstream + raw bodies, and the assertions below read
+# that row straight from SQLite after the lifespan drains the write queue.
+os.environ["REQUEST_LOG_DB"] = f"{_cfg_path}.requests.db"
+Path(os.environ["REQUEST_LOG_DB"]).unlink(missing_ok=True)
 os.environ["SYSTEMONE_SERVER_API_KEY"] = "systemone-secret-env-key"
 os.environ["OPENCODE_GATEWAY_API_KEY"] = "opencode-secret-env-key"
 
@@ -538,6 +543,54 @@ def run() -> int:
         # cleanup: leave the fixture config as the other sections expect
         app.state.manager._config.upstreams = []
         ws.enabled = False
+
+    # ----------------------------------------- standalone request-log detail ---
+    # These are the endpoints the console used to show with `—` for model and no
+    # req/res in the detail drawer. They bypass ProxyService, so the handler publishes
+    # what it knows on request.state and the middleware writes ONE enriched row.
+    print("[11] standalone APIs log model / upstream / req + res bodies")
+    import sqlite3
+
+    log_db = os.environ["REQUEST_LOG_DB"]
+    con = sqlite3.connect(log_db)
+    con.row_factory = sqlite3.Row
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(requests)")}
+        wanted = [
+            c for c in ("path", "status", "model", "requested_model", "upstream", "request_body",
+                        "response_body", "tokens", "stream", "req_size", "res_size")
+            if c in cols
+        ]
+        rows = [dict(r) for r in con.execute(f"SELECT {', '.join(wanted)} FROM requests ORDER BY id")]
+    finally:
+        con.close()
+
+    so_rows = [r for r in rows if r["path"] == "/v1/systemone" and r["status"] == 200 and r.get("request_body")]
+    check("systemone 200 rows carry a request body", len(so_rows) >= 1, str(len(so_rows)))
+    if so_rows:
+        so = so_rows[0]
+        check("systemone logs the injected model", so.get("model") == "multilingual", str(so.get("model")))
+        check("systemone logs its backend as upstream", "laya.example" in (so.get("upstream") or ""), str(so.get("upstream")))
+        check("systemone logs the request body", "I was charged twice" in (so.get("request_body") or ""),
+              str(so.get("request_body"))[:160])
+        check("systemone logs the response body", "answers" in (so.get("response_body") or ""),
+              str(so.get("response_body"))[:160])
+
+    ws_rows = [r for r in rows if r["path"] == "/v1/tools/web-search" and r["status"] == 200 and r.get("request_body")]
+    check("web search 200 rows carry a request body", len(ws_rows) >= 1, str(len(ws_rows)))
+    if ws_rows:
+        web = ws_rows[0]
+        check("web search logs the provider upstream", web.get("upstream") == "opencode", str(web.get("upstream")))
+        check("web search logs the request body", "Ollama keep_alive" in (web.get("request_body") or ""),
+              str(web.get("request_body"))[:160])
+        check("web search logs the response body", "opencode-websearch" in (web.get("response_body") or ""),
+              str(web.get("response_body"))[:160])
+
+    # A refused public call must stay metadata-only -- no phantom model or bodies.
+    denied = [r for r in rows if r["status"] == 401 and r["path"] == "/v1/systemone"]
+    check("public denial has no fake model or body",
+          all(not r.get("model") and not r.get("request_body") and not r.get("response_body") for r in denied),
+          str(denied[:1]))
 
     return 1 if FAILED else 0
 

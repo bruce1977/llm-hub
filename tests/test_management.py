@@ -778,6 +778,58 @@ def run() -> int:
             str((openai_entry.get("tokens_in"), openai_entry.get("tokens_out"), openai_entry.get("tokens"))),
         )
 
+        # --- standalone handlers: model / upstream / req + res on ONE row -----------
+        # These endpoints never enter ProxyService.forward; the handler publishes what
+        # it knows on request.state and the middleware writes one enriched row.
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "qwen3:8b", "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages detail: non-stream -> 200", r.status_code == 200, r.text[:200])
+        msg_row = client.get("/v1/management/requests", params={"path": "v1/messages"}).json()["rows"][0]
+        msg = client.get(f"/v1/management/requests/{msg_row['id']}").json()
+        check("messages detail: resolved model logged", msg.get("model") == "qwen3:8b", str(msg.get("model")))
+        check("messages detail: upstream logged", msg.get("upstream") == "mock-ollama", str(msg.get("upstream")))
+        check("messages detail: requested model kept", msg.get("requested_model") == "qwen3:8b", str(msg.get("requested_model")))
+        check("messages detail: request body logged", "ping" in (msg.get("request_body") or ""), str(msg.get("request_body"))[:160])
+        check("messages detail: Anthropic response body logged", '"type": "message"' in (msg.get("response_body") or ""), str(msg.get("response_body"))[:160])
+        check("messages detail: token split from Anthropic usage",
+              (msg.get("tokens_in"), msg.get("tokens_out")) == (5, 7),
+              str((msg.get("tokens_in"), msg.get("tokens_out"))))
+        check("messages detail: not stream", not msg.get("stream"), str(msg.get("stream")))
+
+        # Streaming messages: the middleware buffers the SSE body from its iterator and
+        # the generator publishes usage from its finally (after the terminal chunk).
+        r = client.post(
+            "/v1/messages", headers=GW,
+            json={"model": "qwen3:8b", "max_tokens": 32, "stream": True, "messages": [{"role": "user", "content": "ping"}]},
+        )
+        check("messages detail: stream -> 200", r.status_code == 200, r.text[:160])
+        srow = client.get("/v1/management/requests", params={"path": "v1/messages"}).json()["rows"][0]
+        sdetail = client.get(f"/v1/management/requests/{srow['id']}").json()
+        check("messages detail: stream flag set", bool(sdetail.get("stream")), str(sdetail.get("stream")))
+        check("messages detail: SSE response body captured", "event:" in (sdetail.get("response_body") or ""),
+              str(sdetail.get("response_body"))[:160])
+        check("messages detail: stream token split", (sdetail.get("tokens_in"), sdetail.get("tokens_out")) == (5, 7),
+              str((sdetail.get("tokens_in"), sdetail.get("tokens_out"))))
+
+        # Rerank: model/upstream come from the resolved target, bodies are pass-through.
+        r = client.post(
+            "/v1/rerank", headers=GW,
+            json={"model": "qwen3-reranker:4b", "query": "keep_alive", "documents": ["doc one"], "top_n": 1},
+        )
+        check("rerank detail: -> 200", r.status_code == 200, r.text[:200])
+        rr_row = client.get("/v1/management/requests", params={"path": "v1/rerank"}).json()["rows"][0]
+        rr = client.get(f"/v1/management/requests/{rr_row['id']}").json()
+        check("rerank detail: requested model logged", rr.get("requested_model") == "qwen3-reranker:4b",
+              str(rr.get("requested_model")))
+        check("rerank detail: resolved model logged", rr.get("model") == "qwen3-reranker:4b", str(rr.get("model")))
+        check("rerank detail: upstream logged", bool(rr.get("upstream")), str(rr.get("upstream")))
+        check("rerank detail: request body logged", "keep_alive" in (rr.get("request_body") or ""),
+              str(rr.get("request_body"))[:160])
+        check("rerank detail: response body logged", "results" in (rr.get("response_body") or ""),
+              str(rr.get("response_body"))[:160])
+
         r = client.post(
             "/v1/chat/completions",
             headers=GW,
@@ -1916,6 +1968,333 @@ def run() -> int:
     check("the sixth attempt is locked out even with the right password", locked.status_code == 429, f"got {locked.status_code}")
     check("the lockout advertises Retry-After", "retry-after" in {k.lower() for k in locked.headers}, str(dict(locked.headers)))
     _LOGIN_FAILURES.clear()
+
+    # ---------------------------------------------- general settings: cleanup ---
+    print("[16] request log cleanup (Settings / General)")
+    cleanup_dir = Path(tempfile.mkdtemp(prefix="llmhub-cleanup-"))
+    cleanup_db = cleanup_dir / "llmhub.db"
+    probe_log = main.app.state.request_log.__class__(db_path=cleanup_db, retention_days=0)
+    probe_log._init_db()  # schema only: no writer task needed for a synchronous preview/delete
+    cutoff_date = "2026-10-12"
+    cutoff_ts = cutoff_date + "T00:00:00"
+
+    def insert_cleanup_row(ts: str, path: str = "/v1/models") -> None:
+        with sqlite3.connect(cleanup_db) as conn:
+            conn.execute(
+                "INSERT INTO requests (ts, method, path, status, duration_ms, stream) "
+                "VALUES (?, 'GET', ?, 200, 1, 0)",
+                (ts, path),
+            )
+
+    for row_ts in (
+        "2020-01-01T00:00:00",
+        "2024-05-31T23:59:59",
+        "2026-10-11T23:59:59",
+        cutoff_ts,  # exactly at the cutoff: strict "<" must keep this one
+        datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds"),
+    ):
+        insert_cleanup_row(row_ts)
+    # Cleanup is a storage operation: it must cover non-API rows too, even though
+    # the request list and charts hide them behind API_PATH_SCOPE.
+    insert_cleanup_row("2021-02-03T04:05:06", "/health")
+
+    saved_log = main.app.state.request_log
+    main.app.state.request_log = probe_log
+    try:
+        anon_cleanup = TestClient(main.app)
+        check("cleanup preview without a session -> 401",
+              anon_cleanup.get("/v1/management/requests/cleanup", params={"before": cutoff_date}).status_code == 401)
+        check("cleanup delete without a session -> 401",
+              anon_cleanup.post("/v1/management/requests/cleanup", json={"before": cutoff_date}).status_code == 401)
+
+        # A destructive write must never become reachable by declaring an allowlist
+        # rule: the management plane is closed on the public socket unless the
+        # operator explicitly opens it, and even then a session cookie is required.
+        security_cfg = main.app.state.manager.config.security
+        saved_public_port = security_cfg.public.port
+        try:
+            security_cfg.public.port = 80  # TestClient's synthetic server port
+            check("public: cleanup preview is behind the admin perimeter",
+                  anon_cleanup.get("/v1/management/requests/cleanup", params={"before": cutoff_date}).status_code in (401, 404))
+            check("public: cleanup delete is behind the admin perimeter",
+                  anon_cleanup.post("/v1/management/requests/cleanup", json={"before": cutoff_date}).status_code in (401, 404))
+        finally:
+            security_cfg.public.port = saved_public_port
+
+        signed_in = probe.post("/v1/management/auth/login", json={"password": "admin-secret-pw"})
+        check("cleanup test client signs in -> 200", signed_in.status_code == 200, f"got {signed_in.status_code}")
+
+        r = probe.get("/v1/management/requests/cleanup", params={"before": cutoff_date})
+        check("preview -> 200 (not swallowed by /requests/{id})", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
+        preview = r.json()
+        check("a plain YYYY-MM-DD normalises to UTC midnight", preview["before"] == cutoff_ts, str(preview.get("before")))
+        check("preview counts every row strictly older than the cutoff", preview["count"] == 4, str(preview))
+        check("preview reports the table total", preview["total"] == 6, str(preview.get("total")))
+        check("preview reports the oldest affected row", preview["oldest"] == "2020-01-01T00:00:00", str(preview.get("oldest")))
+        check("preview reports the newest affected row", preview["newest"] == "2026-10-11T23:59:59", str(preview.get("newest")))
+        check("preview reports the database size", preview["db_bytes"] > 0, str(preview.get("db_bytes")))
+
+        check("an unparsable cutoff -> 400",
+              probe.get("/v1/management/requests/cleanup", params={"before": "not-a-date"}).status_code == 400)
+        check("a missing cutoff -> 400",
+              probe.get("/v1/management/requests/cleanup").status_code == 400)
+        future = (datetime.now(UTC) + timedelta(days=2)).date().isoformat()
+        check("a future cutoff is refused -> 400",
+              probe.get("/v1/management/requests/cleanup", params={"before": future}).status_code == 400)
+        r = probe.get("/v1/management/requests/cleanup", params={"before": "2026-10-12T08:00:00+08:00"})
+        check("a zoned datetime is converted to UTC", r.json()["before"] == cutoff_ts, str(r.json().get("before")))
+        check("an empty POST body cutoff -> 422",
+              probe.post("/v1/management/requests/cleanup", json={"before": ""}).status_code == 422)
+        check("a POST without before -> 422",
+              probe.post("/v1/management/requests/cleanup", json={"vacuum": True}).status_code == 422)
+
+        r = probe.post("/v1/management/requests/cleanup", json={"before": cutoff_date})
+        check("cleanup POST -> 200", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
+        result = r.json()
+        check("cleanup answers ok", result["ok"] is True, str(result))
+        check("cleanup deletes exactly the old rows", result["deleted"] == 4, str(result.get("deleted")))
+        check("cleanup reports two surviving rows", result["remaining"] == 2, str(result.get("remaining")))
+        check("cleanup reports the oldest surviving row", result["oldest"] == cutoff_ts, str(result.get("oldest")))
+        check("VACUUM is off by default", result["vacuum"] is False, str(result.get("vacuum")))
+        check("cleanup reports the db size before/after",
+              result["db_bytes_before"] > 0 and result["db_bytes_after"] > 0, str(result))
+
+        with sqlite3.connect(cleanup_db) as conn:
+            left = [row[0] for row in conn.execute("SELECT ts FROM requests ORDER BY ts")]
+        check("the row exactly at the cutoff survives", cutoff_ts in left, str(left))
+        check("no row older than the cutoff survives", all(ts >= cutoff_ts for ts in left), str(left))
+        check("exactly two rows survive", len(left) == 2, str(left))
+
+        r = probe.get("/v1/management/requests/cleanup", params={"before": cutoff_date})
+        check("a second preview finds nothing left to delete", r.json()["count"] == 0, str(r.json()))
+        r = probe.post("/v1/management/requests/cleanup", json={"before": cutoff_date, "vacuum": True})
+        check("VACUUM is skipped when nothing was deleted",
+              r.json()["deleted"] == 0 and r.json()["vacuum"] is False, str(r.json()))
+        insert_cleanup_row("2019-01-01T00:00:00")
+        r = probe.post("/v1/management/requests/cleanup", json={"before": cutoff_date, "vacuum": True})
+        check("VACUUM runs when rows are removed", r.status_code == 200 and r.json()["vacuum"] is True, str(r.json()))
+        check("VACUUM still deleted the row", r.json()["deleted"] == 1, str(r.json()))
+        check("VACUUM keeps the surviving rows", r.json()["remaining"] == 2, str(r.json()))
+    finally:
+        main.app.state.request_log = saved_log
+
+    # ------------------------------------------- Settings / Security tab (config.yaml) ---
+    print("[17] settings security node (PUT /config)")
+    import ip_guard
+    import yaml as _yaml
+
+    manager = main.app.state.manager
+    original_text = manager.path.read_text(encoding="utf-8")
+    security_probe = TestClient(main.app)
+    try:
+        anon_security = TestClient(main.app)
+        check("security config read without a session -> 401",
+              anon_security.get("/v1/management/config").status_code == 401)
+        check("security config write without a session -> 401",
+              anon_security.put("/v1/management/config", json={"config": {}}).status_code == 401)
+
+        signed_in = security_probe.post("/v1/management/auth/login", json={"password": "admin-secret-pw"})
+        check("security test client signs in -> 200", signed_in.status_code == 200, f"got {signed_in.status_code}")
+
+        got = security_probe.get("/v1/management/config")
+        check("GET /config -> 200", got.status_code == 200, f"got {got.status_code}")
+        base = got.json()
+        full_keys = {"internal", "public", "blocked_paths", "blocked_ips", "cors_origins",
+                     "max_body_bytes", "rate_limit"}
+        check("GET /config exposes the full security node",
+              full_keys.issubset(base["security"]), str(sorted(base["security"])))
+        check("GET /config exposes both zones and the rate limiter",
+              {"allow_anonymous", "expose_version", "expose_docs"}.issubset(base["security"]["internal"])
+              and {"port", "path_allowlist", "admin_endpoints"}.issubset(base["security"]["public"])
+              and {"enabled", "per_minute", "burst", "by"}.issubset(base["security"]["rate_limit"]),
+              str(base["security"]))
+
+        disk_before = _yaml.safe_load(original_text)
+        sec = json.loads(json.dumps(base["security"]))  # deep copy; keep the GET payload intact
+        sec["blocked_ips"] = ["192.0.2.10", "not-an-ip"]
+        sec["blocked_paths"] = ["api/pull", "api/*"]
+        sec["cors_origins"] = ["https://console.example"]
+        sec["max_body_bytes"] = 16 * 1024 * 1024
+        sec["public"]["port"] = 9001
+        sec["public"]["admin_endpoints"] = "readonly"
+        sec["public"]["path_allowlist"] = {
+            "GET": [r"^/v1/models$"],
+            "OPTIONS": [r"^/v1/chat/completions$"],
+        }
+        sec["rate_limit"] = {"enabled": True, "per_minute": 120, "burst": 30, "by": "key"}
+        r = security_probe.put("/v1/management/config", json={"config": {"security": sec}})
+        check("PUT /config with a security node -> 200 + reloaded",
+              r.status_code == 200 and r.json().get("reloaded") is True,
+              f"got {r.status_code}: {r.text[:200]}")
+
+        disk = _yaml.safe_load(manager.path.read_text(encoding="utf-8"))
+        check("security is persisted as a COMPLETE node (defaults included)",
+              full_keys.issubset(disk["security"]), str(sorted(disk["security"])))
+        check("every other top-level segment survives a security-only save",
+              all(disk.get(k) == v for k, v in disk_before.items() if k != "security"),
+              str(sorted(set(disk_before) - {"security"})))
+        check("scalar security fields are written verbatim",
+              disk["security"]["max_body_bytes"] == 16 * 1024 * 1024
+              and disk["security"]["public"]["port"] == 9001
+              and disk["security"]["public"]["admin_endpoints"] == "readonly"
+              and disk["security"]["rate_limit"]["by"] == "key",
+              str(disk["security"]))
+        check("list fields and the method->regex mapping are written verbatim",
+              disk["security"]["blocked_ips"] == sec["blocked_ips"]
+              and disk["security"]["blocked_paths"] == sec["blocked_paths"]
+              and disk["security"]["cors_origins"] == sec["cors_origins"]
+              and disk["security"]["public"]["path_allowlist"] == sec["public"]["path_allowlist"],
+              str(disk["security"]))
+        live = manager.config.security
+        check("the live config reflects the saved security node",
+              live.blocked_ips == sec["blocked_ips"]
+              and live.public.port == 9001
+              and live.public.admin_endpoints == "readonly"
+              and live.rate_limit.enabled is True
+              and live.rate_limit.per_minute == 120,
+              str(live.model_dump(mode="json")))
+        check("blocked_ips hot-reloads into the IP guard; a bad entry is skipped",
+              ip_guard.active_rules() == ("192.0.2.10/32",)
+              and ip_guard.is_blocked("192.0.2.10")
+              and not ip_guard.is_blocked("192.0.2.11"),
+              str(ip_guard.active_rules()))
+
+        # Rejected input must be named against the `security` segment and must
+        # never touch disk. These are the five field kinds the console exposes:
+        # port, enum, bucket key, HTTP verb keys and a numeric bucket size.
+        bad_values = [
+            ("port", {**sec, "public": {**sec["public"], "port": 70000}}),
+            ("admin_endpoints", {**sec, "public": {**sec["public"], "admin_endpoints": "bogus"}}),
+            ("rate_limit.by", {**sec, "rate_limit": {**sec["rate_limit"], "by": "bogus"}}),
+            ("path allowlist verb",
+             {**sec, "public": {**sec["public"], "path_allowlist": {"TRACE": ["^/x$"]}}}),
+            ("per_minute", {**sec, "rate_limit": {**sec["rate_limit"], "per_minute": "many"}}),
+        ]
+        text_before_bad = manager.path.read_text(encoding="utf-8")
+        for label, bad in bad_values:
+            resp = security_probe.put("/v1/management/config", json={"config": {"security": bad}})
+            try:
+                segs = (resp.json().get("detail") or {}).get("segments") or {}
+            except Exception:
+                segs = {}
+            check(f"invalid {label} -> 422 naming the security segment",
+                  resp.status_code == 422 and "security" in segs,
+                  f"got {resp.status_code}: {resp.text[:200]}")
+        check("a rejected security save leaves config.yaml untouched",
+              manager.path.read_text(encoding="utf-8") == text_before_bad)
+
+        r = security_probe.put("/v1/management/config", json={"config": {}})
+        check("an empty PUT leaves the security node intact",
+              r.status_code == 200
+              and manager.config.security.blocked_ips == sec["blocked_ips"]
+              and manager.config.security.public.port == 9001,
+              f"got {r.status_code}: {r.text[:200]}")
+
+        # The console sends null when the operator clears the listener-port input.
+        sec_no_port = json.loads(json.dumps(sec))
+        sec_no_port["public"]["port"] = None
+        r = security_probe.put("/v1/management/config", json={"config": {"security": sec_no_port}})
+        check("a cleared port is saved as null (no public listener)",
+              r.status_code == 200
+              and _yaml.safe_load(manager.path.read_text(encoding="utf-8"))["security"]["public"]["port"] is None
+              and manager.config.security.public.port is None,
+              f"got {r.status_code}: {r.text[:200]}")
+
+        # Regression: the console writes the WHOLE node. If defaults were stripped
+        # on the way out, Config._migrate_auth_node would re-derive
+        # internal.allow_anonymous from a stale top-level `auth.enabled` and flip
+        # the LAN zone after a harmless Settings save.
+        legacy = json.loads(json.dumps(disk_before))
+        legacy["auth"] = {"enabled": True}
+        legacy["security"]["internal"].pop("allow_anonymous", None)
+        manager.path.write_text(_yaml.safe_dump(legacy, allow_unicode=True), encoding="utf-8")
+        manager.reload()
+        check("a stale top-level auth node decides allow_anonymous when absent",
+              manager.config.security.internal.allow_anonymous is False,
+              str(manager.config.security.internal.allow_anonymous))
+        current = security_probe.get("/v1/management/config").json()["security"]
+        current["internal"]["allow_anonymous"] = True
+        r = security_probe.put("/v1/management/config", json={"config": {"security": current}})
+        migrated = _yaml.safe_load(manager.path.read_text(encoding="utf-8"))
+        migrated_internal = migrated["security"]["internal"]
+        check("a full security save is not re-locked by a stale auth node",
+              r.status_code == 200
+              and migrated_internal["allow_anonymous"] is True
+              and manager.config.security.internal.allow_anonymous is True,
+              f"got {r.status_code}: {migrated_internal}")
+        check("unrelated legacy top-level keys are preserved",
+              migrated.get("auth") == {"enabled": True}, str(migrated.get("auth")))
+
+        # --- Service tab: the config.yaml server node (PUT /config) -------------
+        print("[18] settings server node (PUT /config)")
+        server_keys = {"host", "port", "log_level", "request_timeout",
+                       "max_concurrency", "upstream_queue_timeout",
+                       "upstream_keepalive_expiry"}
+        srv_base = security_probe.get("/v1/management/config").json()["server"]
+        check("GET /config exposes the FULL server node",
+              server_keys.issubset(srv_base), str(sorted(srv_base)))
+
+        srv = json.loads(json.dumps(srv_base))  # deep copy; keep the GET payload intact
+        srv["host"] = "127.0.0.1"
+        srv["port"] = 8123
+        srv["log_level"] = "debug"
+        srv["request_timeout"] = 320.5
+        srv["max_concurrency"] = 2
+        srv["upstream_queue_timeout"] = 45.0
+        srv["upstream_keepalive_expiry"] = 12.0
+        r = security_probe.put("/v1/management/config", json={"config": {"server": srv}})
+        check("PUT /config with a server node -> 200 + reloaded",
+              r.status_code == 200 and r.json().get("reloaded") is True,
+              f"got {r.status_code}: {r.text[:200]}")
+
+        srv_disk = _yaml.safe_load(manager.path.read_text(encoding="utf-8"))
+        check("server is persisted as a COMPLETE node (defaults included)",
+              server_keys.issubset(srv_disk["server"]), str(sorted(srv_disk["server"])))
+        check("every server field is written verbatim",
+              all(srv_disk["server"][k] == v for k, v in srv.items()),
+              str(srv_disk["server"]))
+        check("a server-only save leaves every other top-level segment intact",
+              all(srv_disk.get(k) == v for k, v in migrated.items() if k != "server"),
+              str(sorted(set(migrated) - {"server"})))
+        live_srv = manager.config.server
+        check("the live config reflects the saved server node",
+              live_srv.host == "127.0.0.1"
+              and live_srv.port == 8123
+              and live_srv.log_level == "debug"
+              and live_srv.max_concurrency == 2
+              and live_srv.upstream_queue_timeout == 45.0,
+              str(live_srv.model_dump(mode="json")))
+
+        # Rejected server input must be named against the `server` segment and must
+        # never touch disk: a bad enum, a non-numeric field and a concurrency < 1.
+        bad_server = [
+            ("port", {**srv, "port": 70000}),
+            ("max_concurrency", {**srv, "max_concurrency": 0}),
+            ("request_timeout", {**srv, "request_timeout": "many"}),
+            ("upstream_queue_timeout", {**srv, "upstream_queue_timeout": -1}),
+        ]
+        text_before_bad_srv = manager.path.read_text(encoding="utf-8")
+        for label, bad in bad_server:
+            resp = security_probe.put("/v1/management/config", json={"config": {"server": bad}})
+            try:
+                segs = (resp.json().get("detail") or {}).get("segments") or {}
+            except Exception:
+                segs = {}
+            check(f"invalid server {label} -> 422 naming the server segment",
+                  resp.status_code == 422 and "server" in segs,
+                  f"got {resp.status_code}: {resp.text[:200]}")
+        check("a rejected server save leaves config.yaml untouched",
+              manager.path.read_text(encoding="utf-8") == text_before_bad_srv)
+
+        r = security_probe.put("/v1/management/config", json={"config": {}})
+        check("an empty PUT leaves the server node intact",
+              r.status_code == 200
+              and manager.config.server.port == 8123
+              and manager.config.server.max_concurrency == 2,
+              f"got {r.status_code}: {r.text[:200]}")
+    finally:
+        manager.path.write_text(original_text, encoding="utf-8")
+        manager.reload()
 
     print(f"\n{'=' * 60}\nPASSED: {PASSED}  FAILED: {FAILED}\n{'=' * 60}")
     return 0 if FAILED == 0 else 1

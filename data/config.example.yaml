@@ -85,6 +85,20 @@ security:
   # ------------------------------------------------------------------ #
   # Hardening shared by BOTH zones.
   blocked_paths: []
+  # TCP-level deny-list (bare IP or CIDR, IPv4/IPv6): a matching client gets its
+  # socket aborted in uvicorn's connection_made, BEFORE ASGI sees a single byte.
+  # There is NO HTTP response (not even 444), NO access log and NO request log
+  # row -- only one `deny <ip>` application log line. This is not a rate limit:
+  # it is a hard block on the real TCP peer (X-Forwarded-* is never consulted).
+  #   - empty  = no connection is dropped
+  #   - IP     = one host, e.g. 203.0.113.7 or 2001:db8::1
+  #   - CIDR   = a whole range, e.g. 10.0.0.0/8 or 2001:db8::/32
+  # Invalid entries are skipped with a warning; a typo never stops startup.
+  # Hot-reloads (within ~1s, even on an idle gateway). Enforcement REQUIRES the
+  # custom uvicorn protocol: serve.py injects it, and the CLI/local launcher
+  # passes `--http ip_guard_protocol:GuardProtocol`. Startup logs a warning if
+  # this list is non-empty but the protocol was not installed.
+  blocked_ips: []
   # Exact origins allowed cross-site; empty sends no CORS headers at all. A
   # preflight is answered with a bodyless 204 BEFORE the public key check (it
   # carries no credentials), but OPTIONS is still a method+path for the

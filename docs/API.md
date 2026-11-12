@@ -140,6 +140,16 @@ shares one address — prefer `rate_limit.by: key` or throttle at the proxy. `pe
 rejects an ASGI scope with the port-0 rewrite fingerprint left by `ProxyHeadersMiddleware`,
 which is why the image starts with `python serve.py` (`proxy_headers=False`).
 
+**IP deny-list (`security.blocked_ips`):** a bare IP or CIDR (IPv4 / IPv6) can be blocked before
+any request is served. From the API's point of view this is *not* an HTTP status: a matched real
+TCP peer is interrupted before routing, so clients receive **no response at all** (not 403, not
+444), and no access-log or request-log row is produced. The only trace is one `deny <ip>` line in
+the application log. This is distinct from `security.rate_limit` (a **429**) and
+`security.blocked_paths` (a **403** for a real API path). Enforcement happens below ASGI via
+`GuardProtocol` (`serve.py` / `--http ip_guard_protocol:GuardProtocol`), with an outermost pure-ASGI
+fallback for bare uvicorn and keep-alive connections. The list hot-reloads in ~1 s without a
+restart. See [CONFIG.md](CONFIG.md#blocking-client-ips-securityblocked_ips).
+
 **Console session cookie:** the signed cookie minted by `/v1/management/auth/login` is also a credential
 in **both zones**, so the browser need not hold a caller key on business API routes. Its lifetime is `ADMIN_SESSION_TTL`
 seconds (default `43200`, clamped 5 min .. 7d) and successful requests past half the TTL renew it.
@@ -1183,6 +1193,8 @@ before the first key is minted) or when the internal zone runs with
 | `GET` | `/v1/management/models/systemone` | System One config projection (masked the same way), with request/SSE examples |
 | `GET` | `/v1/management/tools/websearch` | Web Search config projection: `enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url` (derived from the provider upstream) / `api_key_env` / `api_key` (masked) / `timeout` / `provider_configured` |
 | `GET` | `/v1/management/requests` | Request details: `start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`, returning `stats` + `rows` + `pagination` + `request_log` (switch state). **API calls only**: the query always carries `request_log.API_PATH_SCOPE` (`path LIKE '/v1/%' OR path LIKE '/api/%'`); `/v1/management/*`, `/admin/*`, docs and static assets are never written at all, while non-API paths such as `/health` are still stored but stay out of lists, charts, KPIs and failure stats (`GET /requests/{id}` deliberately stays unscoped, so a deep link still opens) |
+| `GET` | `/v1/management/requests/cleanup` | **Preview** for Settings → Requests (no writes): `before=YYYY-MM-DD` or a full ISO8601 datetime, normalised to naive UTC (a plain date = UTC midnight). Returns `{before, count, total, oldest, newest, db_bytes}` — the rows with `ts < before`, the whole-table total and the SQLite file + WAL size. Missing / unparsable / future cutoff → **400**. Admin session cookie only |
+| `POST` | `/v1/management/requests/cleanup` | **Delete** every request-log row with `ts < before`. Body `{"before": "YYYY-MM-DD", "vacuum": false}`; returns `{ok, before, deleted, remaining, oldest, db_bytes_before, db_bytes_after, vacuum}`. Strict `<` keeps a row exactly at the cutoff. Cleanup covers the whole table, including non-API rows that lists/charts hide. `vacuum: true` runs `VACUUM` after a non-empty delete to actually reclaim disk space (it briefly holds the write lock, hence opt-in; a plain `DELETE` does not shrink a SQLite file). Both cleanup routes are registered above `/requests/{id}` so the id parameter cannot swallow them. Admin session cookie only; on the public socket the whole management plane stays closed under `deny` |
 | `GET` | `/v1/management/requests/{id}` | A single detail row (request/response bodies truncated to 8 KB, sensitive fields redacted) |
 | `GET` | `/v1/management/stats/timeseries` | Time-series aggregation: `bucket=hour\|day`, each bucket with `count` / `errors` / `p95`. `tz_offset` (minutes to add to UTC to reach the caller, UTC+8 = `480`, range -840..840) shifts **day** buckets so each bar is one local calendar day instead of one UTC day; hour buckets stay UTC because the console renders them as instants |
 | `GET` | `/v1/management/stats/distribution` | Grouped counts: `group_by=upstream\|model\|status`, returning `{group_by, start, end, items:[{key, count, display?}]}`. `status` is a **three-way split**: `ok` (2xx), `failed` (≥ 500) and `warning` (3xx / 4xx / NULL / anything else); `failed` keeps the ≥ 500 threshold shared with the KPI error rate, the timeseries error bars and `/stats/failures`, so 4xx is now visible as `warning` instead of being folded into `ok`. For `group_by=model` each item also carries `display`: the configured `model_aliases` short name when one exists, otherwise the real id — `key` always stays the resolved model id so filters keep working. Rows with no matched upstream are counted under `-` |
@@ -1195,6 +1207,8 @@ before the first key is minted) or when the internal zone runs with
 | `GET` | `/v1/management/api-keys` | Caller API key list (**session cookie only**): `{items: [{id, masked, label, source, created_at}], total}`, where `source` is `console` (minted in the console) or `file` (a legacy label on rows seeded from the environment by an earlier release; nothing writes it any more). Masks only — neither plaintext nor hashes |
 | `POST` | `/v1/management/api-keys` | Mints a new key (**session cookie only**): body `{"label": "..."}`, `label` required (empty → `400`, longer than 100 characters → `422`), `201` returns `{item, secret}`. **This response is the only time the plaintext ever leaves the server**; no endpoint can return it again |
 | `DELETE` | `/v1/management/api-keys/{id}` | Revokes a key (**session cookie only**): `200` returns `{"deleted": id}`, an unknown `id` → `404`. The in-memory verification set reloads immediately, so the very next request fails |
+| `GET` | `/v1/management/config` | The whole `config.yaml` as a structured object for the Settings console — the **Service** and **Security** tabs edit the complete `server` / `security` nodes it returns. Generated `aliases` are stripped and `upstreams[].headers` values are masked as `••••••`, so a later save never persists credentials it merely read back |
+| `PUT` | `/v1/management/config` | Body `{"config": {...}}`; validates and atomically overwrites `config.yaml`, then hot-reloads. **Six** UI-editable segments are read from the request: `server`, `security`, `upstreams`, `rerank`, `systemone`, `websearch`; every other top-level key is copied verbatim from disk and a missing segment is left untouched. `server` (as `ServerConfig`, port validated to 1..65535) and `security` (as `SecurityConfig`) are each written **in full** (defaults included), so the form matches the file and a stale top-level `auth.enabled` cannot re-derive `internal.allow_anonymous` after a save. All `server` fields are startup-only and need a gateway restart. Each segment is checked separately: an invalid field answers **422** with `detail.segments.server` / `detail.segments.security` (or the other segment name) and writes nothing. Success returns `{"ok": true, "reloaded": true}`; a new `blocked_ips` list reaches the IP guard in the same call. Admin session cookie only |
 
 **Status codes:**
 
@@ -1266,12 +1280,20 @@ request parameters, timings and the result:
   logging. Config hot reload compares the file mtime at most once per second, so the switch takes
   effect in **about a second** (measured). The database path and retention stay environment-driven.
 - **One row per API call, including callers the proxy never sees.** `ProxyService.forward` writes the
-  rich row (bodies, token usage, `model`, `upstream`, `stream`); the security middleware writes a
-  metadata-only row for the standalone in-process handlers (`/v1/systemone`, `/v1/tools/web-search`,
-  `/v1/rerank`, `/v1/messages`, `/v1/models`, `/api/tags`, `/api/ps`) and for every middleware
-  refusal (public-zone 401/404, rate limit 429, body cap 413). On a metadata-only row
-  the body/token/upstream columns are `NULL`, but `error` holds the denial reason; a missing-key
-  probe such as `Missing API key: POST /v1/systemone` is therefore auditable in the Requests view.
+  rich row (bodies, token usage, `model`, `upstream`, `stream`). The security middleware writes the
+  only row for anything that bypasses it, and merges in the detail a handler publishes through
+  `request_log.attach_request_detail()` on the shared ASGI state:
+  - The tool handlers (`/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`, `/v1/messages`) publish
+    the caller's `requested_model`, the resolved `model`, `upstream` and their raw request body;
+    the middleware centrally buffers the response (bounded 64 KB, including streaming SSE), so the
+    row carries both bodies and the token split (`extract_token_usage()` also understands
+    Anthropic `input_tokens` / `output_tokens`). The detail drawer shows the same req/res as a
+    proxied call. `/v1/systemone` logs `systemone:<backend-host>` as its upstream.
+  - Pure discovery probes (`/v1/models`, `/api/tags`, `/api/ps`, `/health`) and every middleware
+    refusal (public-zone 401/404, rate limit 429, body cap 413) stay **metadata-only**: body/token/
+    model/upstream are `NULL`, but `error` holds the denial reason; a missing-key probe such as
+    `Missing API key: POST /v1/systemone` is therefore auditable. Capturing the body only when a
+    handler published detail keeps console polling from filling SQLite with 8 KB snapshots.
   A claim flag on the ASGI scope prevents a proxied call from being written twice. Management and
   console paths (`/v1/management/*`, `/admin/*`), docs and static assets are never written; `HEAD`
   and `OPTIONS` are forwarded but never recorded.

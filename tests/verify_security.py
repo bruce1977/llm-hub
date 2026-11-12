@@ -13,6 +13,7 @@ NOTE: CONFIG_PATH must be set *before* importing `config` (its CONFIG_PATH globa
 is bound at import time), so we create one fixed temp config and write each case to it.
 """
 
+import logging
 import os
 import sys
 import tempfile
@@ -85,6 +86,40 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         print(f"  [FAIL] {name}  {detail}")
 
 
+class _LogCollector(logging.Handler):
+    """Capture (level, rendered message) for one logger, without touching others."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[tuple[str, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append((record.levelname, record.getMessage()))
+
+
+@contextmanager
+def capture_logs(*names: str):
+    """Collect log records from the named loggers; restore levels/handlers after.
+
+    A collector is attached to each logger separately, so an assertion still knows
+    which logger emitted a line even if a display-name filter rewrote
+    ``record.name`` on its way through another handler.
+    """
+    collectors = {name: _LogCollector() for name in names}
+    saved = []
+    try:
+        for name in names:
+            lg = logging.getLogger(name)
+            saved.append((lg, lg.level))
+            lg.setLevel(logging.DEBUG)
+            lg.addHandler(collectors[name])
+        yield collectors
+    finally:
+        for lg, level in saved:
+            lg.removeHandler(collectors[lg.name])
+            lg.setLevel(level)
+
+
 DEFAULT_RULES = {
     "GET": [r"^/health$", r"^/v1/models$"],
     "POST": [r"^/v1/chat/completions$"],
@@ -93,13 +128,15 @@ DEFAULT_RULES = {
 
 @contextmanager
 def client_with(*, public: bool = False, rules=None, allow_anonymous: bool = True,
-                public_cfg=None, request_log=None, **sec_overrides):
+                public_cfg=None, request_log=None, client_addr=("127.0.0.1", 41000),
+                **sec_overrides):
     """Start the app with a fresh config.
 
     TestClient's ``scope["server"]`` port is 80. Setting ``public=True`` declares
     80 as ``security.public.port``, so every request lands in the public zone
     without rebinding a real socket. Otherwise the single TestClient socket is
-    the internal zone.
+    the internal zone. ``client_addr`` sets the fake TCP peer, which is what the
+    IP deny-list reads (the ASGI fallback path needs a blocked peer here).
     """
     cfg = yaml.safe_load(EXAMPLE)
     cfg["security"]["internal"]["allow_anonymous"] = allow_anonymous
@@ -111,7 +148,7 @@ def client_with(*, public: bool = False, rules=None, allow_anonymous: bool = Tru
         cfg["request_log"] = dict(request_log)
     cfg["security"].update(sec_overrides)
     Path(_TMP).write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    with TestClient(app, client=("127.0.0.1", 41000)) as c:  # enters lifespan -> ConfigManager
+    with TestClient(app, client=client_addr) as c:  # enters lifespan -> ConfigManager
         yield c
 
 
@@ -203,6 +240,94 @@ def test_log_redaction() -> None:
     check("oversized body is still redacted before truncation", truncated and "SECRET-PLAIN" not in text, text[:120])
     q = sanitize_query("q=hello&api_key=SECRET&token=ABC")
     check("query-string credentials are masked", bool(q) and "SECRET" not in q and "ABC" not in q and "q=hello" in q, str(q))
+
+
+def test_standalone_log_detail() -> None:
+    """Standalone handlers publish model/upstream/raw bodies on ``request.state``; the
+    middleware merges them into ONE row. No duplicate, no leaked credentials, and the
+    console detail pane gets the same req/res a proxy row would.
+    """
+    import time
+    from types import SimpleNamespace
+
+    from request_log import attach_request_detail, basic_entry
+
+    req = SimpleNamespace(state=SimpleNamespace())
+
+    # Repeated calls accumulate; a later value for the same key wins. Bodies stay raw.
+    attach_request_detail(req, requested_model="q35", request_raw=b'{"model":"q35","api_key":"SECRET-REQ"}')
+    attach_request_detail(
+        req,
+        model="qwen3:8b",
+        upstream="mock-ollama",
+        stream=True,
+        response_raw=b'{"model":"qwen3:8b","usage":{"input_tokens":5,"output_tokens":7},"answer":"ok"}',
+    )
+    detail = req.state.request_log_detail
+    check(
+        "standalone detail accumulates across calls",
+        detail["requested_model"] == "q35" and detail["model"] == "qwen3:8b"
+        and detail["upstream"] == "mock-ollama" and detail["stream"] is True,
+        str(detail),
+    )
+    check(
+        "standalone detail keeps raw bodies for one-shot redaction",
+        b"SECRET-REQ" in detail["request_raw"] and b"usage" in detail["response_raw"],
+        str(detail)[:160],
+    )
+
+    row = basic_entry(
+        method="POST", path="/v1/messages", status=200,
+        ts="2026-11-11T00:00:00", started=time.perf_counter(), detail=detail,
+    )
+    check(
+        "standalone row carries requested + resolved model and upstream",
+        row["model"] == "qwen3:8b" and row["requested_model"] == "q35" and row["upstream"] == "mock-ollama",
+        str([row[k] for k in ("model", "requested_model", "upstream")]),
+    )
+    check(
+        "standalone row redacts the request body",
+        "SECRET-REQ" not in (row["request_body"] or "") and "***" in (row["request_body"] or ""),
+        str(row["request_body"]),
+    )
+    check("standalone row carries the response body", "ok" in (row["response_body"] or ""),
+          str(row["response_body"]))
+    check(
+        "standalone row extracts Anthropic-style token split",
+        (row["tokens_in"], row["tokens_out"], row["tokens"]) == (5, 7, 12),
+        str((row["tokens_in"], row["tokens_out"], row["tokens"])),
+    )
+    check("standalone row marks the stream flag", row["stream"] == 1, str(row["stream"]))
+    check(
+        "standalone row sizes bodies from captured bytes, not headers",
+        row["req_size"] == len(detail["request_raw"]) and row["res_size"] == len(detail["response_raw"]),
+        str((row["req_size"], row["res_size"])),
+    )
+
+    # An oversized body is redacted over the FULL buffer before being truncated.
+    big = b'{"api_key":"SECRET-BIG","text":"' + b"y" * 9000 + b'"}'
+    row2 = basic_entry(
+        method="POST", path="/v1/systemone", status=200,
+        ts="2026-11-11T00:00:00", started=time.perf_counter(), detail={"request_raw": big},
+    )
+    check(
+        "oversized standalone body is redacted then truncated",
+        row2["request_body_truncated"] == 1 and "SECRET-BIG" not in (row2["request_body"] or "")
+        and len(row2["request_body"] or "") <= 8192,
+        str((row2["request_body_truncated"], len(row2["request_body"] or ""))),
+    )
+
+    # A detail-free row (pure probe / middleware denial) stays metadata-only.
+    row3 = basic_entry(
+        method="GET", path="/v1/models", status=401,
+        ts="2026-11-11T00:00:00", started=time.perf_counter(),
+    )
+    check(
+        "detail-free row stays metadata-only",
+        all(row3[k] is None for k in ("model", "requested_model", "upstream", "request_body",
+                                      "response_body", "tokens", "ttfb_ms")),
+        str(row3),
+    )
 
 
 def test_request_log_coverage() -> None:
@@ -303,16 +428,25 @@ def test_request_log_coverage() -> None:
 
 
 def test_log_timestamps() -> None:
-    """Every log line carries a timestamp - uvicorn's stock config prints access lines without one.
+    """Every log line carries a timestamp, and uvicorn's logger names read neutrally.
 
-    serve.py hands uvicorn app/logging.json; a plain `uvicorn main:app` is repaired by
-    setup_logging(), which re-formats the handlers uvicorn had already installed.
+    uvicorn hard-codes ``uvicorn.error`` for *all* server lifecycle messages, so an
+    INFO line like "Application startup complete." prints ``uvicorn.error`` and looks
+    like a failure. A display-only filter renames it to ``gateway`` (access to
+    ``gateway.access``) without touching the real logger, level or routing. All three
+    entrypoints must agree: serve.py and ``--log-config`` load logging.json's filters,
+    while a bare ``uvicorn main:app`` is repaired by ``apply_to_existing_handlers``.
     """
     import io
     import logging
     import re
 
-    from logging_config import apply_to_existing_handlers, uvicorn_log_config
+    from logging_config import (
+        LOG_NAME_ALIASES,
+        LoggerNameAliasFilter,
+        apply_to_existing_handlers,
+        uvicorn_log_config,
+    )
 
     spec = uvicorn_log_config("warning")
     for name in ("default", "access"):
@@ -320,30 +454,100 @@ def test_log_timestamps() -> None:
         check(f"logging.json {name} formatter is timestamped", "%(asctime)s" in fmt["fmt"], fmt["fmt"])
         check(f"logging.json {name} formatter keeps milliseconds",
               fmt["datefmt"] == "%Y-%m-%d %H:%M:%S" and "%(msecs)" in fmt["fmt"], fmt["fmt"])
+        check(f"logging.json {name} handler installs the name-alias filter",
+              "name_alias" in spec["handlers"][name].get("filters", []), str(spec["handlers"][name]))
+    check("logging.json declares a name-alias filter from logging_config",
+          spec["filters"]["name_alias"]["()"].endswith("LoggerNameAliasFilter"), str(spec["filters"]))
     check("logging.json pins every logger to server.log_level",
           {v["level"] for v in spec["loggers"].values()} == {"WARNING"}, str(spec["loggers"]))
     check("logging.json pins the root level", spec["root"]["level"] == "WARNING", str(spec["root"]))
 
-    # The CLI path: uvicorn installs its own formatter *before* the app's lifespan runs.
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    check("uvicorn.error is displayed as gateway", LOG_NAME_ALIASES["uvicorn.error"] == "gateway")
+    check("uvicorn.access is displayed as gateway.access", LOG_NAME_ALIASES["uvicorn.access"] == "gateway.access")
+    check("application logger keeps its own name", "llm_hub" not in LOG_NAME_ALIASES)
+
+    # The CLI / bare-uvicorn path: uvicorn installs its handlers *before* the app's
+    # lifespan runs, so setup_logging() must both re-format and attach the filter.
+    # Mirror the real layout: uvicorn.error has no own handler and propagates to the
+    # `uvicorn` parent, uvicorn.access has its own access handler, llm_hub its own.
+    from uvicorn.logging import AccessFormatter, DefaultFormatter
+
+    fmt = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s | %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    parent = logging.getLogger("uvicorn")
     access = logging.getLogger("uvicorn.access")
-    saved = (list(access.handlers), access.propagate)
-    access.handlers = [handler]
+    err = logging.getLogger("uvicorn.error")
+    app_log = logging.getLogger("llm_hub")
+    loggers = (parent, access, err, app_log)
+    saved = [(list(lg.handlers), lg.propagate, lg.level) for lg in loggers]
+    streams: dict[str, io.StringIO] = {}
+    streams["parent"] = io.StringIO()
+    parent.handlers = [logging.StreamHandler(streams["parent"])]
+    parent.propagate = False
+    streams["access"] = io.StringIO()
+    access.handlers = [logging.StreamHandler(streams["access"])]
     access.propagate = False
+    err.handlers = []
+    err.propagate = True  # the bare-start reality: lifecycle lines bubble to `uvicorn`
+    streams["app"] = io.StringIO()
+    app_handler = logging.StreamHandler(streams["app"])
+    # apply_to_existing_handlers() only touches uvicorn* loggers, so the app logger
+    # keeps the formatter that setup_logging()/basicConfig gave it. Mirror that here.
+    app_handler.setFormatter(logging.Formatter(fmt, datefmt))
+    app_log.handlers = [app_handler]
+    app_log.propagate = False
+    for lg in loggers:
+        lg.setLevel(logging.INFO)
     try:
+        # twice: a reload must not stack duplicate filters
         apply_to_existing_handlers("info")
+        apply_to_existing_handlers("info")
+        check("alias filter attached exactly once on the parent handler",
+              sum(isinstance(f, LoggerNameAliasFilter) for f in parent.handlers[0].filters) == 1,
+              str(parent.handlers[0].filters))
+        check("access handler uses AccessFormatter after repair",
+              isinstance(access.handlers[0].formatter, AccessFormatter), str(access.handlers[0].formatter))
+        check("parent handler uses DefaultFormatter after repair",
+              isinstance(parent.handlers[0].formatter, DefaultFormatter), str(parent.handlers[0].formatter))
+        err.info("Application startup complete.")
+        err.warning("Exception in ASGI application")
         access.info('%s - "%s %s HTTP/%s" %s', "1.2.3.4:5678", "GET", "/v1/models", "1.1", 404)
+        app_log.warning("Environment variable is not set")
     finally:
-        access.handlers, access.propagate = saved
-    line = stream.getvalue().strip()
-    stamped = re.match(
-        r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \| INFO\s+\| uvicorn\.access \| '
-        r'1\.2\.3\.4:5678 - "GET /v1/models HTTP/1\.1" 404 Not Found$',
-        line,
-    )
-    check("an access line is re-formatted with a timestamp and the status phrase", bool(stamped), line)
+        for lg, (handlers, propagate, level) in zip(loggers, saved):
+            lg.handlers, lg.propagate, lg.level = handlers, propagate, level
+
+    err_lines = streams["parent"].getvalue().splitlines()
+    access_lines = streams["access"].getvalue().splitlines()
+    app_lines = streams["app"].getvalue().splitlines()
+    check("INFO lifecycle line shows the neutral gateway name, not uvicorn.error",
+          bool(re.match(
+              r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \| INFO\s+\| gateway \| '
+              r'Application startup complete\.$', err_lines[0])), str(err_lines))
+    check("the real severity survives the alias",
+          bool(re.match(
+              r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \| WARNING\s+\| gateway \| '
+              r'Exception in ASGI application$', err_lines[1])), str(err_lines))
+    check("an access line is re-formatted with a timestamp and the status phrase",
+          bool(re.match(
+              r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \| INFO\s+\| gateway\.access \| '
+              r'1\.2\.3\.4:5678 - "GET /v1/models HTTP/1\.1" 404 Not Found$', access_lines[0])), str(access_lines))
+    check("application logs keep the llm_hub name",
+          bool(re.match(
+              r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \| WARNING\s+\| llm_hub \| '
+              r'Environment variable is not set$', app_lines[0])), str(app_lines))
+
+    # The filter is a pure, idempotent name map: unknown names pass through untouched.
+    flt = LoggerNameAliasFilter()
+    for original, aliased in (
+        ("uvicorn", "gateway"),
+        ("uvicorn.error", "gateway"),
+        ("uvicorn.access", "gateway.access"),
+        ("llm_hub", "llm_hub"),
+        ("some.other.logger", "some.other.logger"),
+    ):
+        rec = logging.LogRecord(original, logging.INFO, __file__, 1, "x", (), None)
+        check(f"alias filter maps {original} -> {aliased}", flt.filter(rec) and rec.name == aliased, rec.name)
 
 
 def test_config_guards() -> None:
@@ -938,6 +1142,366 @@ def test_inference_concurrency_gate() -> None:
         server.server_close()
 
 
+# 6. security.blocked_ips: interrupt denied requests (TCP + ASGI layers) -----
+def test_blocked_ips_matching() -> None:
+    """Pure snapshot semantics: IP/CIDR parsing, both address families, invalid
+    entries, dedup, hot swaps and the protocol-activation detector.
+    """
+    import ip_guard
+
+    try:
+        # Starlette inserts add_middleware() calls at index 0 and builds the
+        # stack in reverse: this guard must be the outermost user middleware, or
+        # the HTTP middleware would already have logged the denied request.
+        check("BlockedIPMiddleware is the outermost user middleware",
+              bool(app.user_middleware)
+              and app.user_middleware[0].cls is ip_guard.BlockedIPMiddleware,
+              str([m.cls.__name__ for m in app.user_middleware]))
+
+        with capture_logs("llm_hub") as logs:
+            count = ip_guard.configure([
+                "203.0.113.7", "10.0.0.0/8", "2001:db8::/32",
+                " 192.0.2.5 ", "not-an-ip", "999.999.999.999", "", None,
+            ])
+        check("4 valid rules compiled from a mixed list", count == 4, str(ip_guard.active_rules()))
+        check("invalid / blank / non-string entries are skipped with warnings",
+              len(logs["llm_hub"].records) >= 3, str(logs["llm_hub"].records))
+        check("bare IPs and CIDRs normalise to networks",
+              ip_guard.active_rules() == ("203.0.113.7/32", "10.0.0.0/8",
+                                          "2001:db8::/32", "192.0.2.5/32"),
+              str(ip_guard.active_rules()))
+        check("a single IPv4 address matches", ip_guard.is_blocked("203.0.113.7"))
+        check("the neighbouring IPv4 address is allowed", not ip_guard.is_blocked("203.0.113.8"))
+        check("an IPv4 CIDR matches", ip_guard.is_blocked("10.99.12.3"))
+        check("an address outside every CIDR is allowed", not ip_guard.is_blocked("11.0.0.1"))
+        check("an IPv6 CIDR matches", ip_guard.is_blocked("2001:db8::abcd"))
+        check("an IPv6 address outside the CIDR is allowed", not ip_guard.is_blocked("2001:db9::1"))
+        check("IPv4 and IPv6 families never cross-match", not ip_guard.is_blocked("::ffff:10.1.2.3"))
+        check("whitespace around an entry is trimmed", ip_guard.is_blocked("192.0.2.5"))
+        check("missing / unparsable peer IP never blocks",
+              not ip_guard.is_blocked(None) and not ip_guard.is_blocked("garbage"))
+
+        ip_guard.configure(["203.0.113.7/24"])
+        check("a host address with a prefix resolves to its containing network",
+              ip_guard.active_rules() == ("203.0.113.0/24",), str(ip_guard.active_rules()))
+        ip_guard.configure(["10.0.0.1", "10.0.0.1/32"])
+        check("duplicate rules collapse after normalisation",
+              len(ip_guard.active_rules()) == 1, str(ip_guard.active_rules()))
+        ip_guard.configure(["198.51.100.9"])
+        check("a reload replaces (never appends to) the deny-list",
+              ip_guard.active_rules() == ("198.51.100.9/32",)
+              and not ip_guard.is_blocked("203.0.113.7")
+              and ip_guard.is_blocked("198.51.100.9"))
+        ip_guard.reset()
+        check("reset clears every rule", ip_guard.active_rules() == ()
+              and not ip_guard.is_blocked("198.51.100.9"))
+
+        # The detector drives the startup log. Test the negative branch without
+        # permanently importing the protocol module into this process.
+        saved_module = sys.modules.pop("ip_guard_protocol", None)
+        try:
+            check("guard_protocol_active() is False without the protocol module",
+                  not ip_guard.guard_protocol_active())
+        finally:
+            if saved_module is not None:
+                sys.modules["ip_guard_protocol"] = saved_module
+    finally:
+        ip_guard.reset()
+
+
+def test_blocked_ips_config_and_hot_reload() -> None:
+    """The config field, its defaults, and ConfigManager publishing the snapshot
+    on every load (including hot reload and the keep-last-good error path).
+    """
+    import ip_guard
+    from config import ConfigManager
+
+    def write(cfg: dict) -> None:
+        Path(_TMP).write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    try:
+        check("SecurityConfig declares blocked_ips", "blocked_ips" in SecurityConfig.model_fields)
+        check("the default config emits an empty blocked_ips",
+              build_default_config()["security"]["blocked_ips"] == [])
+        check("the example config emits an empty blocked_ips",
+              yaml.safe_load(EXAMPLE)["security"]["blocked_ips"] == [])
+        check("a non-empty list is accepted",
+              Config(**{"security": {"blocked_ips": ["203.0.113.7"]}}).security.blocked_ips
+              == ["203.0.113.7"])
+
+        base = yaml.safe_load(EXAMPLE)
+        base["server"]["host"] = "127.0.0.1"
+        base["security"]["internal"]["allow_anonymous"] = True
+        base["security"]["public"]["port"] = None
+        base["security"]["blocked_ips"] = ["203.0.113.7", "10.0.0.0/8"]
+        write(base)
+        manager = ConfigManager(_TMP)
+        check("ConfigManager publishes the deny-list on load",
+              ip_guard.active_rules() == ("203.0.113.7/32", "10.0.0.0/8"),
+              str(ip_guard.active_rules()))
+        check("published rules are immediately enforced",
+              ip_guard.is_blocked("203.0.113.7") and ip_guard.is_blocked("10.1.2.3"))
+
+        base["security"]["blocked_ips"] = ["198.51.100.0/24"]
+        write(base)
+        manager.reload()
+        check("a hot reload swaps the deny-list with no restart",
+              ip_guard.active_rules() == ("198.51.100.0/24",)
+              and not ip_guard.is_blocked("203.0.113.7")
+              and ip_guard.is_blocked("198.51.100.42"),
+              str(ip_guard.active_rules()))
+
+        broken = yaml.safe_load(EXAMPLE)
+        broken["security"]["blocked_ips"] = "not-a-list"
+        write(broken)
+        manager.reload()
+        check("a rejected config keeps the last good deny-list",
+              ip_guard.active_rules() == ("198.51.100.0/24",), str(ip_guard.active_rules()))
+    finally:
+        clean = yaml.safe_load(EXAMPLE)
+        clean["security"]["internal"]["allow_anonymous"] = True
+        clean["security"]["public"]["port"] = None
+        write(clean)
+        ip_guard.reset()
+
+
+def test_blocked_ips_interrupts_request() -> None:
+    """ASGI safety net: a denied request never reaches a route or the request
+    log, and produces exactly one `deny <ip>` line. Allowed peers are untouched.
+    """
+    import sqlite3
+
+    log_db = f"{_TMP}.blocked.db"
+    saved_db = os.environ.get("REQUEST_LOG_DB")
+    os.environ["REQUEST_LOG_DB"] = log_db
+    Path(log_db).unlink(missing_ok=True)
+    seed_api_keys(API_KEY)
+
+    def read_rows() -> list[dict]:
+        con = sqlite3.connect(log_db)
+        con.row_factory = sqlite3.Row
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(requests)")}
+            wanted = [c for c in ("path", "status", "client_ip") if c in cols]
+            return [dict(r) for r in con.execute(f"SELECT {', '.join(wanted)} FROM requests")]
+        finally:
+            con.close()
+
+    try:
+        with capture_logs("llm_hub") as logs:
+            with client_with(blocked_ips=["127.0.0.2"],
+                             client_addr=("127.0.0.2", 41000)) as c:
+                denied = c.get("/health")
+                check("a denied request is interrupted with no body",
+                      denied.status_code == 444 and denied.content == b"",
+                      f"{denied.status_code} {denied.content!r}")
+        deny_lines = [m for _, m in logs["llm_hub"].records if m.startswith("deny ")]
+        check("exactly one 'deny <ip>' line is emitted", deny_lines == ["deny 127.0.0.2"],
+              str(deny_lines))
+        check("startup reports which enforcement layer is active",
+              any("security.blocked_ips" in m for _, m in logs["llm_hub"].records),
+              str(logs["llm_hub"].records[-6:]))
+        rows = read_rows()
+        check("the interrupted request writes no request-log row", not rows, str(rows))
+
+        with capture_logs("llm_hub") as allowed_logs:
+            with client_with(client_addr=("127.0.0.1", 41000)) as c:
+                ok = c.get("/health")
+                check("a non-blocked peer still gets the normal response",
+                      ok.status_code == 200 and ok.json() == {"ok": True}, ok.text[:120])
+        check("no deny line for an allowed peer",
+              not any(m.startswith("deny ") for _, m in allowed_logs["llm_hub"].records),
+              str(allowed_logs["llm_hub"].records[-4:]))
+        rows = read_rows()
+        check("the allowed request is recorded with its real peer IP",
+              any(r.get("path") == "/health" and r.get("status") == 200
+                  and r.get("client_ip") == "127.0.0.1" for r in rows), str(rows))
+    finally:
+        if saved_db is None:
+            os.environ.pop("REQUEST_LOG_DB", None)
+        else:
+            os.environ["REQUEST_LOG_DB"] = saved_db
+        Path(log_db).unlink(missing_ok=True)
+        import ip_guard
+        ip_guard.reset()
+
+
+def test_blocked_ips_socket_drop() -> None:
+    """Real uvicorn + GuardProtocol: a denied TCP peer gets ZERO HTTP bytes, no
+    ASGI scope, no access-log line, no request-log row and one `deny <ip>` line.
+
+    Also exercises the CLI `--http` import path, the two launch entrypoints and
+    a deny-list hot reload on a live (otherwise idle) server.
+    """
+    import socket
+    import sqlite3
+    import threading
+    import time
+
+    import ip_guard
+    import uvicorn
+    from ip_guard_protocol import GuardProtocol
+    from uvicorn.importer import import_from_string
+    from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+
+    check("the CLI --http string resolves to GuardProtocol",
+          import_from_string("ip_guard_protocol:GuardProtocol") is GuardProtocol)
+    launcher = Path("scripts/start-local.ps1").read_text(encoding="utf-8")
+    check("start-local.ps1 passes --http to uvicorn",
+          "'--http', 'ip_guard_protocol:GuardProtocol'" in launcher)
+    check("serve.py injects the custom protocol",
+          "http=GuardProtocol" in Path("app/serve.py").read_text(encoding="utf-8"))
+    check("GuardProtocol is a uvicorn HTTP protocol subclass",
+          issubclass(GuardProtocol, HttpToolsProtocol))
+    check("guard_protocol_active() sees the installed protocol",
+          ip_guard.guard_protocol_active())
+
+    log_db = f"{_TMP}.socket.db"
+    saved_db = os.environ.get("REQUEST_LOG_DB")
+    os.environ["REQUEST_LOG_DB"] = log_db
+    Path(log_db).unlink(missing_ok=True)
+    seed_api_keys(API_KEY)
+
+    base = yaml.safe_load(EXAMPLE)
+    base["server"]["host"] = "127.0.0.1"
+    base["security"]["internal"]["allow_anonymous"] = True
+    base["security"]["public"]["port"] = None
+    base["security"]["blocked_ips"] = ["127.0.0.2"]
+    Path(_TMP).write_text(yaml.safe_dump(base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    hits: list = []
+
+    class CountingApp:
+        def __init__(self, inner):
+            self.inner = inner
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                hits.append(scope.get("client"))
+            await self.inner(scope, receive, send)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(32)
+    port = sock.getsockname()[1]
+
+    config = uvicorn.Config(
+        CountingApp(app), log_config=None, log_level="info", lifespan="on",
+        proxy_headers=False, forwarded_allow_ips=None, access_log=True,
+        http=GuardProtocol,
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+
+    def fetch(source_ip: str, path: str = "/health") -> bytes:
+        try:
+            conn = socket.create_connection(("127.0.0.1", port), timeout=2,
+                                            source_address=(source_ip, 0))
+            conn.sendall(
+                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode()
+            )
+            conn.settimeout(2)
+            data = b""
+            try:
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass  # RST from transport.abort() surfaces here
+            finally:
+                conn.close()
+            return data
+        except OSError as exc:
+            return f"ERR:{exc}".encode()
+
+    try:
+        with capture_logs("llm_hub", "uvicorn.access", "uvicorn.error") as logs:
+            thread.start()
+            deadline = time.monotonic() + 6
+            while not server.started and time.monotonic() < deadline:
+                time.sleep(0.02)
+            check("the real uvicorn server started", bool(server.started))
+            if not server.started:
+                return
+
+            denied = fetch("127.0.0.2")
+            check("a denied TCP peer receives zero HTTP bytes", denied == b"", repr(denied[:120]))
+            check("no ASGI scope was created for the denied connection", hits == [], str(hits))
+            deny_lines = [m for _, m in logs["llm_hub"].records if m.startswith("deny ")]
+            check("exactly one 'deny <ip>' line for the dropped socket",
+                  deny_lines == ["deny 127.0.0.2"], str(deny_lines))
+            check("no uvicorn.access line for the denied peer",
+                  not any("127.0.0.2" in m for _, m in logs["uvicorn.access"].records),
+                  str(logs["uvicorn.access"].records))
+            check("no ASGI 'returned without starting response' / 500 fallback",
+                  not any("ASGI callable returned" in m or "Exception in ASGI" in m
+                          for _, m in logs["uvicorn.error"].records),
+                  str(logs["uvicorn.error"].records[-4:]))
+
+            access_before = len(logs["uvicorn.access"].records)
+            allowed = fetch("127.0.0.1")
+            check("an allowed peer gets a normal HTTP 200",
+                  allowed.startswith(b"HTTP/1.1 200"), repr(allowed[:120]))
+            check("the allowed request reached ASGI", len(hits) == 1, str(hits))
+            check("the allowed request produces an access-log line",
+                  any('"GET /health' in m for _, m in logs["uvicorn.access"].records[access_before:]),
+                  str(logs["uvicorn.access"].records[access_before:]))
+
+            # Hot reload with no traffic in between: the background config watch
+            # must republish the snapshot even though denied sockets never reach
+            # the ASGI middleware that normally triggers a reload.
+            base["security"]["blocked_ips"] = ["127.0.0.3"]
+            Path(_TMP).write_text(yaml.safe_dump(base, allow_unicode=True, sort_keys=False),
+                                  encoding="utf-8")
+            deadline = time.monotonic() + 4
+            while ip_guard.active_rules() != ("127.0.0.3/32",) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            check("blocked_ips hot-reloads on a live server without a restart",
+                  ip_guard.active_rules() == ("127.0.0.3/32",), str(ip_guard.active_rules()))
+            former = fetch("127.0.0.2")
+            newly = fetch("127.0.0.3")
+            check("the removed IP is served again", former.startswith(b"HTTP/1.1 200"),
+                  repr(former[:80]))
+            check("the newly added IP is dropped", newly == b"", repr(newly[:80]))
+            check("no ASGI scope for the newly denied IP", len(hits) == 2, str(hits))
+
+            server.should_exit = True
+        thread.join(timeout=5)
+        check("the real uvicorn server shut down cleanly", not thread.is_alive())
+
+        con = sqlite3.connect(log_db)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = [dict(r) for r in con.execute("SELECT path, status, client_ip FROM requests")]
+        finally:
+            con.close()
+        check("no denied connection ever wrote a request-log row",
+              all(r["status"] == 200 for r in rows)
+              and not any(r["client_ip"] == "127.0.0.3" for r in rows), str(rows))
+        check("only allowed requests are in the request log",
+              sum(1 for r in rows if r["client_ip"] == "127.0.0.2") == 1
+              and any(r["client_ip"] == "127.0.0.1" and r["path"] == "/health" for r in rows),
+              str(rows))
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        sock.close()
+        if saved_db is None:
+            os.environ.pop("REQUEST_LOG_DB", None)
+        else:
+            os.environ["REQUEST_LOG_DB"] = saved_db
+        Path(log_db).unlink(missing_ok=True)
+        clean = yaml.safe_load(EXAMPLE)
+        clean["security"]["internal"]["allow_anonymous"] = True
+        clean["security"]["public"]["port"] = None
+        Path(_TMP).write_text(yaml.safe_dump(clean, allow_unicode=True, sort_keys=False),
+                              encoding="utf-8")
+        ip_guard.reset()
+
+
 if __name__ == "__main__":
     print("Security verification:")
     try:
@@ -948,6 +1512,7 @@ if __name__ == "__main__":
         test_nul_path_and_hidden_version()
         test_forwarding_hygiene()
         test_log_redaction()
+        test_standalone_log_detail()
         test_request_log_coverage()
         test_log_timestamps()
         test_config_guards()
@@ -967,6 +1532,10 @@ if __name__ == "__main__":
         test_legacy_config_migration()
         test_config_security()
         test_inference_concurrency_gate()
+        test_blocked_ips_matching()
+        test_blocked_ips_config_and_hot_reload()
+        test_blocked_ips_interrupts_request()
+        test_blocked_ips_socket_drop()
     finally:
         if os.path.exists(_TMP):
             os.unlink(_TMP)

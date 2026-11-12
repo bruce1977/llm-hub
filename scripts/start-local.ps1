@@ -18,7 +18,9 @@
     Two launch paths, picked automatically:
 
     * Default (no distinct public port, no -NoReload): uvicorn CLI with auto-reload. It passes
-      --no-proxy-headers, so a caller's X-Forwarded-For can no longer rewrite the TCP peer.
+      --no-proxy-headers, so a caller's X-Forwarded-For can no longer rewrite the TCP peer,
+      and --http ip_guard_protocol:GuardProtocol so security.blocked_ips drops sockets at the
+      TCP layer (one "deny <ip>" log line, no HTTP response, no access/request log).
       Single listener only; the same HTTP policy as the container.
 
     * A distinct public port, or -NoReload: app/serve.py, the hardened entrypoint also used
@@ -268,6 +270,7 @@ if missing:
 
 try:
     from config import ConfigManager, LEGACY_LISTENER_ENV
+    import ip_guard
 
     cfg = ConfigManager().config
 except Exception as exc:  # a broken config.yaml must be reported, not traced
@@ -311,6 +314,9 @@ report.update({
     'allow_anonymous': allow_anonymous,
     'expose_docs': bool(cfg.security.internal.expose_docs),
     'public_rules': sum(len(v) for v in cfg.security.public.path_allowlist.values()),
+    # ConfigManager published the snapshot while loading cfg, so this is the exact
+    # deny-list the custom protocol will enforce (normalised CIDRs).
+    'blocked_ips': list(ip_guard.active_rules()),
     'legacy_env': [name for name in LEGACY_LISTENER_ENV if os.getenv(name, '').strip()],
     # Mirrors the lifespan guard: an empty key table is only fatal when the console
     # cannot mint one either (no ADMIN_PASSWORD) and no anonymous zone exists.
@@ -425,6 +431,10 @@ if ($Check.public_port) {
     }
 }
 Note "config    server.port=$Port  security.public.port=$($Check.public_port)  listen=[$($AllPorts -join ',')]"
+if (@($Check.blocked_ips).Count -gt 0) {
+    Note ("blocked_ips  {0} rule(s) active: {1} - TCP drop; denied peers get only 'deny <ip>' in the log" -f `
+        @($Check.blocked_ips).Count, ($Check.blocked_ips -join ', '))
+}
 if (@($Check.legacy_env).Count -gt 0) {
     Note "legacy env still set: $($Check.legacy_env -join ', ') (app migrates/ignores it; remove it from .env)"
 }
@@ -435,7 +445,7 @@ if ($UseServe) {
     Note "gateway   $BaseUrl"
     Note "docs      $BaseUrl/docs"
     Note "console   $BaseUrl/admin/"
-    Note 'entry     uvicorn --no-proxy-headers  (single internal listener; no IP header rewrite)'
+    Note 'entry     uvicorn --no-proxy-headers --http ip_guard_protocol:GuardProtocol  (single internal listener; no IP header rewrite; TCP deny-list active)'
 }
 
 if ($CheckOnly) {
@@ -457,9 +467,13 @@ try {
     } else {
         # --no-proxy-headers is the local equivalent of serve.py's proxy_headers=False:
         # without it ProxyHeadersMiddleware rewrites scope["client"] from a caller's XFF.
+        # --http installs the same custom protocol serve.py injects via http=GuardProtocol:
+        # it is what enforces security.blocked_ips at the TCP layer (abort before ASGI,
+        # only a "deny <ip>" log line). Without it a non-empty block list is inert.
         $UvicornArgs = @('main:app', '--app-dir', $AppDir, '--host', $Bind, '--port', "$Port",
                          '--log-level', $LogLevel, '--no-proxy-headers',
-                         '--log-config', 'logging.json')
+                         '--log-config', 'logging.json',
+                         '--http', 'ip_guard_protocol:GuardProtocol')
         if ($Reload) { $UvicornArgs += @('--reload', '--reload-dir', $AppDir) }
         Write-Host ''
         Step "uvicorn $($UvicornArgs -join ' ')"

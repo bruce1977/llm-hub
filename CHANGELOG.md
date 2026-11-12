@@ -7,6 +7,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (2026-11-12: Settings → Service, edit `config.yaml` `server` from the UI)
+
+The **Settings** tab bar is now ordered **Service → Security → Requests (formerly General)
+→ Upstream / Rerank / System One / Web Search**. A new **Service** tab opens by default and edits
+the whole `server` node; the maintenance tab is renamed **Requests**.
+
+- **Backend**: `PUT /v1/management/config` now accepts a `server` segment (six editable segments
+  total). It is validated as `ServerConfig` and written back **in full**; `port` is constrained to
+  1..65535 and `request_timeout` / `upstream_queue_timeout` / `upstream_keepalive_expiry` must be
+  positive. An invalid field answers **422** with `detail.segments.server` and writes nothing.
+  All `server` fields are startup-only, so changes take effect after a gateway restart.
+- **Frontend**: the Service form covers `host` / `port` / `log_level` / `request_timeout` and the
+  inference concurrency gate (`max_concurrency` / `upstream_queue_timeout` /
+  `upstream_keepalive_expiry`), with a restart hint after saving. `ConfigPayload.server` is typed;
+  all three locales carry the same key set. The `admin_endpoints` control is relabelled
+  **Allow external admin access** (允许外网访问管理后台) with copy that names the `/admin` console
+  and `/v1/management/*` behind its three modes.
+- **Tests**: `tests/test_management.py` `[18]` adds 12 assertions (494 → 506): complete server
+  round-trip, other segments untouched, live config updated, invalid port / concurrency / timeouts
+  → 422 naming `server`, a rejected save leaving config.yaml untouched, and an empty PUT not
+  clearing `server`.
+
+### Added (2026-11-12: Settings → Security, edit `config.yaml` `security` from the UI)
+
+The console's **Settings** page gains a **Security** tab that edits the whole `security`
+node: the trusted internal zone, the public listener and its path allowlist, shared hardening
+(blocked paths / IPs, CORS, body limit) and the token-bucket rate limiter.
+
+- **Backend**: `PUT /v1/management/config` now accepts a `security` segment alongside
+  `upstreams` / `rerank` / `systemone` / `websearch`. It is validated as `SecurityConfig`
+  and written back **in full** (defaults included), so `Config._migrate_auth_node` cannot
+  re-derive `internal.allow_anonymous` from a stale top-level `auth.enabled` and silently
+  flip the LAN zone. Other top-level keys stay verbatim; an invalid field answers **422**
+  with `detail.segments.security` and leaves the file untouched. `manager.reload()` pushes
+  the new `blocked_ips` snapshot to the IP guard immediately.
+- **Frontend**: fixed-verb editor for `public.path_allowlist` (method → regex lines), switches
+  for both zones, a MiB input for `max_body_bytes`, rate-limit controls, and a self-lockout
+  warning when `blocked_ips` is non-empty. The save confirmation states that the entire node
+  is overwritten. `ConfigPayload.security` is typed; all three locales carry the same 50 keys.
+- **Tests**: `tests/test_management.py` `[17]` adds 24 assertions (470 → 494): session-only
+  access, complete round-trip, other segments untouched, IP-guard hot reload, an invalid port /
+  enum / bucket key / HTTP verb / numeric field → 422 naming `security`, a rejected save
+  leaving config.yaml untouched, an empty PUT not clearing security, a cleared port saving as
+  `null`, and the stale-`auth` regression.
+
+### Added (2026-11-12: Settings → General, request-log cleanup)
+
+A new **General** tab in the console opens by default. Its first action expires request-log
+rows older than a chosen date (default: the same calendar day one month ago, clamped for
+short months). This is a storage operation, not a `config.yaml` edit, so the config Save bar
+is hidden on that tab.
+
+- **Backend**: `GET /v1/management/requests/cleanup?before=YYYY-MM-DD` previews
+  `{before, count, total, oldest, newest, db_bytes}`; `POST` with `{"before", "vacuum"}`
+  deletes `WHERE ts < cutoff` and returns `{ok, deleted, remaining, oldest,
+  db_bytes_before, db_bytes_after, vacuum}`. Cutoffs are normalised to naive UTC (a plain
+  date means UTC midnight, zoned datetimes are converted); missing, unparsable or future
+  values → 400. Strict `<` keeps the row exactly at the cutoff. Both routes require the
+  admin session cookie and are registered above `/requests/{id}` so the id converter
+  cannot swallow them. Cleanup covers the whole table, including non-API rows that lists
+  and charts hide.
+- **Safety**: every SQLite writer (batch insert, hourly retention prune, manual delete)
+  now shares `RequestLog._io_lock`, so a large `DELETE` cannot race an `executemany` into
+  "database is locked". An optional `vacuum: true` rewrites the file to actually reclaim
+  disk space; it is opt-in because it briefly holds the write lock (a plain `DELETE` does
+  not shrink a SQLite file).
+- **Frontend**: the date picker disables future dates, a preview is mandatory before the
+  destructive call, changing the date invalidates the preview, the confirm dialog shows
+  the exact row count, and the preview refreshes after a successful delete. All three
+  locales (`en` / `zh-CN` / `zh-TW`) updated; `app/web` rebuilt.
+- **Tests**: `test_management.py` `[16]` adds 33 assertions — auth, public-zone
+  perimeter, route order, ISO formats, the boundary row at the cutoff, preview/delete
+  counts and VACUUM.
+
+### Added (2026-11-12: `security.blocked_ips` — interrupt denied requests)
+
+New optional deny-list of bare IPs and CIDRs (IPv4 / IPv6), e.g.
+`blocked_ips: ["203.0.113.7", "10.0.0.0/8", "2001:db8::/32"]`. A matching **real TCP
+peer** is interrupted before it is served: one `deny <ip>` log line, then nothing — no
+route, no middleware, no request-log row and no `uvicorn.access` line. It applies to both
+listeners, never consults `X-Forwarded-*` and is not a rate limiter.
+
+- **Two enforcement layers, one log line.** `app/ip_guard_protocol.py` installs a custom
+  uvicorn protocol (`GuardProtocol`) that calls `transport.abort()` in `connection_made`,
+  before an ASGI scope exists — zero HTTP bytes, not even a 444. `app/ip_guard.py` also
+  installs `BlockedIPMiddleware` as the outermost pure-ASGI layer, so the request is still
+  interrupted when the protocol is absent (bare `uvicorn main:app`) or on a keep-alive
+  connection opened *before* a hot-reloaded deny-list took effect. On uvicorn it marks the
+  request cycle `disconnected` and aborts the socket, which suppresses both the
+  "ASGI callable returned without starting response" error and the 500 fallback. The two
+  layers are mutually exclusive per request, so exactly one `deny <ip>` line is produced.
+  The cut is deliberately best-effort: the requirement is that the **request is interrupted**,
+  not that a specific TCP reset sequence is guaranteed on every ASGI server.
+- **Hot reload even with zero traffic.** `ConfigManager._set_config()` publishes an
+  immutable snapshot (`ip_guard.configure()`) on every successful load, and `main.lifespan`
+  runs a 0.5 s config-watch task because a denied connection never reaches the middleware
+  that would normally trigger a reload. Invalid entries are skipped with a warning instead
+  of blocking startup; `203.0.113.7/24` shorthand resolves to the containing network.
+- **Entrypoints.** `app/serve.py` passes `http=GuardProtocol`; `scripts/start-local.ps1`
+  and the documented bare-uvicorn command pass
+  `--http ip_guard_protocol:GuardProtocol`. Startup logs an INFO line with the active rules
+  when the protocol is installed, or a WARNING naming the ASGI-fallback-only mode when it
+  is not. The local launcher's preflight prints the normalised rules.
+- **Tests** (`tests/verify_security.py`): IP/CIDR parsing, dedup, IPv4/IPv6 separation,
+  invalid entries, config publish + hot reload + keep-last-good on a rejected config,
+  outermost-middleware ordering, the ASGI fallback (444 with no body, no request-log row),
+  and a real uvicorn server proving zero HTTP bytes / zero ASGI scopes / no access or error
+  log / no request-log row for a denied peer, an allowed peer still returning 200, plus a
+  live hot reload that swaps the blocked IP without a restart.
+
+### Fixed (2026-11-11: uvicorn's `uvicorn.error` logger name no longer looks like a failure)
+
+uvicorn labels *all* server lifecycle messages with the logger name `uvicorn.error`, so a
+healthy boot printed `INFO | uvicorn.error | Application startup complete.` — the word
+`error` on a line that is not one. The logger name is a uvicorn hard-code, not a severity,
+and cannot be renamed at the logger level without breaking its handler routing.
+
+- **`logging_config.LoggerNameAliasFilter` rewrites only the displayed name.** A logging
+  `Filter` maps `record.name` for the `%(name)s` column: `uvicorn` / `uvicorn.error` →
+  `gateway`, `uvicorn.access` → `gateway.access`. The real logger identity, level, handler
+  routing and `--log-level` are untouched, so a genuine failure still prints
+  `ERROR | gateway | Exception in ASGI application`. Application logs keep `llm_hub`.
+- **All three entrypoints agree.** `app/logging.json` declares the filter and attaches it
+  to both handlers (the `serve.py` path and the `uvicorn --log-config logging.json` path,
+  including the auto-reload parent); `apply_to_existing_handlers()` attaches the same filter
+  for the bare `uvicorn main:app` path, where uvicorn's stock handlers predate the lifespan.
+  A type guard keeps it idempotent across reloads. Result:
+  `2026-11-11 17:42:56.451 | INFO    | gateway | Application startup complete.`
+- **`tests/verify_security.py`** asserts the alias map, that both handlers carry the filter,
+  that a second `apply_to_existing_handlers()` does not stack duplicates, that the real
+  severity survives, that access lines show `gateway.access` and that `llm_hub` is unchanged.
+
+### Fixed (2026-11-11: standalone tool APIs now show their model and req/res in the request log)
+
+The console's Requests view used to show `—` for the model and "no request/response body" in
+the detail drawer for `POST /v1/tools/web-search`, `POST /v1/systemone`, `POST /v1/rerank`
+and `POST /v1/messages`. Those endpoints are in-process handlers: they never enter
+`ProxyService.forward`, so the only row was the middleware's metadata fallback with every
+rich field left `NULL`.
+
+- **A one-row detail channel over `request.state`.** New
+  `request_log.attach_request_detail(request, ...)` lets a handler publish the fields only
+  it can know -- `requested_model`, resolved `model`, `upstream`, the raw request body,
+  optional token/stream values -- without writing to SQLite or claiming the row. The
+  middleware merges that detail into the single row it already writes in `basic_entry()`;
+  `sanitize_body()` (redact the full buffer, then truncate to 8 KB) and `extract_token_usage()`
+  are shared with the proxy, so the two logging paths cannot drift. Repeated calls
+  accumulate (publish the body up front, fill in model/upstream after resolution), and a
+  later value for a key wins.
+- **Response bodies are captured once, centrally.** `BaseHTTPMiddleware.call_next` returns a
+  streaming wrapper whose iterator is consumed after the middleware returns; the middleware
+  wraps that iterator with a bounded (64 KB) buffer and writes the row from its `finally`.
+  This covers streaming handlers (e.g. Anthropic SSE from `/v1/messages`) and records a
+  partial trace on client disconnect. Crucially, capture only runs when a handler actually
+  published detail: pure discovery probes (`/v1/models`, `/api/tags`, `/api/ps`, `/health`),
+  rejections and FastAPI 404s stay metadata-only, so console polling cannot fill SQLite
+  with 8 KB snapshots of a body nobody asked to inspect.
+- **Per-handler wiring.** `/v1/systemone` records the caller's `model` (or the injected
+  `systemone.model`) plus `systemone:<backend-host>` as its upstream; web search records the
+  resolved provider upstream; `/v1/rerank` now reads the body through `read_limited_body()`
+  so the raw JSON survives; `/v1/messages` publishes model/upstream/stream up front and its
+  streaming generator publishes the token split from `finally`. `extract_token_usage()` also
+  accepts Anthropic's `input_tokens`/`output_tokens` alongside OpenAI/Ollama names.
+- **Console column.** `RequestsView` now falls back to a stable tool label (`web-search` /
+  `systemone`) and then to the upstream, so those rows no longer read as `—`. A body-level
+  `model`, when present, still takes priority.
+
+`tests/verify_security.py::test_standalone_log_detail` asserts accumulation, redaction before
+truncation, Anthropic token extraction and the metadata-only fallback;
+`tests/test_gateway_new.py` asserts systemone/web search rows carry model/upstream/bodies;
+`tests/test_management.py` asserts the same for messages (buffered + streaming) and rerank.
+
 ### Changed (2026-11-11: `allow_query_api_key` and `trusted_proxies` removed)
 
 Both knobs had exactly one useful value in practice (`false` / `[]`), so keeping them in

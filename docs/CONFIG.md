@@ -20,6 +20,7 @@ Chinese version: [CONFIG_CN.md](CONFIG_CN.md).
 [`websearch`](#websearch) ·
 [`request_log`](#request_log) ·
 [`security`](#security) ·
+[Blocking client IPs](#blocking-client-ips-securityblocked_ips) ·
 [Path surface](#path-surface--the-closed-set-of-callable-paths) ·
 [Console-only fields](#fields-the-console-reads-and-routing-does-not) ·
 [Removed nodes](#nodes-that-no-longer-exist) ·
@@ -71,11 +72,17 @@ Two read timings matter when you change a value:
 |---|---|---|---|
 | `host` | `0.0.0.0` | `main.py`, `serve.py` | Bind address for every listener. `0.0.0.0` **plus** `security.internal.allow_anonymous: true` logs an "INTERNAL ZONE IS FULLY OPEN" warning at startup |
 | `port` | `8000` | `Config.listen_ports()`, `serve.py` | The **internal (trusted LAN)** socket. This port is the zone anchor; it is not a setting you can override by IP or header |
-| `log_level` | `info` | `main.setup_logging()`, `app/logging.json` | One knob for every logger, uvicorn's access log included: `2026-11-10 20:31:18.718 \| INFO    \| uvicorn.access \| 127.0.0.1:61641 - "GET /v1/models HTTP/1.1" 404 Not Found`. `debug` prints alias resolution and routing decisions; that is the level to use when a rerank score or a route looks wrong |
+| `log_level` | `info` | `main.setup_logging()`, `app/logging.json` | One knob for every logger, uvicorn's log included: `2026-11-10 20:31:18.718 \| INFO    \| gateway.access \| 127.0.0.1:61641 - "GET /v1/models HTTP/1.1" 404 Not Found`. uvicorn's `uvicorn.error` / `uvicorn.access` logger names are shown as `gateway` / `gateway.access` (display only, via `LoggerNameAliasFilter`) because uvicorn labels even healthy INFO lifecycle lines like `Application startup complete.` as `uvicorn.error`; the real level and routing are untouched. `debug` prints alias resolution and routing decisions; that is the level to use when a rerank score or a route looks wrong |
 | `request_timeout` | `600.0` | `main.py` (httpx client), `proxy.py`, `messages.py`, `rerank.py`, `systemone.py`, `websearch.py` | The connect-10s/read-`request_timeout` budget for a call that does not set a per-upstream or per-feature timeout |
 | `max_concurrency` | `4` | `http_clients.py` → `httpx.Limits` | **Inference concurrency gate**: at most N requests are in flight against model backends (Ollama / LM Studio / OpenCode chat). Excess requests are **queued**, never rejected with 429; a streaming response holds its slot until its last chunk. Single-GPU hosts: 1~2. This is *not* a rate limiter |
 | `upstream_queue_timeout` | `120.0` | `http_clients.py` → `httpx.Timeout(pool=...)` | Max seconds a request waits for a free inference slot. Beyond that: **503 + `Retry-After: 5`**. Bounds the waiting queue so a flood cannot pile up in RAM |
 | `upstream_keepalive_expiry` | `30.0` | `http_clients.py` → `httpx.Limits` | How long an idle keep-alive connection to a backend stays open |
+
+All `server` fields are editable in the console under **Settings → Service** (a real `config.yaml`
+editor that writes the whole node through `PUT /v1/management/config`). They are **startup-only**:
+saving rewrites the file but the bound socket, log level, timeouts and connection pools take effect
+only after a gateway restart. `port` is validated to a TCP port in 1..65535; `max_concurrency`,
+`request_timeout`, `upstream_queue_timeout` and `upstream_keepalive_expiry` must be positive.
 
 Two outbound pools are built once in the lifespan (`app/http_clients.py`):
 
@@ -265,14 +272,22 @@ may be omitted, in which case the provider picks.
 
 **Coverage:** every API call produces one row, not just proxied ones. The rich row (request/response
 bodies, token usage, resolved `model`, `upstream`, `stream`) is built in `ProxyService.forward`.
-Standalone in-process handlers (`/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`,
-`/v1/messages`, `/v1/models`, `/api/tags`, `/api/ps`) and requests refused by the security
-middleware (public-zone 401/404, rate limit 429, body cap 413) are written by the
-middleware as a **metadata-only** row: method, path, query, status, duration, client IP and the
-denial reason, with no body/token/upstream. An ASGI-scope claim flag prevents a proxy call from
-being written twice. `/v1/management/*`, `/admin/*`, docs and static assets are control-plane
-noise and never enter the log; `HEAD` and `OPTIONS` are forwarded but never recorded, so a
-liveness monitor or CORS pre-flight cannot drown the log.
+For anything that bypasses the proxy the security middleware writes the only row, merging in the
+detail a handler published via `request_log.attach_request_detail()` (on shared ASGI state):
+
+- Tool handlers (`/v1/systemone`, `/v1/tools/web-search`, `/v1/rerank`, `/v1/messages`) publish
+  the caller's model, the resolved model/upstream and the raw request body; the middleware buffers
+  the response (bounded 64 KB, including streaming) and extracts token usage, so these rows carry
+  bodies and `model`/`upstream` too.
+- Pure discovery probes (`/v1/models`, `/api/tags`, `/api/ps`, `/health`) and middleware refusals
+  (public-zone 401/404, rate limit 429, body cap 413) stay **metadata-only**: method, path, query,
+  status, duration, client IP and the denial reason, with no body/token/model/upstream. Capturing
+  only published detail stops console polling from filling SQLite with 8 KB response snapshots.
+
+An ASGI-scope claim flag prevents a proxy call from being written twice. `/v1/management/*`,
+`/admin/*`, docs and static assets are control-plane noise and never enter the log; `HEAD` and
+`OPTIONS` are forwarded but never recorded, so a liveness monitor or CORS pre-flight cannot drown
+the log.
 
 Storage location and retention are deliberately **not** in this file — `REQUEST_LOG_DB`,
 `LLMHUB_DB` and `REQUEST_LOG_RETENTION_DAYS` stay deployment-level.
@@ -282,6 +297,13 @@ Storage location and retention are deliberately **not** in this file — `REQUES
 One tree for both listeners. The zone is decided by the **kernel-assigned local socket** — never by
 a client IP, an `X-Forwarded-For` header or an API key — and `app/serve.py` starts uvicorn with
 `proxy_headers=False` so a header cannot move that anchor.
+
+Every field in this node can also be edited from **Settings → Security** in the web console
+(`GET` / `PUT /v1/management/config`). The console writes the entire node back, including keys
+that still equal their defaults, so a legacy top-level `auth` node cannot re-infer the LAN policy.
+`blocked_ips`, path rules and the rate limiter hot-reload; changing `security.public.port` needs
+a process restart. See [USAGE → Settings → Security](USAGE.md) for the form and its self-lockout
+warning.
 
 One process binds both sockets (`app/serve.py`); `app/bridge.py` is the public-zone **policy**
 module, not a second proxy hop. The anchor is the listening port in `scope["server"]`, so no header
@@ -390,6 +412,7 @@ answers **403** rather than a **404** claiming the endpoint does not exist; see
 | Field | Default | Effect |
 |---|---|---|
 | `blocked_paths` | `[]` | Operator deny-list, enforced **everywhere** (exact name or trailing-`*` prefix), in addition to the public admin blocklist. Checked in `proxy.py` through `SecurityConfig.is_path_blocked()` |
+| `blocked_ips` | `[]` | TCP-level deny-list of bare IPs / CIDRs, IPv4 and IPv6 (`203.0.113.7`, `10.0.0.0/8`, `2001:db8::/32`). A matching **real TCP peer** is interrupted before any route: one `deny <ip>` log line, no HTTP response, no access-log line, no request-log row. Applies to both listeners; forwarded headers are never consulted. Invalid entries are skipped with a warning. Hot-reloads (~1 s, even with no traffic). See [Blocking client IPs](#blocking-client-ips-securityblocked_ips) |
 | `cors_origins` | `[]` | Exact origins allowed cross-site; empty sends no CORS headers at all. The middleware answers a preflight with a **bodyless `204`**, only for a listed origin. A preflight is still bound by the zone's path policy: the internal listener answers any path, while on the public socket `OPTIONS` is a method like any other and must be listed in `security.public.path_allowlist` — otherwise the preflight is a **404** and the browser never sends the real call |
 | `max_body_bytes` | `33554432` | Request body cap: a `Content-Length` over it → **413** in the middleware, and a chunked body is counted while streaming (`read_limited_body`) before the proxy, messages, websearch and systemone paths forward it |
 
@@ -405,6 +428,35 @@ Two behaviours are deliberately **not configurable**:
 
 The retired `allow_query_api_key` / `trusted_proxies` keys are ignored with a startup
 warning so an old config file cannot silently resurrect them.
+
+### Blocking client IPs (`security.blocked_ips`)
+
+```yaml
+security:
+  blocked_ips:
+    - 203.0.113.7        # one host
+    - 10.0.0.0/8         # a whole IPv4 range
+    - 2001:db8::/32      # IPv6 works too
+```
+
+A matched client is **interrupted before its request is served**. It is deliberately not a
+403/429: there is no HTTP response, no route, no middleware, no request-log row and no
+`uvicorn.access` line — only one `deny <ip>` application log line. The address used is the
+real TCP peer; `X-Forwarded-*` / `X-Real-IP` are never consulted, and this applies to the
+internal and public listeners alike. It is not a rate limiter (`security.rate_limit` is).
+
+| Aspect | Behaviour |
+|---|---|
+| Accepted syntax | Bare IPv4/IPv6 address or CIDR. A host address with a prefix (`203.0.113.7/24`) resolves to its containing network. Whitespace is trimmed, duplicates collapse, invalid entries are skipped with a warning (they never stop startup) |
+| Hot reload | `ConfigManager` publishes an immutable snapshot on every successful load. A 0.5 s config-watch task in `main.lifespan` drives the mtime check even with zero traffic, because a denied connection never reaches the middleware that normally triggers a reload. Takes effect within ~1 s, no restart |
+| Enforcement layer 1 (preferred) | `app/ip_guard_protocol.py`'s `GuardProtocol` aborts the socket in `connection_made`, before an ASGI scope exists → zero HTTP bytes. Installed by `serve.py` (`http=GuardProtocol`) and by `--http ip_guard_protocol:GuardProtocol` on the uvicorn CLI / `start-local.ps1` |
+| Enforcement layer 2 (always) | `app/ip_guard.py`'s `BlockedIPMiddleware`, the outermost pure-ASGI layer, interrupts the request without calling the downstream app or `send`. Covers a bare `uvicorn main:app` without `--http`, and keep-alive connections opened *before* an IP was added. On uvicorn it marks the request cycle `disconnected` and aborts the transport, so no 500 fallback or access-log line appears. On a non-uvicorn ASGI server it answers a bodyless `444` so the client does not hang |
+| Startup log | INFO with the normalised rules when layer 1 is installed; WARNING naming the "ASGI fallback only" mode when it is not. `start-local.ps1 -CheckOnly` prints the active rules |
+| Log output | Exactly one `deny <ip>` line per denied request. The two layers are mutually exclusive per request, so no duplicate line |
+
+The cut is intentionally best-effort: what matters is that the request is interrupted, not
+that a particular TCP reset sequence is guaranteed on every ASGI server. If a future
+uvicorn version makes the custom protocol unusable, layer 2 still protects the gateway.
 
 ### `security.rate_limit`
 

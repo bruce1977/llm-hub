@@ -65,7 +65,7 @@ llm-hub/
 │   ├── bench.py      # 模型测速：TTFT / decode / prefill 采集
 │   ├── bench_store.py # 测速历史（与请求明细共用 llmhub.db，每模型保留 3 份）
 │   ├── api_test.py   # 管理台接口测试的执行引擎（封闭的端点白名单）
-│   ├── management.py # Web 管理台 API（/v1/management：只读视图 + 测速 + 接口测试 + API Key 管理 + 设置页保存）
+│   ├── management.py # Web 管理台 API（/v1/management：只读视图 + 测速 + 接口测试 + API Key 管理 + 请求记录清理 + 设置页保存）
 │   ├── websearch.py  # 联网检索代理（OpenCode API Gateway 上游）
 │   └── web/          # 管理台构建产物（`npm run build` 的输出），网关在 /admin 提供服务
 ├── web/
@@ -293,8 +293,8 @@ security:
   表为空**且** `ADMIN_PASSWORD` 未设置（管理台无法签发）**且**没有可匿名的内网区——即系统不可能
   存在任何凭据。设置 `ADMIN_PASSWORD` 启动后，到 `/admin` 签发第一把即可
 
-其余 `security.*` 键（`blocked_paths`、`cors_origins`、`max_body_bytes`、`rate_limit`）
-是**两个区共享**的加固项，
+其余 `security.*` 键（`blocked_paths`、`blocked_ips`、`cors_origins`、`max_body_bytes`、
+`rate_limit`）是**两个区共享**的加固项，
 表格见[安全](#安全公网暴露必读)，每个键的默认值见
 [CONFIG_CN.md](CONFIG_CN.md#security)。
 
@@ -612,11 +612,17 @@ request_log:
   所以照常转发，只是不落行
 - **每次 API 调用恰好一行。** 两个写入方通过 ASGI scope 上的认领标记协同覆盖全部调用面：
   `ProxyService.forward` 为代理转发写**完整行**（请求/响应体、token 用量、解析后的 `model`、`upstream`、`stream`）；
-  安全 middleware 为绕过代理的调用写**仅元数据行**——进程内独立 handler（`/v1/systemone`、
-  `/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`、`/v1/models`、`/api/tags`、`/api/ps`）以及所有被拒请求
-  （公网 401/404、IP 403、限流 429、body 413）。被拒请求的 `error` 列带拒绝原因，扫描或未带 Key 的调用都可审计。
-  仅元数据行的 body/token/upstream 字段为 `null`。`/v1/management/*`、`/admin/*`、文档与静态资源属于控制面噪音，
-  完全不入库，所以管理台自身的轮询不会撑大日志
+  安全 middleware 为绕过代理的调用写唯一一行，并合并 handler 通过 `request_log.attach_request_detail()`
+  上报的字段：
+  - 工具 API（`/v1/systemone`、`/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`）上报调用方模型、
+    解析后的 `model`/`upstream` 与原始请求体；middleware 统一缓冲响应体（上限 64 KB，含流式）
+    并提取 token 用量。详情抽屉因此能看到真实的 req/res，Requests 列表的模型列也不再是 `—`
+    （有 body 内 `model` 就用它，否则显示工具标签或上游）。
+  - 纯发现探针（`/v1/models`、`/api/tags`、`/api/ps`、`/health`）与所有被拒请求
+    （公网 401/404、限流 429、body 413）仍写**仅元数据行**：body/token/model/upstream 为 `null`，
+    被拒请求的 `error` 列带拒绝原因，扫描或未带 Key 的调用都可审计。只采集主动上报的 body，
+    避免管理台轮询把 SQLite 塞满 8 KB 响应快照。
+  `/v1/management/*`、`/admin/*`、文档与静态资源属于控制面噪音，完全不入库，所以管理台自身的轮询不会撑大日志
 - **统计只计 API 调用**：明细列表、图表、KPI 与失败统计一律带上
   `path LIKE '/v1/%' OR path LIKE '/api/%'`（`request_log.API_PATH_SCOPE`），避免少数仍会入库的非 API 路径稀释数字。
   `GET /requests/{id}` 有意不加这个条件，任何一条记录的深链都还能打开
@@ -635,13 +641,49 @@ request_log:
 `app/web` 与模块同级，本地和镜像里的解析路径因此是同一个）。
 登录用户名固定为 `admin`，密码来自环境变量 `ADMIN_PASSWORD`，登录成功后签发 12 小时
 HttpOnly 会话 Cookie；页面包括 Dashboard、Upstreams、Requests、Models（LLM / Embed / Rerank / System One）、
-Tools（Web Search）、API Key 管理、Settings 与 About，会动手的地方只有四处：
-Models · LLM 上的每模型测速、每个 `API 用法` 标签页里的接口测试窗口、API Key 管理页的签发与吊销，
-以及 Settings 页本身（唯一会校验并保存 `config.yaml` 的编辑器）——前三者只写数据库，不碰 `config.yaml`。
+Tools（Web Search）、API Key 管理、Settings 与 About，会动手的地方只有五处：
+Models · LLM 上的每模型测速、每个 `API 用法` 标签页里的接口测试窗口、API Key 管理页的签发与吊销、
+Settings「请求」页的请求记录清理，以及 Settings 的配置编辑器（「服务」/「安全」/ Upstream / Rerank /
+System One / Web Search 这些 Tab 共用同一个校验并保存 `config.yaml` 的接口）——只有最后这一处会碰 `config.yaml`。
 任何管理接口返回 401 时前端会自动登出并跳回登录页；503 不当作鉴权失败，它分别代表
 上游不可达、`ADMIN_PASSWORD` 未设置或前端尚未构建。
 账户卡固定在面板左下角，点击弹出账户菜单：语言（简体中文 / 繁體中文 / English，右侧子菜单，按浏览器记忆）、深色/浅色切换、
 设置入口（原侧栏入口已移除）、**API Key 管理**（同样不占侧栏位）、关于（项目简介、主要功能、动态版本信息、GitHub 地址与公众号二维码）与退出登录。
+
+**Settings「服务」** 是 Settings 的第一个标签页，也是默认打开的页。它是真正的 `config.yaml`
+编辑器：通过 `PUT /v1/management/config` 写入**整个** `server` 节点，因此这里会显示「保存配置」栏。
+表单覆盖受信任监听（`server.host`、`server.port`、`log_level`、`request_timeout`）与**推理并发闸门**
+（`max_concurrency`、`upstream_queue_timeout`、`upstream_keepalive_expiry`）——后者把突发请求排队而不是
+用 429 拒绝，以保护本地 Ollama。所有字段都是**启动期参数**：保存只会重写文件，端口、日志级别、超时和
+连接池要重启网关后才生效（保存成功提示会注明）。保存会覆盖整个 `server` 节点，写入包括默认值在内的
+全部字段；非法值（端口超出 1..65535、非数字、并发小于 1）返回 **422** 并把错误归到「服务」Tab，
+`config.yaml` 保持不变。
+
+**Settings「安全」** 是第二个标签页，也是真正的 `config.yaml` 编辑器：它通过
+`PUT /v1/management/config` 写入**整个** `security` 节点，因此这里会显示「保存配置」栏。
+表单分三组：受信任的**内网区**（`server.port`：是否免鉴权、构建版本、docs）、**公网区**
+（`security.public.port`：监听端口、**允许外网访问管理后台** / `admin_endpoints`、以及
+「HTTP 方法 → 全匹配正则」的 `path_allowlist`）与**共享加固**（封禁路径、封禁 IP/CIDR、CORS 来源、
+MiB 请求体上限、令牌桶限流）。其中 `admin_endpoints` 是公网区专属开关，控制此 socket 是否开放
+`/admin` 控制台与 `/v1/management/*`：`deny` 拒绝全部管理访问，`readonly` 只放行 Ollama 模型 pull
+而管理后台仍关闭，`allow` 开放管理后台。管理路由仍需在 `path_allowlist` 放行对应路径，且要登录管理会话。
+
+**Settings「请求」** 是第三个标签页。它不是 `config.yaml` 编辑器（这里会隐藏「保存配置」栏），
+用于放管理台的维护类操作。第一项是**请求记录清理**：
+日期选择器默认是「同一个日历日的一个月前」（短月自动收敛到当月最后一天），不允许选未来；
+真正删除前先预览会删多少条。`before` 是 UTC 边界——纯 `YYYY-MM-DD` 按 UTC 00:00 处理——
+删除条件是严格的 `ts < before`，恰好等于截止时刻的行会保留。删除不可恢复，确认弹窗会再报一次
+准确条数。清理覆盖整张表，包括列表与图表里隐藏的 `/health`、404 等非 API 行。由于 `DELETE`
+不会缩小 SQLite 文件，可选「同时压缩数据库（VACUUM）」会重写文件回收磁盘空间，代价是短暂占用
+写锁。另一个每小时执行的保留期清理（`REQUEST_LOG_RETENTION_DAYS`，默认 30 天）与此相互独立。
+
+保存前有两件事要知道。其一，`blocked_ips` 是作用在**真实 TCP 对端**上的黑名单，在 ASGI 之前生效：
+命中只输出一条 `deny <ip>` 日志，没有 HTTP 响应、也不写请求记录——所以把网关自身 IP 加进去同样会把
+管理台切断，列表非空时表单会给出警告。IP / 路径 / 限流的修改约 1 秒内热加载；改 `public.port`
+需要重启进程。其二，保存是**整体覆盖** `security` 节点，不是只改几项，确认弹窗会明确说明。
+后端会把所有键（含默认值）写回，因此文件里遗留的顶层 `auth.enabled` 不会在一次看似无害的保存后
+悄悄把内网重新锁上。非法值（端口不在 1..65535、`admin_endpoints` / 分桶依据 / HTTP 方法名不认识、
+分桶大小不是数字）返回 **422**，错误会挂到「安全」标签页上，`config.yaml` 保持不变。
 
 **API Key 管理**（`/admin/api-keys`）是调用方凭据的签发与吊销之处。表格里每一行只有掩码
 （`sk-hub-FNdc…SVvw`）、描述与创建时间——列表响应里既没有明文，也没有 hash；响应中的 `source`
@@ -1166,6 +1208,7 @@ Ollama 的 gin 解析器会严格拒绝此类请求并报 400。网关在转发�
 | 字段 | 默认 | 说明 |
 |------|------|------|
 | `blocked_paths` | `[]` | 额外封禁的路径前缀，如 `["api/show"]` 或 `["api/*"]`——两个区都生效 |
+| `blocked_ips` | `[]` | 客户端 IP / CIDR 黑名单（`203.0.113.7`、`10.0.0.0/8`、`2001:db8::/32`）。命中的**真实 TCP 对端**在进路由前就被中断：只输出一条 `deny <ip>` 日志，无 HTTP 响应、无访问日志、无请求记录。两个区都生效，转发头不采信，非法条目告警跳过，约 1 秒内热加载（空闲网关也生效）。预 ASGI 切断需 `serve.py` / `--http ip_guard_protocol:GuardProtocol`；缺失时 ASGI 兜底仍会中断请求，启动会告警。详见[封禁客户端 IP](#封禁客户端-ip) |
 | `cors_origins` | `[]` | 显式允许的跨域来源；留空则完全不返回 CORS 头。预检应答是不带 body 的 `204`，且在公网端口只有当该路径的 `OPTIONS` 也列进 `security.public.path_allowlist` 时才会到达这一步 |
 | `max_body_bytes` | `33554432` | 请求体上限（32 MiB）：先按 `Content-Length` 预检，chunked 请求边读边计数，超限直接 413，不会把整个 body 读进内存 |
 | `rate_limit` | `{"enabled":false,"per_minute":60,"burst":20,"by":"ip"}` | 内存令牌桶限流（单进程）：`by` 选 `ip` / `key`，`burst` 为桶容量，`per_minute` 为补充速率；超量返回 **429** 并带 `Retry-After`。**公网实例务必开启**（或由反代限流） |
@@ -1297,6 +1340,33 @@ curl -s -b jar.txt http://127.0.0.1:8000/v1/management/api-keys \
 
 详情见 [API 文档](API_CN.md#system-one-决策-apilaya-server-与-ollama-代理)。
 
+### 封禁客户端 IP
+
+`security.blocked_ips` 是单 IP / CIDR 黑名单（IPv4、IPv6 都支持）。与 `blocked_paths`
+（对真实 API 路径返回 **403**）或 `rate_limit`（**429**）不同，命中后**没有任何响应**：
+请求在进路由前直接中断，日志里只有一条 `deny <ip>`，没有 `uvicorn.access` 行，也没有请求记录。
+
+```yaml
+security:
+  blocked_ips: ["203.0.113.7", "10.0.0.0/8", "2001:db8::/32"]
+```
+
+- 判定只用**真实 TCP 对端**，`X-Forwarded-*` / `X-Real-IP` 一律忽略；内外网两个监听都生效，
+  它不是限流器。
+- 非法条目告警后跳过（拼写错误不会让网关起不来）；`203.0.113.7/24` 这类带前缀的主机地址会归到
+  所在网段，重复项自动合并。
+- **约 1 秒内热加载，无需重启**，即使完全没有流量：后台配置轮询会发布新快照，因为被拒连接根本
+  到不了平时触发重载的中间件。
+- 两层保障：`serve.py` 与 `start-local.ps1` 装载 `GuardProtocol`（CLI 上是
+  `--http ip_guard_protocol:GuardProtocol`），在 `connection_made` 里、ASGI 建立之前就切断
+  socket，零 HTTP 字节；最外层的纯 ASGI `BlockedIPMiddleware` 始终存在，因此裸
+  `uvicorn main:app`（未带 `--http`）或热加载之前就已建立的 keep-alive 连接同样会被中断。
+  装载成功时启动日志打印 INFO 与生效规则，未装载时打印 WARNING 说明当前是「仅 ASGI 兜底」模式。
+- 查看当前生效规则：`scripts\start-local.bat -CheckOnly` 会打印归一化后的条目。
+
+切断行为刻意是**尽力而为**：保证的是「请求被中断」，而不是在所有 ASGI 服务器上都复现某种
+特定的 TCP RST 序列。
+
 ### 公网部署 checklist
 
 - [ ] `security.public.admin_endpoints: allow` 要想清楚再开。它同时做两件事：一是不再过滤 Ollama 的
@@ -1327,7 +1397,8 @@ curl -s -b jar.txt http://127.0.0.1:8000/v1/management/api-keys \
 
 `scripts\start-local.bat`（或直接 `scripts\start-local.ps1`）是最短路径：它定位 python、读取 `.env`、找到 `data\config.yaml`，然后调用应用**自己的**规则做启动前检查——缺少依赖、Pydantic 模型拒绝配置、`api_keys` 表为空且内网区不允许匿名（失败关闭）、弱/占位 Key、**内网或外网端口被占用**、控制台未构建——然后打印解析后的分区布局和各入口地址。**端口与分区只来自 `config.yaml`**（`server.port`、`security.public.port`）；启动脚本会对 `.env` 里残留的旧 `LLMHUB_*` 端口变量告警，但不会使用它们。它按场景自动选择入口：
 
-- 单个内网监听（默认）：uvicorn + `--no-proxy-headers` + 自动重载。
+- 单个内网监听（默认）：uvicorn + `--no-proxy-headers` + `--log-config logging.json` +
+  `--http ip_guard_protocol:GuardProtocol` + 自动重载。
 - 配置了独立的外网监听，或带 `-NoReload`：`python serve.py`，同一进程绑定所有监听端口并执行外网路径策略；无自动重载。
 
 ```powershell
@@ -1351,7 +1422,17 @@ scripts\start-local.bat -NoReload                     # serve.py 同时绑定 80
 > 已移除的参数：`-Port`、`-Bind`、`-LogLevel`、`-PublicPorts`、`-PublicAdmin`。绑定地址、端口与分区
 > 请改在 `config.yaml` 里设置。
 
-两种入口都在 `app/` 目录下运行，工作目录与镜像的 `WORKDIR /app` 一致，因此 `.env` 中的相对路径（`../data/config.yaml`）在本地和容器里解析结果相同。手动启动 uvicorn（不经脚本）时务必带 `--no-proxy-headers`，避免调用方提交的 `X-Forwarded-For` 改写客户端 IP。
+两种入口都在 `app/` 目录下运行，工作目录与镜像的 `WORKDIR /app` 一致，因此 `.env` 中的相对路径（`../data/config.yaml`）在本地和容器里解析结果相同。手动启动 uvicorn（不经脚本）时务必带 `--no-proxy-headers`（避免调用方提交的 `X-Forwarded-For` 改写客户端 IP），并带 `--http ip_guard_protocol:GuardProtocol`（让 `security.blocked_ips` 在 ASGI 之前就生效）：
+
+```bash
+cd app
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env \
+  --no-proxy-headers --log-config logging.json \
+  --http ip_guard_protocol:GuardProtocol
+```
+
+不带 `--http` 时 ASGI 兜底仍会中断被拒请求，但启动会打印 WARNING 说明处于降级模式；
+`serve.py`（Docker / 双分区入口）始终装载自定义 protocol。
 
 ### 快速开始
 
@@ -1369,13 +1450,15 @@ cp .env.example .env
 
 # 4. 启动单监听开发服务（自动加载 ../.env）
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env \
+  --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 # 生产 / 双区：cd app && python serve.py（在 config.yaml 里设 security.public.port: 8001 开外网监听）
 ```
 
 凡是会暴露到本机的场景，优先用 `python serve.py`（或 Windows 启动脚本加 `-NoReload`）：
 它在同一进程绑定所有监听端口，并从代码层禁用代理头改写。上面的
-`--no-proxy-headers` 让单监听 uvicorn 得到同等保护。
+`--no-proxy-headers` 让单监听 uvicorn 得到同等保护，`--http` 让
+`security.blocked_ips` 在 ASGI 之前就切断连接。
 
 ### Windows PowerShell 启动
 
@@ -1390,32 +1473,32 @@ $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 
 # 3. 启动单监听开发服务（自动加载 ../.env）
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 ```
 
 ### 指定配置文件运行
 
 ```bash
 cd app
-CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
+CONFIG_PATH=../data/config.yaml python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 ```
 
 ```powershell
 # Windows PowerShell
 $env:CONFIG_PATH="D:\workspace\github\llm-hub\data\config.yaml"
 cd app
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 ```
 
 ### 后台运行（Linux/macOS）
 
 ```bash
 cd app
-nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers > ../llm-hub.log 2>&1 &
+nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 --env-file ../.env --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol > ../llm-hub.log 2>&1 &
 ```
 
-绑定的地址/端口不是 loopback 时，请用 `python serve.py` 替代 uvicorn，以便从代码层禁用代理头改写，
-并让 `security.public.port` 声明的外网监听生效。
+绑定的地址/端口不是 loopback 时，请用 `python serve.py` 替代 uvicorn，以便从代码层禁用代理头改写、
+装载 `security.blocked_ips` 的 socket guard，并让 `security.public.port` 声明的外网监听生效。
 
 ### 注册为 Windows 服务（使用 NSSM）
 

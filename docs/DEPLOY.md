@@ -118,15 +118,21 @@ cp data/config.example.yaml data/config.yaml
 cp .env.example .env                                # fill in ADMIN_PASSWORD
 
 cd app
-python -m uvicorn main:app --reload --port 8000 --env-file ../.env --no-proxy-headers
+python -m uvicorn main:app --reload --port 8000 --env-file ../.env \
+  --no-proxy-headers --log-config logging.json --http ip_guard_protocol:GuardProtocol
 # For a non-reload start or a public listener use the hardened entrypoint instead:
-# python serve.py     (proxy_headers=False; binds server.port and security.public.port from config.yaml)
+# python serve.py     (proxy_headers=False + GuardProtocol; binds server.port and
+#                      security.public.port from config.yaml)
 ```
 
 `--no-proxy-headers` is required even for a local uvicorn start: without it
 `ProxyHeadersMiddleware` rewrites `scope["client"]` from a caller-supplied `X-Forwarded-For`
-when the peer is `127.0.0.1`, which defeats the IP whitelist. `serve.py` sets the equivalent
-`proxy_headers=False` in code.
+when the peer is `127.0.0.1`, which would forge the address used by rate-limit buckets,
+audit rows and `security.blocked_ips`. `serve.py` sets the equivalent
+`proxy_headers=False` in code. `--http ip_guard_protocol:GuardProtocol` installs the
+pre-ASGI socket drop for `security.blocked_ips`; without it the ASGI fallback still
+interrupts denied requests (startup logs a WARNING about the degraded mode). `serve.py`
+always installs the protocol.
 
 The working directory must be `app/` (the same as the image's `WORKDIR /app`), otherwise the
 `../data/config.yaml` path in `.env` does not resolve; `--env-file` points at the `.env`
@@ -140,7 +146,8 @@ To run the gateway straight on the host (debugging upstreams, validating a confi
 
 ```bat
 :: Single internal listener (server.port from config.yaml), uvicorn + auto-reload
-:: (passes --no-proxy-headers). Change the port in config.yaml, not on the command line.
+:: (passes --no-proxy-headers, --log-config logging.json and
+::  --http ip_guard_protocol:GuardProtocol). Change the port in config.yaml, not on the CLI.
 scripts\start-local.bat
 
 :: Run the preflight checks only, do not start
@@ -354,8 +361,9 @@ Red lines on the public socket — management, docs, `/`, `/probe` and `/health`
 
 One listener in the container means **one zone**, because the container sees only ONE socket and
 `scope["server"]` is identical for every host port mapped to it. Two **different host ports pointing
-at the same container port do NOT create two zones** — no reverse proxy, IP whitelist or header can
-split that socket. Set the whole instance to one of the two single-socket layouts in `config.yaml`:
+at the same container port do NOT create two zones** — no reverse proxy, client-IP list or header can
+split that socket (`allowed_client_ips` was removed; `security.blocked_ips` is a deny-list, not a
+zone selector). Set the whole instance to one of the two single-socket layouts in `config.yaml`:
 
 1. **Internal-only** — `security.public.port: null`. The sole `server.port` socket is trusted LAN;
    `security.internal.allow_anonymous` decides whether business APIs need a key. Publish it on the
@@ -516,11 +524,18 @@ Code fixes do not replace deployment hardening. Confirm each item on an internet
    `server.upstream_queue_timeout` to an acceptable wait (default 120s). Excess requests
    queue instead of being rejected; a wait that exceeds the cap gets 503 + `Retry-After`.
    Both are read at startup only — restart after editing.
-5. **Keep the console internal-only**: `/admin` and `/admin/*` are hard 404 on the public socket
+5. **Block hostile client IPs at the socket**: `security.blocked_ips` takes bare IPs and CIDRs
+   (IPv4/IPv6). A match is interrupted before any route — one `deny <ip>` line, no HTTP
+   response, no access-log line, no request-log row — on the real TCP peer, never an
+   `X-Forwarded-*` value. It hot-reloads in ~1 s with no restart. Start the image with
+   `python serve.py` (it injects `http=GuardProtocol`); a bare `uvicorn main:app` needs
+   `--http ip_guard_protocol:GuardProtocol` for the pre-ASGI drop, otherwise the ASGI
+   fallback still interrupts requests but startup warns. `-CheckOnly` prints the active rules.
+6. **Keep the console internal-only**: `/admin` and `/admin/*` are hard 404 on the public socket
    (there is no admin-shell switch); reach the console only from the LAN/VPN or through a tunnel.
    All `/v1/management/*` endpoints accept a signed session cookie only — a caller API key answers
    401, and they are 404 on public regardless of the config.
-6. **Declare the zones in config**: set `security.public.port` to a port distinct from
+7. **Declare the zones in config**: set `security.public.port` to a port distinct from
    `server.port` (e.g. `8001`), map the two container ports to **different host ports**, and
    publish `server.port` on the LAN only. The listening socket is the anchor — no IP list, XFF or
    port environment variable can move a request between zones (legacy port variables are migration
@@ -529,12 +544,12 @@ Code fixes do not replace deployment hardening. Confirm each item on an internet
    Confirm the image starts with `python serve.py` (`proxy_headers=False`), never plain
    `uvicorn main:app`; the latter cannot bind the public port and lets a caller forge the audit IP.
    A hidden `/docs` must never coexist with a key-free public API.
-7. **Reduce the information surface**: `security.internal.expose_version: false`,
+8. **Reduce the information surface**: `security.internal.expose_version: false`,
    `security.internal.expose_docs: false` unless needed, and keep `security.public.path_allowlist`
    to the minimum set of `re.fullmatch` method+path rules (e.g. `^/v1/chat/completions$`, not a
    broad `^/v1/.*$`). Unlisted pairs are 404 with or without a key. `GET /v1/management/config`
    masks upstream headers (saving the projection restores the real values from disk).
-8. **Container / dependencies (deployment-side TODO, no code change)**: the image still runs
+9. **Container / dependencies (deployment-side TODO, no code change)**: the image still runs
    as root and `requirements.txt` uses unbounded `>=`. Prefer a non-root user, a read-only root
    filesystem with only `/data` writable, and a hash-pinned lock file.
 

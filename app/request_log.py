@@ -31,6 +31,7 @@ import math
 import os
 import re
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -131,6 +132,60 @@ _ADDED_COLUMNS = (
 )
 
 
+def attach_request_detail(
+    request: Any,
+    *,
+    requested_model: str | None = None,
+    model: str | None = None,
+    upstream: str | None = None,
+    request_raw: bytes | str | None = None,
+    response_raw: bytes | str | None = None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
+    tokens: int | None = None,
+    stream: bool | None = None,
+    ttfb_ms: int | None = None,
+) -> None:
+    """Publish fields a standalone handler knows to the middleware's request-log row.
+
+    Standalone routes (``/v1/systemone``, ``/v1/tools/web-search``, ``/v1/rerank``,
+    ``/v1/messages``) bypass ``ProxyService.forward``, so the middleware is the only
+    writer of their row -- but the handler is the only thing that has seen the raw
+    request body and the resolved model/upstream. This helper passes those facts
+    through the shared ASGI ``request.state``; ``basic_entry`` merges them into the
+    single row the middleware writes, applying the same ``sanitize_body`` redaction
+    the proxy uses. Bodies stay as raw bytes here so masking happens exactly once,
+    at merge time, and the two logging paths cannot drift apart.
+
+    Repeated calls accumulate (publish the request up front, fill in the resolved
+    model/upstream afterwards); a later value for the same key wins. Nothing here
+    writes to SQLite or claims the row, so it is safe on both success and error paths.
+    """
+    detail: dict[str, Any] = getattr(request.state, "request_log_detail", None) or {}
+    values: tuple[tuple[str, Any], ...] = (
+        ("requested_model", requested_model),
+        ("model", model),
+        ("upstream", upstream),
+        ("tokens_in", tokens_in),
+        ("tokens_out", tokens_out),
+        ("tokens", tokens),
+        ("stream", stream),
+        ("ttfb_ms", ttfb_ms),
+        ("request_raw", request_raw),
+        ("response_raw", response_raw),
+    )
+    for key, value in values:
+        if value is not None:
+            detail[key] = value
+    # sanitize_body works on bytes. Normalize here so a handler holding an already
+    # encoded JSON string cannot accidentally store an unredacted body.
+    for key in ("request_raw", "response_raw"):
+        raw = detail.get(key)
+        if raw is not None and not isinstance(raw, bytes):
+            detail[key] = str(raw).encode("utf-8")
+    request.state.request_log_detail = detail
+
+
 def basic_entry(
     *,
     method: str,
@@ -143,8 +198,9 @@ def basic_entry(
     req_size: int | None = None,
     res_size: int | None = None,
     error: str | None = None,
+    detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a metadata-only row for calls that never reach ``ProxyService.forward``.
+    """Build a request-log row for calls that never reach ``ProxyService.forward``.
 
     The rich row (request/response bodies, token usage, upstream, stream flags) is built
     by the proxy from its own timing and parsed body. Two kinds of request bypass that
@@ -152,38 +208,68 @@ def basic_entry(
     (b) the in-process API handlers (``/v1/systemone``, ``/v1/tools/web-search``,
     ``/v1/rerank``, ``/v1/messages``, ``/v1/models``, ``/api/tags``, ``/api/ps``) answer
     without a proxy. Both still matter to the console: a 401 from a public probe and a
-    failed rerank are exactly the rows an operator needs to see. This helper produces
-    the same shape as a proxy row but leaves body/token/upstream fields unset, so the
-    list, counts, percentiles and status distribution include them without pretending
-    we captured a body we never read.
+    failed rerank are exactly the rows an operator needs to see.
+
+    ``detail`` is the optional payload published by ``attach_request_detail``. With no
+    detail the row stays metadata-only (pure probes, denials, 404s): body/token/model/
+    upstream fields are left unset rather than faking a capture. With detail, the raw
+    bodies are redacted and truncated through the proxy's own ``sanitize_body``, so the
+    console detail pane can show the same request/response a proxy row would -- without
+    ever writing a second row for the call.
 
     ``ts`` is the wall-clock arrival time (``now_ts()``) and ``started`` is the
     ``time.perf_counter()`` reading taken at the same moment, for the duration.
     """
+    detail = detail or {}
+    duration_ms = max(0, round((time.perf_counter() - started) * 1000))
+    request_body, request_truncated = sanitize_body(detail.get("request_raw"))
+    response_body, response_truncated = sanitize_body(detail.get("response_raw"))
+    # A captured body is a more honest size than Content-Length: streaming replies
+    # carry no such header, and a handler that rewrites the payload upstream would
+    # otherwise report the caller's byte count as the response size.
+    if detail.get("request_raw") is not None:
+        req_size = len(detail["request_raw"])
+    if detail.get("response_raw") is not None:
+        res_size = len(detail["response_raw"])
+
+    tokens_in = detail.get("tokens_in")
+    tokens_out = detail.get("tokens_out")
+    tokens = detail.get("tokens")
+    if detail.get("response_raw") and tokens is None and tokens_in is None and tokens_out is None:
+        tokens_in, tokens_out, tokens = extract_token_usage(detail["response_raw"])
+
+    stream = 1 if detail.get("stream") else 0
+    ttfb_ms = detail.get("ttfb_ms")
+    if ttfb_ms is None and stream == 0 and detail:
+        # A non-streaming standalone handler answers in one shot, so first byte and
+        # last byte are effectively the same instant. Only approximate when the
+        # handler published something; pure probes/denials keep a NULL TTFB.
+        ttfb_ms = duration_ms
+
     return {
         "ts": ts,
         "ts_end": now_ts(),
         "method": method,
         "path": path,
         "query": sanitize_query(query),
-        "requested_model": None,
-        "model": None,
-        "upstream": None,
+        "requested_model": detail.get("requested_model"),
+        "model": detail.get("model"),
+        "upstream": detail.get("upstream"),
         "status": status,
-        "duration_ms": max(0, round((time.perf_counter() - started) * 1000)),
-        "ttfb_ms": None,
-        "stream": 0,
-        "tokens_in": None,
-        "tokens_out": None,
-        "tokens": None,
+        "duration_ms": duration_ms,
+        "ttfb_ms": ttfb_ms,
+        "stream": stream,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tokens": tokens,
         "req_size": req_size,
         "res_size": res_size,
         "client_ip": client_ip,
         "error": error,
-        "request_body": None,
-        "response_body": None,
-        "request_body_truncated": 0,
-        "response_body_truncated": 0,
+        "request_body": request_body,
+        "response_body": response_body,
+        "request_body_truncated": int(request_truncated),
+        "response_body_truncated": int(response_truncated),
     }
 
 
@@ -310,6 +396,13 @@ def extract_token_usage(raw: bytes | None) -> tuple[int | None, int | None, int 
     if isinstance(usage, dict):
         prompt = _as_int(usage.get("prompt_tokens"))
         completion = _as_int(usage.get("completion_tokens"))
+        # Anthropic Messages (and the /v1/messages bridge) name the same counts
+        # input_tokens / output_tokens. Accept both so a metrics row is populated
+        # no matter which dialect answered.
+        if prompt is None:
+            prompt = _as_int(usage.get("input_tokens"))
+        if completion is None:
+            completion = _as_int(usage.get("output_tokens"))
         if prompt is not None or completion is not None:
             total = _as_int(usage.get("total_tokens"))
             if total is None:
@@ -341,6 +434,11 @@ class RequestLog:
         self._started = False
         self.dropped = 0
         self._last_prune = 0.0
+        # Serialise every SQLite writer. The background batch writer, the hourly
+        # retention prune and the console's on-demand cleanup all run in worker
+        # threads; without this lock a large DELETE can overlap an executemany and
+        # make the latter fail with "database is locked".
+        self._io_lock = threading.Lock()
 
     # --------------------------------------------------------------- lifecycle ---
     async def start(self) -> None:
@@ -463,13 +561,83 @@ class RequestLog:
     def _insert_many(self, batch: list[dict[str, Any]]) -> None:
         rows = [tuple(entry.get(col) for col in _COLUMNS.split(", ")) for entry in batch]
         placeholders = ", ".join("?" * len(rows[0]))
-        with self._db() as conn:
+        with self._io_lock, self._db() as conn:
             conn.executemany(f"INSERT INTO requests ({_COLUMNS}) VALUES ({placeholders})", rows)
 
     def _prune(self, cutoff: str) -> int:
-        with self._db() as conn:
+        with self._io_lock, self._db() as conn:
             cur = conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,))
             return cur.rowcount
+
+    # -------------------------------------------------------- manual cleanup ---
+    def _db_bytes(self) -> int:
+        """Main DB plus its WAL: a DELETE frees pages but does not shrink the file."""
+        total = 0
+        for suffix in ("", "-wal"):
+            try:
+                total += Path(f"{self.db_path}{suffix}").stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def _cleanup_preview_sync(self, cutoff: str) -> dict[str, Any]:
+        """What ``DELETE FROM requests WHERE ts < cutoff`` would remove, without deleting."""
+        with self._io_lock, self._db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), MIN(ts), MAX(ts) FROM requests WHERE ts < ?", (cutoff,)
+            ).fetchone()
+            total = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+        return {
+            "count": int(row[0]),
+            "total": int(total),
+            "oldest": row[1],
+            "newest": row[2],
+            "db_bytes": self._db_bytes(),
+        }
+
+    def _cleanup_sync(self, cutoff: str, vacuum: bool) -> dict[str, Any]:
+        before_bytes = self._db_bytes()
+        with self._io_lock:
+            with self._db() as conn:
+                cur = conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,))
+                deleted = cur.rowcount
+                remaining = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+                oldest = conn.execute("SELECT MIN(ts) FROM requests").fetchone()[0]
+            # VACUUM rewrites the whole database and must run outside a transaction.
+            # Only worth it when rows were actually removed; it can hold the write
+            # lock for a while on a large DB, so the console offers it as an option.
+            compacted = False
+            if vacuum and deleted:
+                try:
+                    conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
+                    try:
+                        conn.execute("VACUUM")
+                        compacted = True
+                    finally:
+                        conn.close()
+                except sqlite3.Error as exc:
+                    # Another reader can hold a WAL snapshot. The rows are already
+                    # deleted and committed; failing to compact must not turn a
+                    # successful cleanup into a 500.
+                    logger.warning("Request log VACUUM skipped (delete already committed): %s", exc)
+        return {
+            "deleted": int(deleted),
+            "remaining": int(remaining),
+            "oldest": oldest,
+            "db_bytes_before": before_bytes,
+            "db_bytes_after": self._db_bytes(),
+            "vacuum": compacted,
+        }
+
+    async def cleanup_preview(self, cutoff: str) -> dict[str, Any]:
+        """Async wrapper: drain pending rows first, then count off the event loop."""
+        await self.flush()
+        return await asyncio.to_thread(self._cleanup_preview_sync, cutoff)
+
+    async def cleanup(self, cutoff: str, *, vacuum: bool = False) -> dict[str, Any]:
+        """Delete every row older than ``cutoff`` (naive-UTC ISO, strict ``ts < cutoff``)."""
+        await self.flush()
+        return await asyncio.to_thread(self._cleanup_sync, cutoff, vacuum)
 
     # -------------------------------------------------------------------- queries ---
     @staticmethod

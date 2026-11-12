@@ -43,6 +43,7 @@ from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from http_clients import inference_timeout
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from request_log import attach_request_detail
 
 logger = logging.getLogger("llm_hub")
 
@@ -177,6 +178,17 @@ class MessagesService:
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body must be a JSON object.")
 
+        # Publish the caller's body before any validation/resolution error can abort,
+        # so even a rejected call leaves an auditable request body. The resolved
+        # model/upstream (and the validated stream flag) are filled in below.
+        requested_model = str(parsed.get("model") or "").strip() or None
+        attach_request_detail(
+            request,
+            requested_model=requested_model,
+            request_raw=raw,
+            stream=bool(parsed.get("stream")),
+        )
+
         try:
             req = MessageRequest(**parsed)
         except ValidationError as exc:
@@ -225,6 +237,7 @@ class MessagesService:
             extra_params = dict(resolved.extra_params or {})
 
         is_ollama = getattr(upstream, "type", None) == "ollama"
+        attach_request_detail(request, model=target, upstream=upstream.name, stream=bool(req.stream))
         payload = self._build_payload(req, target, is_ollama, extra_params, cfg)
 
         url = f"{upstream.base_url_stripped()}/{'api/chat' if is_ollama else 'v1/chat/completions'}"
@@ -276,7 +289,7 @@ class MessagesService:
 
         if req.stream:
             return StreamingResponse(
-                self._stream_anthropic(resp, is_ollama, target),
+                self._stream_anthropic(resp, is_ollama, target, request),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
             )
@@ -426,7 +439,7 @@ class MessagesService:
                     yield line
 
     async def _stream_anthropic(
-        self, resp: httpx.Response, is_ollama: bool, target: str
+        self, resp: httpx.Response, is_ollama: bool, target: str, request: Request | None = None
     ) -> AsyncIterator[str]:
         started = time.perf_counter()
         usage = {"input_tokens": 0, "output_tokens": 0}
@@ -515,6 +528,16 @@ class MessagesService:
                             stop_reason = _openai_stop(choice["finish_reason"])
         finally:
             await resp.aclose()
+            if request is not None:
+                # Usage is only known once the terminal upstream chunk arrives. Publish
+                # it here so the middleware's row (written from its iterator's finally,
+                # after this generator finishes) can record the token split.
+                attach_request_detail(
+                    request,
+                    tokens_in=usage["input_tokens"],
+                    tokens_out=usage["output_tokens"],
+                    tokens=usage["input_tokens"] + usage["output_tokens"],
+                )
 
         yield self._sse("content_block_stop", {"type": "content_block_stop", "index": 0})
         yield self._sse(

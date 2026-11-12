@@ -22,6 +22,8 @@ import type {
   ModelsSystemOne,
   Overview,
   RangeQuery,
+  RequestCleanupPreview,
+  RequestCleanupResult,
   RequestDetail,
   RequestsQuery,
   RequestsResponse,
@@ -56,6 +58,17 @@ export const api = {
 
   requests: (params: RequestsQuery) => http.get<RequestsResponse>('/requests', { params }),
   requestDetail: (id: number) => http.get<RequestDetail>(`/requests/${id}`),
+
+  // Settings / General: preview before deleting, then delete request-log rows older
+  // than `before`. The route is registered above /requests/{id} so it is not parsed
+  // as a record id. VACUUM is an explicit opt-in (it holds the SQLite write lock).
+  requestCleanupPreview: (before: string): Promise<AxiosResponse<RequestCleanupPreview>> =>
+    http.get<RequestCleanupPreview>('/requests/cleanup', { params: { before } }),
+  requestCleanup: (
+    before: string,
+    vacuum = false,
+  ): Promise<AxiosResponse<RequestCleanupResult>> =>
+    http.post<RequestCleanupResult>('/requests/cleanup', { before, vacuum }, { timeout: 120000 }),
 
   // `tz_offset` is minutes to add to UTC to reach this browser (UTC+8 -> 480) and only
   // affects `bucket: 'day'`, so each bar is one local calendar day.

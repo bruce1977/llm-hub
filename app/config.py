@@ -20,6 +20,7 @@ from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+import ip_guard
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
@@ -215,9 +216,9 @@ class ServerConfig(BaseModel):
     """
 
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "info"
-    request_timeout: float = 600.0
+    request_timeout: float = Field(default=600.0, gt=0)
     # Concurrency gate for model-inference upstreams (Ollama / LM Studio / OpenCode
     # chat). High request volume is legitimate traffic, so a burst is QUEUED rather
     # than rejected: httpcore's connection pool hands out at most `max_concurrency`
@@ -230,7 +231,7 @@ class ServerConfig(BaseModel):
     # How long a request may wait for a free inference slot before answering 503
     # with Retry-After. Bounds the queue so a sustained flood cannot pile up in RAM.
     upstream_queue_timeout: float = Field(default=120.0, gt=0)
-    upstream_keepalive_expiry: float = 30.0
+    upstream_keepalive_expiry: float = Field(default=30.0, gt=0)
 
 
 class InternalSecurityConfig(BaseModel):
@@ -718,6 +719,19 @@ class SecurityConfig(BaseModel):
     public: PublicSecurityConfig = Field(default_factory=PublicSecurityConfig)
 
     blocked_paths: list[str] = Field(default_factory=list)
+    # TCP-level deny-list, shared by BOTH listeners. Each entry is a bare IPv4/IPv6
+    # address or a CIDR (``203.0.113.7``, ``10.0.0.0/8``, ``2001:db8::/32``). A
+    # matched peer gets an ``abort()`` in uvicorn's ``connection_made`` -- BEFORE
+    # any ASGI scope exists -- so there is no HTTP response (not even 444), no
+    # access-log line, no request-log row and no middleware work. Only one
+    # ``deny <ip>`` application log line is emitted. The real TCP peer is the sole
+    # address source; forwarded headers are never consulted.
+    # Hot-reloads: ConfigManager publishes a new snapshot to the protocol layer on
+    # every load. Invalid entries are skipped with a warning, never fatal.
+    # Enforcement requires the custom uvicorn protocol (serve.py injects it; the
+    # CLI needs ``--http ip_guard_protocol:GuardProtocol``); startup warns if it
+    # is missing while this list is non-empty.
+    blocked_ips: list[str] = Field(default_factory=list)
     cors_origins: list[str] = Field(default_factory=list)
     max_body_bytes: int = 32 * 1024 * 1024
     # In-memory token-bucket rate limiter (DoS / brute-force mitigation).
@@ -1222,6 +1236,9 @@ def build_default_config() -> dict[str, Any]:
                 "admin_endpoints": "deny",
             },
             "blocked_paths": [],
+            # TCP-level deny-list: bare IP or CIDR, enforced below ASGI by
+            # ip_guard_protocol.GuardProtocol. Empty = no connection is dropped.
+            "blocked_ips": [],
             "cors_origins": [],
             "max_body_bytes": 32 * 1024 * 1024,
             "rate_limit": {"enabled": False, "per_minute": 60, "burst": 20, "by": "ip"},
@@ -1254,7 +1271,21 @@ class ConfigManager:
         self._mtime: float = 0.0
         self._last_check: float = 0.0
         self._lock = threading.RLock()
+        self._set_config(self._config)
         self._reload_if_needed(force=True)
+
+    def _set_config(self, cfg: Config) -> None:
+        """Swap the active config and publish its TCP deny-list in one place.
+
+        Every path that replaces ``_config`` goes through here, so the snapshot
+        read by ``GuardProtocol.connection_made`` can never drift from the config
+        the rest of the app is using (including the "keep previous config" error
+        paths in :meth:`_load`, where republishing the same rules is a no-op).
+        ``ip_guard.configure`` swaps an immutable tuple under its own lock, so a
+        protocol callback never blocks on config parsing.
+        """
+        self._config = cfg
+        ip_guard.configure(cfg.security.blocked_ips)
 
     # ------------------------------------------------------------------ loading ---
     def _active_path(self) -> Path:
@@ -1342,7 +1373,7 @@ class ConfigManager:
                 mtime = 0.0
             if force or mtime != self._mtime:
                 self._mtime = mtime
-                self._config = self._load()
+                self._set_config(self._load())
 
     # ------------------------------------------------------------------ public API ---
     @property
@@ -1352,7 +1383,7 @@ class ConfigManager:
 
     def reload(self) -> Config:
         with self._lock:
-            self._config = self._load()
+            self._set_config(self._load())
             try:
                 self._mtime = self._active_path().stat().st_mtime
             except OSError:

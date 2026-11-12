@@ -26,11 +26,13 @@ import json
 import logging
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from auth import read_limited_body
 from fastapi import HTTPException, Request, status
 from fastapi.responses import Response
+from request_log import attach_request_detail
 
 logger = logging.getLogger("llm_hub")
 
@@ -125,8 +127,22 @@ class SystemOneService:
         # sentinel) and the caller did not already set one. laya-server reads it as a
         # routing hint and defaults to "auto"; an Ollama backend wants a real model name
         # and answers 404 for "auto", so point `systemone.model` at a model it serves.
-        if so.model and so.model != "local" and not body.get("model"):
+        requested_model = str(body.get("model") or "").strip() or None
+        if so.model and so.model != "local" and not requested_model:
             body["model"] = so.model
+
+        # Publish what this handler alone knows to the request log. The System One
+        # backend is not a `cfg.upstreams` entry, so label it by host to keep the
+        # console's upstream column and distribution useful; the response body is
+        # captured centrally by the middleware.
+        backend_host = urlparse(so.backend).netloc or so.backend
+        attach_request_detail(
+            request,
+            requested_model=requested_model,
+            model=str(body.get("model") or "").strip() or None,
+            upstream=f"systemone:{backend_host}",
+            request_raw=raw_body,
+        )
 
         # Build upstream request headers.
         headers = self._build_headers(request)

@@ -20,6 +20,18 @@ const PAGE_SIZE = 15
 const STATUS_OPTIONS = ['2xx', '3xx', '4xx', '5xx']
 const METHOD_OPTIONS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
 
+// Standalone tool endpoints have no model of their own. Give the 模型 column a stable
+// tool label so a web-search / System One call no longer reads as an empty `—`; the
+// real backend is already shown in the dedicated upstream column, and a body-level
+// `model` (when the caller/provider supplied one) still takes priority on the backend.
+const TOOL_LABELS: Record<string, string> = {
+  '/v1/tools/web-search': 'web-search',
+  '/v1/systemone': 'systemone',
+}
+function modelSubLine(row: RequestRow): string {
+  return row.model || row.requested_model || TOOL_LABELS[row.path] || row.upstream || '—'
+}
+
 const { t } = useI18n()
 
 const filters = reactive({
@@ -314,7 +326,7 @@ onMounted(() => {
             <td>{{ row.method }}</td>
             <td class="path-cell">
               {{ row.path }}
-              <div class="mono sub-line">{{ row.model || row.requested_model || '—' }}</div>
+              <div class="mono sub-line">{{ modelSubLine(row) }}</div>
             </td>
             <td>{{ row.upstream || '—' }}</td>
             <td><span class="badge" :class="statusBadge(row.status).cls">{{ statusBadge(row.status).text }}</span></td>

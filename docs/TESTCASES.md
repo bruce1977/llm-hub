@@ -891,7 +891,7 @@ curl http://localhost:8000/v1/models \
 
 | 用例 | 命令 / 配置 | 期望 |
 | --- | --- | --- |
-| 默认仅内网监听 | `start-local.bat -CheckOnly`（`security.public.port: null`） | `public=none`；入口为 `uvicorn --no-proxy-headers`；打印 gateway/docs/console/models |
+| 默认仅内网监听 | `start-local.bat -CheckOnly`（`security.public.port: null`） | `public=none`；入口为 `uvicorn --no-proxy-headers --http ip_guard_protocol:GuardProtocol`；打印 gateway/docs/console/models；设了 `blocked_ips` 时额外打印生效规则 |
 | 双区 | 在 `config.yaml` 设 `security.public.port: 18081` 后 `start-local.bat -CheckOnly` | `public=18081`；入口为 `python serve.py`；打印 internal/public 两行分区地址 |
 | 公网上的管理接口 | 双区下访问公网端口的 `/v1/management/*`、`/admin`（`admin_endpoints` 保持默认 `deny`） | 公网这两个路径恒 404；管理操作走内网端口、VPN 或 SSH 隧道（`admin_endpoints: allow` 时二者会被路由到真实处理器，但仍需登录 `/admin` 换会话 Cookie，除静态外壳与登录接口外一律 401） |
 | 端口被占用 | `server.port` 或 `security.public.port` 已被监听 | 报错并指出 pid，退出码 1；提示编辑 `config.yaml` |
@@ -899,8 +899,9 @@ curl http://localhost:8000/v1/models \
 | 环境里的旧 Key 变量 | `.env` 残留 `GATEWAY_API_KEYS` / `GATEWAY_API_KEYS_FILE` | 启动脚本主动从环境删除并告警：调用方 Key 只能在 `/admin` 签发进 `api_keys` 表，环境变量里的一律不生效 |
 | `-NoReload` | `start-local.bat -NoReload -CheckOnly` | 入口为 `python serve.py`，无自动重载 |
 
-默认单监听路径下 uvicorn 必须带 `--no-proxy-headers`，否则 `ProxyHeadersMiddleware` 会用
-`X-Forwarded-For` 改写 `scope["client"]`，使请求日志里的客户端 IP 可被伪造。
+默认单监听路径下 uvicorn 必须带 `--no-proxy-headers`（否则 `ProxyHeadersMiddleware` 会用
+`X-Forwarded-For` 改写 `scope["client"]`，使请求日志里的客户端 IP 可被伪造）与
+`--http ip_guard_protocol:GuardProtocol`（让 `security.blocked_ips` 在 ASGI 之前切断连接）。
 当 `security.public.port` 与 `server.port` 不同（或传 `-NoReload`）时脚本自动切到 `serve.py`：
 它在同一进程绑定所有监听端口，因此内存中的 Key 缓存、限流桶、登录锁定在两区共享。
 若 `.env` 里残留旧的端口变量，脚本仅将其当作一次性迁移提示并警告要求删除，显式配置优先。
@@ -1109,6 +1110,133 @@ done; wait
 - 旧配置文件里残留（甚至带非默认值）仍能正常加载，但字段不会复活，启动时给出告警；
 - 公网区 `?api_key=<合法 Key>` -> `401`，`Authorization: Bearer` -> `200`；
 - 伪造的 `X-Forwarded-For` / `X-Real-IP` 链不改变 `peer_ip()`，也不改变分区。
+
+### 测试 29C: `security.blocked_ips`（请求直接中断，2026-11-12）
+
+需求是"配置的 IP 发起的请求直接中断掉"，不是返回一个 HTTP 错误码。自动化验证见
+`tests/verify_security.py` 的 `test_blocked_ips_matching` /
+`test_blocked_ips_config_and_hot_reload` / `test_blocked_ips_interrupts_request` /
+`test_blocked_ips_socket_drop`：
+
+- **规则解析**：单 IP、CIDR、IPv4 / IPv6、`203.0.113.7/24` 简写、`192.0.2.5` 前后空白、
+  重复项合并；非法条目与非字符串条目告警后跳过；`configure()` 是替换而非追加，
+  `reset()` 清空；IPv4 与 IPv6 家族互不误判。
+- **配置与热加载**：`SecurityConfig` / 默认配置 / 示例配置都有 `blocked_ips: []`；
+  `ConfigManager` 每次成功加载都发布不可变快照；`reload()` 换名单无需重启；配置被校验器
+  拒绝时保留上一份可用名单。启动日志区分「TCP 层已装载」（INFO）与「仅 ASGI 兜底」（WARNING）。
+- **ASGI 兜底**：`BlockedIPMiddleware` 必须是**最外层**用户中间件（Starlette 的
+  `add_middleware` 是 `insert(0)` 且逆序建栈，所以要在模块末尾注册）。被拒请求无 body、
+  只输出一条 `deny <ip>`、请求记录表零行；允许的请求正常 200 且带真实对端 IP。
+- **真实 socket 验证**：起一个真的 `uvicorn.Server`（`http=GuardProtocol`），从
+  `127.0.0.2` 绑定源地址发请求 —— 收到 **0 字节**、ASGI 命中数为 0、
+  `uvicorn.access` 无该 IP 的行、没有 "ASGI callable returned without starting response"
+  或 500 兜底、仅一条 `deny 127.0.0.2`；从 `127.0.0.1` 发请求得到 `HTTP/1.1 200`
+  且产生访问日志与请求记录。同时验证 CLI 的 `--http ip_guard_protocol:GuardProtocol`
+  导入路径、`serve.py` 的 `http=GuardProtocol` 与 `start-local.ps1` 的 `--http` 参数。
+- **零流量热加载**：服务器运行中把名单从 `127.0.0.2` 改成 `127.0.0.3`，约 1 秒后
+  旧 IP 恢复 200、新 IP 被丢弃；后台配置轮询让被拒连接无需任何其它请求也能生效。
+
+手工验证（Linux / macOS，先设 `security.blocked_ips: ["127.0.0.2"]` 并以 `python serve.py` 启动）：
+
+```bash
+curl --interface 127.0.0.2 -v http://127.0.0.1:8000/health   # 连接直接被断开，无 HTTP 响应
+curl http://127.0.0.1:8000/health                            # 200 {"ok":true}
+# 服务端日志只多一行：WARNING | llm_hub | deny 127.0.0.2
+```
+
+再编辑 `config.yaml` 把名单改成 `["127.0.0.3"]`，不重启、不发其它请求，等约 1 秒后重复：
+`127.0.0.2` 恢复 200，`127.0.0.3` 被丢弃。
+
+### 测试 29D: Settings「请求」请求记录清理（2026-11-12）
+
+自动化验证见 `tests/test_management.py` 的 `[16] request log cleanup`（33 项断言），使用独立的
+临时 SQLite 库，避免污染前面各组写入的请求记录。
+
+- **鉴权与分区**：未登录时 GET 预览 / POST 删除都是 401；把 TestClient 的端口声明为公网后，
+  即便配置了 allowlist，cleanup 仍在管理面红线内（401 / 404）。两个路由必须注册在
+  `/requests/{id}` **之前**，否则 Starlette 会先把 `cleanup` 当成 id 解析并返回 422。
+- **截止日期**：纯 `YYYY-MM-DD` 归一化为 UTC `00:00:00`；带时区的
+  `2026-10-12T08:00:00+08:00` 归一化到同一时刻；空值 / 无法解析 / 未来时间 → 400；
+  POST 缺 `before` 或空串 → 422。
+- **预览**：`count` 是 `ts < cutoff` 的行数，`total` 是全表行数，`oldest` / `newest` 是待删
+  区间的最早 / 最晚时间，`db_bytes` 是 SQLite 主文件 + WAL 大小。
+- **删除**：严格 `<`，恰好等于截止时刻的行保留；待删的旧行里含一条 `/health`（非 API 行，
+  列表与图表隐藏它）也要被清掉；返回 `deleted` / `remaining` / `oldest` /
+  `db_bytes_before` / `db_bytes_after`。第二次预览 `count=0`。
+- **VACUUM**：默认 `false`；无行可删时即便传 `true` 也不执行；插入一条旧行后再删则
+  `vacuum=true`，且删除数与剩余数仍正确。批量插入、每小时保留期清理与手工删除共用
+  `RequestLog._io_lock`，避免大 `DELETE` 与 `executemany` 撞出 `database is locked`。
+
+手工验证（先登录拿 Cookie）：
+
+```bash
+BASE=http://127.0.0.1:8000/v1/management
+curl -c jar -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d '{"password":"..."}'
+curl -b jar "$BASE/requests/cleanup?before=2026-10-12"
+# {"before":"2026-10-12T00:00:00","count":123,"total":456,"oldest":"...","newest":"...","db_bytes":...}
+curl -b jar -X POST "$BASE/requests/cleanup" -H 'Content-Type: application/json' \
+  -d '{"before":"2026-10-12","vacuum":true}'
+# {"ok":true,"deleted":123,"remaining":333,...}
+```
+
+界面路径：Settings → 请求（第三个 Tab，非 config 编辑器、隐藏保存栏）→ 默认一个月前并自动
+预览 → 点「清理记录」→ 确认弹窗显示准确条数 → 成功后刷新预览，并展示删除数 / 剩余数 / 数据库大小变化。
+
+### 测试 29E: Settings「安全」配置编辑（2026-11-12）
+
+自动化验证见 `tests/test_management.py` 的 `[17] settings security node (PUT /config)`
+（24 项断言），与 `[16]` 共用临时 config 文件，`finally` 恢复原文并 `manager.reload()`。
+
+- **鉴权**：未登录时 GET /config 与 PUT /config 都是 **401**；管理会话登录后正常读写。
+- **完整往返**：GET /config 返回 `security` 全部 7 个顶层键（`internal` / `public` /
+  `blocked_paths` / `blocked_ips` / `cors_origins` / `max_body_bytes` / `rate_limit`），
+  两个区与限流器的子字段也都在。PUT 后磁盘上的 `security` 仍是完整节点（含默认值），
+  标量、列表、`path_allowlist` 的「方法 → 正则数组」映射逐项一致；其余顶层段
+  （`upstreams` / `rerank` / `systemone` / `websearch` / `server` / `routing` 等）原样保留。
+- **热加载**：`manager.reload()` 后 `manager.config.security` 立即反映新值，
+  `blocked_ips` 快照同步进 `ip_guard`；非法 IP 条目被跳过，合法 IP 命中。
+- **校验**：`public.port=70000`、`admin_endpoints=bogus`、`rate_limit.by=bogus`、
+  `path_allowlist` 含未知方法 `TRACE`、`per_minute="many"` 都返回 **422**，
+  `detail.segments` 里明确是 `security`，且磁盘文件逐字节不变。
+- **空 PUT**：`{"config": {}}` 不清空 `security`。
+- **旧配置回归**：磁盘放一个顶层 `auth: {enabled: true}` 并删掉
+  `security.internal.allow_anonymous`，加载后该字段由 `auth.enabled` 推断为 false；
+  界面读回、改成 true 并保存，完整写回使 `Config._migrate_auth_node` 不再覆盖它，
+  磁盘与运行时都为 true；顶层 `auth` 原样保留（其它顶层键 verbatim）。
+
+手工验证（先登录拿 Cookie）：
+
+```bash
+BASE=http://127.0.0.1:8000/v1/management
+curl -c jar -X POST "$BASE/auth/login" -H 'Content-Type: application/json' -d '{"password":"..."}'
+curl -b jar "$BASE/config" | python -m json.tool | head -40
+curl -b jar -X PUT "$BASE/config" -H 'Content-Type: application/json' \
+  -d '{"config":{"security":{...完整节点...}}}'
+# {"ok":true,"reloaded":true}
+```
+
+界面路径：Settings → 安全 → 修改任意字段 → 「保存配置」→ 确认弹窗提示整体覆盖 `security` 节点。
+`blocked_ips` 非空时表单给出自锁警告；IP / 路径 / 限流约 1 秒热加载，`public.port` 需重启。
+其中「允许外网访问管理后台」（`admin_endpoints`）控制公网 socket 是否开放 `/admin` 与
+`/v1/management/*`：`deny` 全拒、`readonly` 仅放行模型 pull 而后台仍关闭、`allow` 开放后台；
+管理路由仍需在 `path_allowlist` 放行并登录管理会话。
+
+### 测试 29F: Settings「服务」server 节点编辑（2026-11-12）
+
+自动化验证见 `tests/test_management.py` 的 `[18] settings server node (PUT /config)`
+（12 项断言），与 `[17]` 共用临时 config 文件，`finally` 恢复原文并 `manager.reload()`。
+
+- **完整往返**：GET /config 返回 `server` 全部 7 个字段（`host` / `port` / `log_level` /
+  `request_timeout` / `max_concurrency` / `upstream_queue_timeout` / `upstream_keepalive_expiry`）。
+  PUT 后磁盘上的 `server` 仍是完整节点（含默认值），逐字段一致；其余顶层段原样保留。
+- **热加载**：`manager.reload()` 后 `manager.config.server` 立即反映新值。
+- **校验**：`port=70000`、`max_concurrency=0`、`request_timeout="many"`、
+  `upstream_queue_timeout=-1` 都返回 **422**，`detail.segments` 里明确是 `server`，磁盘不变。
+- **空 PUT**：`{"config": {}}` 不清空 `server`。
+
+界面路径：Settings → 服务（第一个 Tab，默认页）→ 修改监听 / 日志 / 超时 / 并发闸门 →
+「保存配置」→ 确认弹窗提示整体覆盖 `server` 节点且需重启网关 → 成功后提示端口 / 日志 / 超时 /
+并发的变更待重启生效。
 
 ### 测试 30: 流式响应延迟
 
@@ -1424,11 +1552,20 @@ curl -b cookie.txt "http://localhost:8000/v1/management/requests/42"
 - 每笔 API 调用恰好一行：方法、路径、模型、上游、状态码、耗时、TTFT、是否流式、输入/输出/总 token 数、
   请求/响应大小、客户端 IP、错误信息；流式请求在流结束后落库
 - **代理看不到的调用也补齐**（对应 `tests/verify_security.py::test_request_log_coverage`）：
-  独立 handler（`/v1/models`、`/v1/rerank`、`/api/tags`、`/api/ps`、`/health`）与被 middleware 拒绝的请求
-  （公网未带 Key 的 401、白名单外的 404）都会由 middleware 写**仅元数据行**——body/token/upstream 列为
-  `NULL`，`error` 保存拒绝原因（如 `Missing API key: POST /v1/systemone`）；经代理的调用认领
-  ASGI scope 标记，不会被重复写两行。`/v1/management/*`、`/admin/*`、docs 与静态资源
-  **完全不写库**（控制台轮询不会污染表），`HEAD` 与 `OPTIONS` 也不记录
+  经代理的调用认领 ASGI scope 标记，独立 handler 与被 middleware 拒绝的请求由 middleware 写**同一行**，
+  不会被重复写两行。独立 handler 分两类：
+  - **有实质内容的工具 API**（`/v1/tools/web-search`、`/v1/systemone`、`/v1/rerank`、`/v1/messages`）：
+    handler 通过 `request_log.attach_request_detail()` 上报已解析的 model/upstream/原始请求体，
+    middleware 再统一捕获响应体并合并成**富字段行**——`requested_model`、`model`、`upstream`、
+    `request_body`、`response_body`、`tokens_in/out/tokens`、`stream` 都有值，详情抽屉能直接看 req/res。
+    `/v1/messages` 的流式 SSE 响应体中，token 用量由生成器 `finally` 在末块到达后补记。
+    web-search 无自身模型时 `model` 取 body 内的 `model`（若有），模型列由前端回退到稳定工具标签/上游。
+  - **纯发现探针**（`/v1/models`、`/api/tags`、`/api/ps`、`/health`）与**被 middleware 拒绝的请求**
+    （公网未带 Key 的 401、白名单外的 404）：仍写**仅元数据行**，body/token/upstream/model 列为 `NULL`，
+    `error` 保存拒绝原因（如 `Missing API key: POST /v1/systemone`）。这样控制台高频轮询 `/v1/models`
+    不会用 8 KB 响应快照塞满 SQLite；详情富字段只在 handler 主动上报时才采集。
+  `/v1/management/*`、`/admin/*`、docs 与静态资源 **完全不写库**（控制台轮询不会污染表），
+  `HEAD` 与 `OPTIONS` 也不记录
 - `status` 只接受档位 `2xx` / `3xx` / `4xx` / `5xx`（传具体数字 -> `400`）
 - `page < 1`、`page_size` 不在 `1..200`、`status` 非法 -> `400`；时间戳非法或 `start > end` -> `400`
 - 记录不存在 -> `404`
@@ -1561,9 +1698,12 @@ curl -b cookie.txt http://localhost:8000/v1/management/overview
 - 改回 `true` 后，越过约 1 秒的热加载窗口，下一条请求即入库（无需重启容器）
 - 自动化用例里直接调用 `ConfigManager.reload()` 跳过该窗口；对真实服务需等待或先发一次探测请求
 - 旧版本留下的 `llmhub.db` 在启动时自动 `ALTER TABLE ADD COLUMN` 补上新列，历史行不受影响
-- 独立 handler 与 middleware 拒绝写的是**仅元数据行**：`request_body` / `response_body` / `tokens` /
-  `upstream` / `model` 为 `NULL`，但 `error` 带拒绝原因（如 401 的 `Missing API key`），所以控制台
-  Requests 页能看到本不被代理感知的调用；`/v1/management/*` 与 `/admin/*` 不写库
+- 独立 handler 分两类：工具 API（`/v1/tools/web-search`、`/v1/systemone`、`/v1/rerank`、`/v1/messages`）
+  写**富字段行**（model/upstream/req/res/token 由 handler 经 `request.state.request_log_detail` 上报，
+  middleware 合并后一次落库，含流式响应）；纯发现探针（`/v1/models`、`/api/tags`、`/api/ps`、`/health`）
+  与 middleware 拒绝的请求写**仅元数据行**：`request_body` / `response_body` / `tokens` / `upstream` /
+  `model` 为 `NULL`，拒绝请求 `error` 带原因（如 401 的 `Missing API key`）。两类都能在控制台
+  Requests 页看到；`/v1/management/*` 与 `/admin/*` 不写库
 - **`HEAD` 与 `OPTIONS` 只转发不记录**：两者都由 catch-all 的 `HTTP_METHODS` 接受（已无全局方法白名单），
   `HEAD` 在内网端口正常返回 `200`、`OPTIONS` 预检由 middleware 回 `204`，但 `/requests` 里都没有这一行
   （同样的 `GET` 会有一行）；公网分区只有 `security.public.path_allowlist` 显式列出对应

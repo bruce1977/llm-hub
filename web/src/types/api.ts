@@ -505,14 +505,61 @@ export interface ApiTestResult {
 
 // --------------------------------------------------------------------------- //
 // Config (Settings console): the whole config.yaml object, editable in place.
-// The console only renders the four common segments (upstreams / rerank /
-// systemone / websearch); the rest is preserved verbatim on save, so we keep the
-// payload loose and let the backend validate the segments it owns.
+// The console renders six segments (server / security / upstreams / rerank /
+// systemone / websearch) over six tabs; the rest is preserved verbatim on save,
+// so we keep the payload loose and let the backend validate the segments it owns.
 // --------------------------------------------------------------------------- //
+/** `server` node of config.yaml. GET /config returns the full validated node; the
+ *  Service tab sends it back unchanged apart from the fields the operator edits.
+ *  Every field is startup-only: a change needs a gateway restart to take effect. */
+export interface ConfigServer {
+  host: string
+  /** Trusted LAN listener. Same value as security.public.port = public-only socket. */
+  port: number | string
+  log_level: string
+  /** Request wall-clock timeout in seconds. */
+  request_timeout: number | string
+  /** Inference concurrency gate; a burst is queued, never rejected with 429. */
+  max_concurrency: number | string
+  /** Seconds a request waits for a free inference slot before a 503. */
+  upstream_queue_timeout: number | string
+  upstream_keepalive_expiry: number | string
+}
+
+/** `security` node of config.yaml. GET /config returns the full validated node; the
+ *  Security tab sends it back unchanged apart from the fields the operator edits. */
+export interface ConfigSecurity {
+  internal: {
+    allow_anonymous: boolean
+    expose_version: boolean
+    expose_docs: boolean
+  }
+  public: {
+    /** null = no public listener. "" occurs transiently while the number input is cleared. */
+    port: number | string | null
+    /** HTTP method -> full-match regexes. */
+    path_allowlist: Record<string, string[]>
+    admin_endpoints: 'deny' | 'readonly' | 'allow'
+  }
+  blocked_paths: string[]
+  blocked_ips: string[]
+  cors_origins: string[]
+  /** Bytes on the wire; the form edits MiB. */
+  max_body_bytes: number
+  rate_limit: {
+    enabled: boolean
+    per_minute: number
+    burst: number
+    by: 'ip' | 'key'
+  }
+}
+
 export interface ConfigPayload {
   upstreams: ConfigUpstream[]
-  // The console only renders the four common segments; the rest is preserved verbatim,
+  // The console renders six editable segments; the rest is preserved verbatim,
   // so the editable blocks are kept loose (the backend validates them per segment).
+  server: ConfigServer
+  security: ConfigSecurity
   rerank: any
   systemone: any
   websearch: any
@@ -568,4 +615,35 @@ export interface ApiKeyCreated {
 
 export interface ApiKeyDeleted {
   deleted: number
+}
+
+// --------------------------------------------------------------------------- //
+// Settings / General: expire request-log rows older than a chosen date.
+// `before` is a naive-UTC ISO8601 string (second precision) on the wire; the
+// browser sends a plain YYYY-MM-DD and the backend normalises it to UTC midnight.
+// --------------------------------------------------------------------------- //
+export interface RequestCleanupPreview {
+  /** Normalised cutoff actually used by the backend. */
+  before: string
+  /** Rows that would be removed (ts < before). */
+  count: number
+  /** All rows in the table, including ones the list/charts hide. */
+  total: number
+  /** Oldest / newest ts among the rows to be removed; null when count is 0. */
+  oldest: string | null
+  newest: string | null
+  /** SQLite file + WAL size in bytes. */
+  db_bytes: number
+}
+
+export interface RequestCleanupResult {
+  ok: boolean
+  before: string
+  deleted: number
+  remaining: number
+  oldest: string | null
+  db_bytes_before: number
+  db_bytes_after: number
+  /** True only when rows were removed AND VACUUM actually ran. */
+  vacuum: boolean
 }

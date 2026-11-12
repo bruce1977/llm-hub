@@ -31,6 +31,7 @@ import httpx
 from auth import read_limited_body
 from fastapi import HTTPException, Request, status
 from fastapi.responses import Response
+from request_log import attach_request_detail
 
 logger = logging.getLogger("llm_hub")
 
@@ -171,6 +172,18 @@ class WebSearchService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Web search request body must be a JSON object.",
             )
+
+        # Web search has no model of its own, but a provider-side router may still
+        # accept one in the body -- record it when present. The resolved upstream is
+        # always worth logging, and the middleware captures the response body.
+        requested_model = str(body.get("model") or "").strip() or None
+        attach_request_detail(
+            request,
+            requested_model=requested_model,
+            model=requested_model,
+            upstream=upstream.name,
+            request_raw=raw_body,
+        )
 
         headers = self._build_headers(request, upstream)
 

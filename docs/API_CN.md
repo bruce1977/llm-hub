@@ -108,6 +108,14 @@ HEALTHCHECK 请改用 TCP 端口探测而不是 HTTP 探针。两个监听必须
 ASGI scope，这正是镜像用 `python serve.py`（`proxy_headers=False`）启动、而不让
 `ProxyHeadersMiddleware` 改写 `scope["client"]` 的原因。
 
+**IP 黑名单（`security.blocked_ips`）：** 可以封禁单个 IP 或 CIDR（IPv4 / IPv6）。从接口视角看，这**不是**
+一个 HTTP 状态码：命中的真实 TCP 对端在进路由前就被中断，客户端**收不到任何响应**（既不是 403 也不是
+444），也不会产生访问日志或请求记录，应用日志里只有一条 `deny <ip>`。它与 `security.rate_limit`
+（**429**）、`security.blocked_paths`（对真实 API 路径返回 **403**）完全不同。执行发生在 ASGI 之下：
+`GuardProtocol`（`serve.py` / `--http ip_guard_protocol:GuardProtocol`），并有一层最外层纯 ASGI 兜底，
+覆盖裸 uvicorn 与热加载前建立的 keep-alive 连接。名单约 1 秒内热加载，无需重启。
+详见 [CONFIG_CN.md](CONFIG_CN.md#封禁客户端-ip-securityblocked_ips)。
+
 **管理台会话 Cookie：** 登录 `/v1/management/auth/login` 后签发的签名 Cookie 在**两个区**都是业务 API 的
 凭据，浏览器无需持有调用方 Key。令牌格式为 `<sid>.<过期时间>.<签名>`：每次登录生成随机 session id，
 签名密钥由 `ADMIN_PASSWORD` + session id + 进程启动时生成的随机 seed 派生，seed 从不写入 Cookie 或日志，
@@ -1097,6 +1105,8 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
 | `GET` | `/v1/management/models/systemone` | System One 配置投影（同样掩码），含请求/SSE 示例 |
 | `GET` | `/v1/management/tools/websearch` | Web Search 配置投影：`enabled` / `endpoint` / `upstream` / `upstream_type` / `path` / `base_url`（由 provider upstream 派生）/ `api_key_env` / `api_key`（掩码）/ `timeout` / `provider_configured` |
 | `GET` | `/v1/management/requests` | 请求明细：`start`/`end`/`upstream`/`model`/`status`(2xx\|3xx\|4xx\|5xx)/`path`/`page`/`page_size`，返回 `stats` + `rows` + `pagination` + `request_log`（开关状态）。**只统计 API 调用**：查询始终带上 `request_log.API_PATH_SCOPE`（`path LIKE '/v1/%' OR path LIKE '/api/%'`）；`/v1/management/*`、`/admin/*`、docs 与静态资源根本不写库，`/health` 等非 API 路径仍会入库但不出现在列表、图表、KPI 与失败统计里（`GET /requests/{id}` 详情接口故意不加这个范围，深链仍能打开） |
+| `GET` | `/v1/management/requests/cleanup` | Settings「请求」清理的**预览**（不写库）：`before=YYYY-MM-DD` 或完整 ISO8601 日期时间，统一归一化为无时区 UTC（纯日期按 UTC 00:00 处理）。返回 `{before, count, total, oldest, newest, db_bytes}` —— `ts < before` 的行数、全表行数与 SQLite 主文件 + WAL 大小。缺失 / 无法解析 / 未来时间 → **400**。仅认管理会话 Cookie |
+| `POST` | `/v1/management/requests/cleanup` | **删除**所有 `ts < before` 的请求记录。请求体 `{"before": "YYYY-MM-DD", "vacuum": false}`，返回 `{ok, before, deleted, remaining, oldest, db_bytes_before, db_bytes_after, vacuum}`。严格 `<`，恰好等于截止时刻的行保留。清理覆盖整张表，包括列表/图表隐藏的非 API 行。`vacuum: true` 在确有删除时执行 `VACUUM` 真正回收磁盘空间（会短暂占用写锁，故默认关闭；单纯 `DELETE` 不会缩小 SQLite 文件）。两个 cleanup 路由都注册在 `/requests/{id}` **之前**，避免被 id 参数吞掉。仅认管理会话 Cookie；公网 socket 在 `deny` 下整个管理面仍是关闭的 |
 | `GET` | `/v1/management/requests/{id}` | 单条明细（含截断至 8 KB 的请求/响应体，敏感字段已脱敏） |
 | `GET` | `/v1/management/stats/timeseries` | 时序聚合：`bucket=hour\|day`，每桶 `count` / `errors` / `p95`。`tz_offset`（UTC 加多少分钟等于调用方本地时间，UTC+8 为 `480`，取值 -840..840）只影响 **day** 桶的分组，让每根柱子是一个本地自然日而不是 UTC 日；hour 桶保持 UTC，因为控制台是把它们当时间点渲染成本的 |
 | `GET` | `/v1/management/stats/distribution` | 分组计数：`group_by=upstream\|model\|status`，返回 `{group_by, start, end, items:[{key, count, display?}]}`。`status` 分**三类**：`ok`(2xx) / `failed`(≥500) / `warning`(3xx、4xx、NULL 及其他)；`failed` 仍与错误率、趋势图错误柱、`failures` 共用 ≥500 阈值，4xx 现在作为 `warning` 可见，不再被并入 `ok`。`group_by=model` 时每项另带 `display`：有 `model_aliases` 短名则显示短名，否则显示真实 id；`key` 始终是解析后的真实模型 id，筛选逻辑不变。未命中上游的行计入 `-` |
@@ -1109,6 +1119,8 @@ curl -b cookie.txt http://localhost:8888/v1/management/overview
 | `GET` | `/v1/management/api-keys` | 调用方 API Key 列表（**仅会话 Cookie**）：`{items: [{id, masked, label, source, created_at}], total}`，`source` 为 `console`（在管理台签发）或 `file`（更早版本从环境变量播种时留下的历史标记，现在不再写入）。只回掩码，既没有明文也没有 hash |
 | `POST` | `/v1/management/api-keys` | 签发一把新 Key（**仅会话 Cookie**）：Body `{"label": "..."}`，`label` 必填（空 → `400`，超过 100 字符 → `422`），`201` 返回 `{item, secret}`。**这个响应是明文一生中唯一一次离开服务器**，之后任何接口都拿不回来 |
 | `DELETE` | `/v1/management/api-keys/{id}` | 吊销（**仅会话 Cookie**）：`200` 返回 `{"deleted": id}`，`id` 不存在 → `404`。内存校验集合随即重载，下一笔请求就用不了了 |
+| `GET` | `/v1/management/config` | 供 Settings 页编辑的完整 `config.yaml` 结构化对象——**「服务」**与**「安全」**标签页编辑的就是它返回的完整 `server` / `security` 节点。生成的 `aliases` 会被剔除，`upstreams[].headers` 的值统一掩码为 `••••••`，避免「读回再保存」把凭据写进文件 |
+| `PUT` | `/v1/management/config` | Body `{"config": {...}}`；逐段校验后原子覆盖 `config.yaml` 并热重载。请求里只读取**六个** UI 可编辑段：`server`、`security`、`upstreams`、`rerank`、`systemone`、`websearch`；其余顶层键从磁盘原样保留，缺失的段不动。`server` 按 `ServerConfig` 校验（`port` 限定 1..65535）、`security` 按 `SecurityConfig` 校验，两者都**完整写回**（含默认值），既让表单与文件一致，也避免旧的顶层 `auth.enabled` 在保存后重新推断 `internal.allow_anonymous`。所有 `server` 字段都是启动期参数，需重启网关才生效。每段单独校验：非法字段返回 **422** 且 `detail.segments.server` / `detail.segments.security`（或对应段名），不写文件。成功返回 `{"ok": true, "reloaded": true}`，新的 `blocked_ips` 在同一次调用里推送到 IP guard。仅认管理会话 Cookie |
 
 **状态码：**
 
@@ -1166,11 +1178,18 @@ management / console / docs / 静态资源除外），字段覆盖请求参数�
   配置热加载每秒最多比对一次文件 mtime，所以开关在**约 1 秒内**生效（已实测）。
   数据库路径与保留天数仍由环境变量决定。
 - **每笔 API 调用恰好一行，包含代理看不到的调用方**：`ProxyService.forward` 写**完整行**（请求/响应体、
-  token 用量、`model`、`upstream`、`stream`）；安全 middleware 为两类请求写**仅元数据行**——
-  进程内的独立 handler（`/v1/systemone`、`/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`、
-  `/v1/models`、`/api/tags`、`/api/ps`）以及所有 middleware 拒绝（公网区 401/404、限流 429、
-  请求体超限 413）。仅元数据行的 body/token/upstream 列为 `NULL`，但 `error` 保存拒绝原因，
-  因此像 `Missing API key: POST /v1/systemone` 这样的无 Key 探测也能在 Requests 页审计。
+  token 用量、`model`、`upstream`、`stream`）。安全 middleware 为绕过代理的请求写唯一一行，
+  并合并 handler 通过 `request_log.attach_request_detail()` 在 ASGI state 上上报的字段：
+  - 工具 API（`/v1/systemone`、`/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`）上报调用方
+    `requested_model`、解析后的 `model`、`upstream` 和原始请求体；middleware 统一缓冲响应体
+    （上限 64 KB，含流式 SSE），因此这一行也有请求/响应体和 token 拆分（`extract_token_usage()`
+    同时识别 Anthropic 的 `input_tokens` / `output_tokens`），详情抽屉与代理调用一样能看到 req/res。
+    `/v1/systemone` 的 upstream 记为 `systemone:<后端主机>`。
+  - 纯发现探针（`/v1/models`、`/api/tags`、`/api/ps`、`/health`）与所有 middleware 拒绝
+    （公网区 401/404、限流 429、请求体超限 413）仍写**仅元数据行**：body/token/model/upstream
+    为 `NULL`，但 `error` 保存拒绝原因，因此像 `Missing API key: POST /v1/systemone` 这样的无 Key
+    探测也能在 Requests 页审计。只在 handler 主动上报时才采集 body，避免控制台轮询把 SQLite
+    塞满 8 KB 快照。
   ASGI scope 上的认领标记（`request.state.request_log_claimed`）防止代理调用被写两次
   （流式行在响应返回后才由 body 迭代器写入）。`/v1/management/*`、`/admin/*`、docs 与静态资源
   **完全不写库**；`HEAD` 与 `OPTIONS` 照常转发但都不记录。

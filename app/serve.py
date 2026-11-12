@@ -11,6 +11,12 @@ Why this file exists instead of `python -m uvicorn main:app`:
     process. A local listening socket is a kernel-assigned, unspoofable trust
     anchor: requests on ``security.public.port`` are the untrusted zone, with a
     mandatory key and a config-driven path allowlist.
+  * It installs ``ip_guard_protocol.GuardProtocol`` via ``http=``. That is what
+    makes ``security.blocked_ips`` a real TCP drop: uvicorn's protocol sees the
+    peer at ``connection_made`` and calls ``transport.abort()`` before ASGI, so
+    a denied IP gets no HTTP response, no access log and no request-log row --
+    only ``deny <ip>``. A bare ``uvicorn main:app`` needs the equivalent
+    ``--http ip_guard_protocol:GuardProtocol`` flag.
 
 Ports come from ``config.yaml`` ONLY - there are no LLMHUB_HOST / LLMHUB_PORT /
 LLMHUB_PUBLIC_PORTS overrides. A socket that serves untrusted traffic must be
@@ -52,6 +58,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import uvicorn
+from ip_guard_protocol import GuardProtocol
 from logging_config import uvicorn_log_config
 
 
@@ -102,6 +109,11 @@ def run(application, *, host: str, port: int, public_port: int | None, log_level
             log_config=uvicorn_log_config(log_level),
             proxy_headers=False,
             forwarded_allow_ips=None,
+            # TCP-level ``security.blocked_ips`` enforcement. uvicorn's protocol
+            # sees the real peer before ASGI exists, so a denied connection can be
+            # aborted with one ``deny <ip>`` line and zero HTTP bytes. The list
+            # itself is hot-reloaded from config via ip_guard.configure().
+            http=GuardProtocol,
         )
         uvicorn.Server(config).run(sockets=sockets)
     finally:

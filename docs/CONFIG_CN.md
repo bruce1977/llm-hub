@@ -19,6 +19,7 @@
 [`websearch`](#websearch) ·
 [`request_log`](#request_log) ·
 [`security`](#security) ·
+[封禁客户端 IP](#封禁客户端-ip-securityblocked_ips) ·
 [路径面](#路径面--可调用路径的封闭集合) ·
 [管理台专用字段](#管理台读取而路由不读的字段) ·
 [已移除节点](#已不存在的节点) ·
@@ -71,11 +72,16 @@
 |---|---|---|---|
 | `host` | `0.0.0.0` | `main.py`、`serve.py` | 所有监听器的绑定地址。`0.0.0.0` **加上** `security.internal.allow_anonymous: true` 会在启动时打印 "INTERNAL ZONE IS FULLY OPEN" 警告 |
 | `port` | `8000` | `Config.listen_ports()`、`serve.py` | **内网（可信 LAN）**套接字。这个端口就是分区锚点，不是可以靠 IP 或请求头改写的设置 |
-| `log_level` | `info` | `main.setup_logging()`、`app/logging.json` | 一个开关管所有 logger，包含 uvicorn 的访问日志：`2026-11-10 20:31:18.718 \| INFO    \| uvicorn.access \| 127.0.0.1:61641 - "GET /v1/models HTTP/1.1" 404 Not Found`。`debug` 会打印别名解析与路由决策；rerank 分数或路由看起来不对时就该用这个级别 |
+| `log_level` | `info` | `main.setup_logging()`、`app/logging.json` | 一个开关管所有 logger，包含 uvicorn 的日志：`2026-11-10 20:31:18.718 \| INFO    \| gateway.access \| 127.0.0.1:61641 - "GET /v1/models HTTP/1.1" 404 Not Found`。uvicorn 的 `uvicorn.error` / `uvicorn.access` logger 名在日志里显示为 `gateway` / `gateway.access`（只改显示，通过 `LoggerNameAliasFilter`）——因为 uvicorn 连 `Application startup complete.` 这种正常 INFO 生命周期日志也标成 `uvicorn.error`，看着像出错；真实级别与 handler 路由不变。`debug` 会打印别名解析与路由决策；rerank 分数或路由看起来不对时就该用这个级别 |
 | `request_timeout` | `600.0` | `main.py`（httpx 客户端）、`proxy.py`、`messages.py`、`rerank.py`、`systemone.py`、`websearch.py` | 没有单独设置上游级或功能级超时的调用，用「连接 10s / 读取 `request_timeout`」这个预算 |
 | `max_concurrency` | `4` | `http_clients.py` → `httpx.Limits` | **推理并发闸门**：同一时刻最多 N 个请求打到模型后端（Ollama / LM Studio / OpenCode chat）。超出的请求**排队**等空位，不会 429 拒绝；流式响应占槽到最后一个 chunk。单卡主机建议 1~2。它不是限流器 |
 | `upstream_queue_timeout` | `120.0` | `http_clients.py` → `httpx.Timeout(pool=...)` | 排队等空位的最长秒数，超时返回 **503 + `Retry-After: 5`**。给等待队列封顶，避免洪泛把请求堆在内存里 |
 | `upstream_keepalive_expiry` | `30.0` | `http_clients.py` → `httpx.Limits` | 到后端的空闲 keep-alive 连接保留多久 |
+
+所有 `server` 字段都能在管理台 **Settings → 服务** 里编辑（真正写 `config.yaml` 的编辑器，通过
+`PUT /v1/management/config` 覆盖整个节点）。它们是**启动期参数**：保存只重写文件，已绑定的 socket、
+日志级别、超时与连接池要重启网关后才生效。`port` 校验为 1..65535 的 TCP 端口；`max_concurrency`、
+`request_timeout`、`upstream_queue_timeout`、`upstream_keepalive_expiry` 必须为正数。
 
 启动时由 `app/http_clients.py` 建两个出站连接池：
 
@@ -254,7 +260,12 @@
 |---|---|---|
 | `enabled` | `true` | 入库开关，**每请求**求值（`proxy._logging_on` 与安全 middleware 都会读）：为 `false` 时连请求/响应体都不复制，也不写任何行。因为这个标志每次调用都重读，保存文件后约 1 秒内生效、无需重启。关闭期间 `/v1/management/overview` 与 `/requests` 会报 `request_log.enabled: false`，于是管理台可以说「日志已关闭」，而不是显示一个看起来像没流量的空列表 |
 
-**覆盖范围：** 每次 API 调用都会产生一行，不只是走代理的那些。完整行（请求/响应体、token 用量、解析后的 `model`、`upstream`、`stream`）在 `ProxyService.forward` 里构造。进程内独立 handler（`/v1/systemone`、`/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`、`/v1/models`、`/api/tags`、`/api/ps`）以及被安全 middleware 拒绝的请求（公网 401/404、IP 403、限流 429、body 413）由 middleware 写成**仅元数据**的行：方法、路径、query、状态、耗时、客户端 IP 与拒绝原因，没有 body/token/upstream。ASGI scope 上的认领标记避免代理调用被重复写两行。`/v1/management/*`、`/admin/*`、文档与静态资源属于控制面噪音，永不入库；`HEAD` 与 `OPTIONS` 会被转发但永不入库，所以存活探测和 CORS 预检不会淹掉日志。
+**覆盖范围：** 每次 API 调用都会产生一行，不只是走代理的那些。完整行（请求/响应体、token 用量、解析后的 `model`、`upstream`、`stream`）在 `ProxyService.forward` 里构造。绕过代理的请求由安全 middleware 写唯一一行，并合并 handler 通过 `request_log.attach_request_detail()` 在共享 ASGI state 上上报的字段：
+
+- 工具 API（`/v1/systemone`、`/v1/tools/web-search`、`/v1/rerank`、`/v1/messages`）上报调用方模型、解析后的 `model`/`upstream` 与原始请求体；middleware 统一缓冲响应体（上限 64 KB，含流式）并提取 token 用量，因此这些行也有请求/响应体和 `model`/`upstream`。
+- 纯发现探针（`/v1/models`、`/api/tags`、`/api/ps`、`/health`）与被安全 middleware 拒绝的请求（公网 401/404、限流 429、body 413）仍写**仅元数据**行：方法、路径、query、状态、耗时、客户端 IP 与拒绝原因，没有 body/token/model/upstream。只在 handler 主动上报时才采集 body，避免控制台轮询把 SQLite 塞满 8 KB 响应快照。
+
+ASGI scope 上的认领标记避免代理调用被重复写两行。`/v1/management/*`、`/admin/*`、文档与静态资源属于控制面噪音，永不入库；`HEAD` 与 `OPTIONS` 会被转发但永不入库，所以存活探测和 CORS 预检不会淹掉日志。
 
 存储位置与保留期刻意**不**放在本文件里 —— `REQUEST_LOG_DB`、`LLMHUB_DB` 与
 `REQUEST_LOG_RETENTION_DAYS` 属于部署层。
@@ -356,11 +367,18 @@ security:
 第 1 步来说它照样是一个 method+path，所以公网侧要让浏览器能用，必须在 `GET:`/`POST:` 旁边补上
 `OPTIONS:` 条目，详见下面 `security.cors_origins` 一行。
 
+这个节点下的所有字段也能在管理台的 **Settings「安全」** 里编辑
+（`GET` / `PUT /v1/management/config`）。保存时会把整个节点写回（包括仍等于默认值的键），
+因此遗留的顶层 `auth` 节点不会重新推断内网策略。`blocked_ips`、路径规则与限流会热加载；
+改 `security.public.port` 需要重启进程。表单与自锁警告见
+[USAGE_CN → Settings「安全」](USAGE_CN.md)。
+
 ### `security` —— 两个区共用的加固项
 
 | 字段 | 默认值 | 作用 |
 |---|---|---|
 | `blocked_paths` | `[]` | 运维方黑名单，**处处生效**（精确名或以 `*` 结尾的前缀），在公网管理黑名单之外额外叠加。在 `proxy.py` 里通过 `SecurityConfig.is_path_blocked()` 检查 |
+| `blocked_ips` | `[]` | TCP 层 IP 黑名单，支持单 IP / CIDR、IPv4 / IPv6（`203.0.113.7`、`10.0.0.0/8`、`2001:db8::/32`）。命中的**真实 TCP 对端**在任何业务处理前被中断：只输出一条 `deny <ip>` 日志，没有 HTTP 响应、没有访问日志、没有请求记录。内公网两个监听都生效；转发头一律不采信。非法条目告警后跳过。约 1 秒内热加载（即使无流量）。详见[封禁客户端 IP](#封禁客户端-ip-securityblocked_ips) |
 | `cors_origins` | `[]` | 允许跨站的精确 origin；留空则完全不发 CORS 头。中间件只对列表内的 origin 用**不带 body 的 `204`** 应答预检。预检同样受所在分区的路径策略约束：内网监听任何路径都能应答，公网侧 `OPTIONS` 却和其它方法一样必须在 `security.public.path_allowlist` 里列出，否则预检就是 **404**，浏览器根本发不出真正的请求 |
 | `max_body_bytes` | `33554432` | 请求体上限：`Content-Length` 超过它 → 中间件里 **413**；分块传输的 body 在流式读取时计数（`read_limited_body`），然后才由 proxy、messages、websearch、systemone 路径转发 |
 
@@ -375,6 +393,33 @@ security:
 
 已移除的 `allow_query_api_key` / `trusted_proxies` 两个键会被忽略并给出启动告警，
 避免旧配置文件悄悄把它们「复活」。
+
+### 封禁客户端 IP（`security.blocked_ips`）
+
+```yaml
+security:
+  blocked_ips:
+    - 203.0.113.7        # 单个主机
+    - 10.0.0.0/8         # 整段 IPv4
+    - 2001:db8::/32      # IPv6 也可以
+```
+
+命中的客户端会在**请求被处理之前直接中断**。这里刻意不是 403/429：没有 HTTP 响应、不进路由、
+不进中间件、不写请求记录，也没有 `uvicorn.access` 行，日志里只有一条 `deny <ip>`。
+判定用的是真实 TCP 对端，`X-Forwarded-*` / `X-Real-IP` 一律不采信；内网、公网两个监听都生效。
+它不是限流器（限流是 `security.rate_limit`）。
+
+| 方面 | 行为 |
+|---|---|
+| 可写语法 | 单个 IPv4/IPv6 地址或 CIDR。带前缀的主机地址（`203.0.113.7/24`）会归到所在网段。首尾空白会去掉，重复项合并，非法条目告警后跳过（绝不会导致网关起不来） |
+| 热加载 | `ConfigManager` 每次成功加载都会发布一份不可变快照。`main.lifespan` 里有一个 0.5 秒的配置轮询任务——因为被拒连接根本到不了平时触发重载的中间件，空闲网关也必须能生效。约 1 秒内生效，无需重启 |
+| 第 1 层（首选） | `app/ip_guard_protocol.py` 的 `GuardProtocol` 在 `connection_made` 里就 `abort()`，ASGI scope 都还没建立 → 零 HTTP 字节。由 `serve.py`（`http=GuardProtocol`）或 uvicorn CLI / `start-local.ps1` 的 `--http ip_guard_protocol:GuardProtocol` 装载 |
+| 第 2 层（始终存在） | `app/ip_guard.py` 的 `BlockedIPMiddleware` 是最外层纯 ASGI 中间件，不调用下游 app、也不调用 `send` 就直接中断。覆盖裸 `uvicorn main:app`（没带 `--http`）和热加载前就已建立的 keep-alive 连接。在 uvicorn 上它会把请求周期标记为 `disconnected` 并 abort 传输层，因此不会出现 500 兜底或访问日志；在非 uvicorn 的 ASGI 服务器上回一个无 body 的 `444`，避免客户端一直挂着 |
+| 启动日志 | 装载第 1 层时打印 INFO 与归一化后的规则；未装载时打印 WARNING，说明当前是「仅 ASGI 兜底」模式。`start-local.ps1 -CheckOnly` 也会打印生效规则 |
+| 日志输出 | 每个被拒请求恰好一条 `deny <ip>`。两层对同一请求互斥，不会出现重复行 |
+
+切断行为刻意是**尽力而为**：核心是「请求被中断」，而不是保证在所有 ASGI 服务器上都产生
+某种特定的 TCP RST 序列。即使将来 uvicorn 升级导致自定义 protocol 不可用，第 2 层仍能保护网关。
 
 ### `security.rate_limit`
 
