@@ -1,1 +1,0 @@
-import{W as e}from"./index-DvJi-DJX.js";var t=e({version:null});export{t};

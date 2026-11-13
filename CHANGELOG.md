@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (2026-11-13: Request list shows the alias-priority model name)
+
+The **Requests** page's model column used to print the resolved real model id
+(e.g. `bge-m3:latest`), ignoring the `model_aliases` short name (e.g. `bge-m3`) a caller
+actually uses. It now honours alias priority, consistent with the Dashboard's by-model pie.
+
+- **Backend**: `GET /v1/management/requests` and `GET /v1/management/requests/{id}` attach a
+  `display` field to every row via the same `_display_by_model` map the Dashboard uses — the
+  `model_aliases` short name for the resolved real model id, falling back to the id itself
+  (and `null` when the request has no model of its own). `RequestRow.display` is typed.
+- **Frontend**: `modelSubLine()` prefers `row.display` over the resolved `model` / raw
+  `requested_model`, so the column shows `bge-m3` instead of `bge-m3:latest` while standalone
+  tool calls (web-search / systemone) still fall back to their stable tool label.
+- **Tests**: `tests/test_management.py` adds two assertions (506 → 508): an alias call's row
+  carries `display` equal to the short name and distinct from the resolved id.
+
 ### Added (2026-11-12: Settings → Service, edit `config.yaml` `server` from the UI)
 
 The **Settings** tab bar is now ordered **Service → Security → Requests (formerly General)

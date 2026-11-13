@@ -749,6 +749,16 @@ def run() -> int:
             alias_entry.get("requested_model") == "q35" and alias_entry.get("model") == "qwen3:8b",
             str((alias_entry.get("requested_model"), alias_entry.get("model"))),
         )
+        check(
+            "list row carries alias-priority display name",
+            alias_entry.get("display") == "q8",
+            str(alias_entry.get("display")),
+        )
+        check(
+            "display is the alias, not the raw resolved model id",
+            alias_entry.get("display") != alias_entry.get("model"),
+            str((alias_entry.get("display"), alias_entry.get("model"))),
+        )
 
         client.get("/api/version", headers=GW, params={"format": "json"})
         version_row = client.get("/v1/management/requests", params={"path": "api/version"}).json()["rows"][0]

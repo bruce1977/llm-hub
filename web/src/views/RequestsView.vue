@@ -29,7 +29,10 @@ const TOOL_LABELS: Record<string, string> = {
   '/v1/systemone': 'systemone',
 }
 function modelSubLine(row: RequestRow): string {
-  return row.model || row.requested_model || TOOL_LABELS[row.path] || row.upstream || '—'
+  // Prefer the alias-priority display name (the `model_aliases` short name when configured),
+  // which the backend attaches as `display`; fall back to the resolved model id, then the
+  // raw requested name, then a stable tool label / upstream, then a dash.
+  return row.display || row.model || row.requested_model || TOOL_LABELS[row.path] || row.upstream || '—'
 }
 
 const { t } = useI18n()

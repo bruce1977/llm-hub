@@ -205,6 +205,9 @@ export interface RequestRow {
   query: string | null
   requested_model: string | null
   model: string | null
+  /** Alias-priority display name for `model` (the `model_aliases` short name when one
+   *  exists), or `model` itself. Null when the request has no model of its own. */
+  display: string | null
   upstream: string | null
   status: number
   duration_ms: number

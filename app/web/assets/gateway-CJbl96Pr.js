@@ -1,0 +1,1 @@
+import{W as e}from"./index-DOUAjh0k.js";var t=e({version:null});export{t};

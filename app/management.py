@@ -920,6 +920,14 @@ async def list_requests(
         page=page,
         page_size=page_size,
     )
+    # Alias-priority display name for the 模型 column: prefer the `model_aliases` short
+    # name configured for the resolved real model id, falling back to the id itself. This
+    # mirrors `_display_by_model` used by the Dashboard's by-model pie so the two views
+    # show the same name for the same model.
+    display = _display_by_model(request.app.state.manager.config)
+    for row in payload.get("rows", []):
+        mdl = row.get("model")
+        row["display"] = display.get(mdl) or mdl
     payload["request_log"] = _request_log_state(request.app.state.manager.config, log)
     return JSONResponse(payload)
 
@@ -968,6 +976,11 @@ async def request_detail(record_id: int, request: Request, _=Depends(require_adm
     entry["stream"] = bool(entry["stream"])
     entry["request_body_truncated"] = bool(entry["request_body_truncated"])
     entry["response_body_truncated"] = bool(entry["response_body_truncated"])
+    # Same alias-priority display name as the list endpoint, so the detail view and the
+    # list agree on how a model is named.
+    display = _display_by_model(request.app.state.manager.config)
+    mdl = entry.get("model")
+    entry["display"] = display.get(mdl) or mdl
     return JSONResponse(entry)
 
 
